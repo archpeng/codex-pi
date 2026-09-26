@@ -80,6 +80,18 @@ python3 runtime/pi_task.py continue --repo REPO --task TASK \
 - 运行中的普通失败/单次超时留在本地；已排队的旧事件在 `decide` 时按 phase/contract/candidate/round
   判定陈旧并拒绝，`dispatch` 也不会投递陈旧阶段事件。队列发送的 `uncertain` 保守语义未改动。
 
+### 命令与超时证据门（R2 增补）
+
+- 阶段 brief 的 `pi_check.py` 示例使用契约 `commandTimeoutSeconds`；无契约的旧任务仍使用项目
+  round 的 `timeoutSeconds` 示例。整轮 supervisor 超时与单命令上限相互独立，不能用整轮超时代替
+  命令上限。
+- 唯一 receipt 判定还强制：候选绑定的最新回执必须来自验收项声明的命令（argv 完全一致），且
+  `deadline_at - started_at` 不超过契约 `commandTimeoutSeconds`。已知命令不一致或超上限为
+  `failed`；argv、时间范围缺失/畸形/矛盾为 `unknown`；两者都绝不覆盖该验收项。失败尝试保留在
+  `round.checks/`，不因后续成功而删除。
+- board、事件、`readiness` 与 `decide accept` 继续消费同一个规范化判定；`accept` 重读实时快照，
+  因此已生成的旧 review 事件在回执失效后会被拒绝。
+
 ### 兼容与边界
 
 - 不带 `--contract-file` 的旧任务完全走 0.4 路径：无 phase 投影、无自动补齐、`review_required`
@@ -113,8 +125,8 @@ python3 runtime/pi_task.py continue --repo REPO --task TASK \
   覆盖源码候选，实际安装由 GPT 主会话在验收后按安全边界执行。
 - **真实 queue 传输**：沿用 0.4 已验证的忙/闲桌面与 uncertain 恢复证据，O2 只观察到正常排入；
   本阶段未重复烧模型验证传输层（也没有改变传输层）。
-- **复杂多阶段连续运行**：O2 只验证了受控两阶段夹具；多阶段长链、预算边缘、用户中途指令等仍
-  待后续阶段验证。
+- **复杂多阶段连续运行**：O2 只验证了同一阶段内的两轮夹具（R1 被拒、同 session 返修 R2），
+  不是多阶段长链；多阶段连续运行、预算边缘、用户中途指令等仍待后续阶段验证。
 
 ## 原始证据与使用量指针
 

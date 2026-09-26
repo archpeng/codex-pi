@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -29,10 +30,11 @@ HEAD_A = "a" * 40
 HEAD_B = "b" * 40
 CONTRACT = "c" * 64
 
+REAL_COMMAND = shlex.join([sys.executable, "-c", "print('ok')"])
 REAL_CONTRACT = {
     "schemaVersion": 1, "phaseId": "P-REAL", "goal": "g", "result": "r", "baseline": "HEAD",
     "scope": ["."], "designRef": "docs/design.md", "designSha256": "0" * 64,
-    "acceptanceItems": [{"id": "A1", "description": "d", "command": "true",
+    "acceptanceItems": [{"id": "A1", "description": "d", "command": REAL_COMMAND,
                          "passCondition": "exit 0", "evidence": "receipt"}],
     "budgetSeconds": 3600, "commandTimeoutSeconds": 900, "resourceLimits": [],
     "autonomousRepair": ["fix"], "escalateWhen": ["design"],
@@ -116,7 +118,8 @@ class ProgressEchoTest(unittest.TestCase):
         checks.mkdir(parents=True, exist_ok=True)
         proc = subprocess.run(
             [sys.executable, str(RUNTIME / "pi_check.py"), "--output-dir", str(checks),
-             "--id", check_id, "--", sys.executable, "-c", "print('ok')"],
+             "--id", check_id, "--timeout-seconds", "900",
+             "--", *shlex.split(REAL_COMMAND)],
             cwd=str(repo_root), capture_output=True, text=True, env=os.environ.copy(), timeout=60)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         return Path(json.loads(proc.stdout)["receipt"])

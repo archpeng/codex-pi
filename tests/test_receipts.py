@@ -61,9 +61,15 @@ class ReceiptTest(unittest.TestCase):
     def wait_for_marker(self, check_id: str, timeout: float = 15) -> Path:
         deadline = time.monotonic() + timeout
         while True:
-            found = sorted(self.checks.glob(f"{check_id}-*.running"))
-            if found:
-                return found[0]
+            for candidate in sorted(self.checks.glob(f"{check_id}-*.running")):
+                try:
+                    data = json.loads(candidate.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    data = None
+                # The wrapper writes the marker before spawning and updates it
+                # with the child pid; wait for the initialized marker identity.
+                if isinstance(data, dict) and isinstance(data.get("pid"), int):
+                    return candidate
             if time.monotonic() >= deadline:
                 raise AssertionError(f"running marker for {check_id} never appeared")
             time.sleep(0.05)

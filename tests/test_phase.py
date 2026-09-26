@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -154,14 +155,18 @@ class PhaseTest(unittest.TestCase):
 
     def synth_receipt(self, checks: Path, check_id: str, exit_code: int, head: str, *,
                       dirty: bool = False, timed_out: bool = False, cancelled: bool = False,
-                      counts=None) -> Path:
+                      counts=None, command: str = "python3 -c pass",
+                      timeout_seconds: float = 900, argv=None, deadline_at=None) -> Path:
         checks.mkdir(parents=True, exist_ok=True)
         log = checks / f"{check_id}-{uuid.uuid4().hex[:8]}.log"
         log.write_text("synthetic evidence\n", encoding="utf-8")
         receipt = checks / f"{check_id}-{uuid.uuid4().hex[:8]}.json"
-        data = {"schema_version": 1, "id": check_id, "argv": ["synthetic"], "cwd": str(checks),
+        started = time.time() - 1
+        data = {"schema_version": 1, "id": check_id,
+                "argv": shlex.split(command) if argv is None else argv, "cwd": str(checks),
                 "head": head, "dirty": dirty, "tracked_diff_sha256": None,
-                "started_at": time.time() - 1, "ended_at": time.time(),
+                "started_at": started, "ended_at": time.time(),
+                "deadline_at": started + timeout_seconds if deadline_at is None else deadline_at,
                 "exit_code": exit_code, "timed_out": timed_out, "cancelled": cancelled,
                 "error": None, "test_counts": counts, "log": log.name,
                 "log_sha256": hashlib.sha256(log.read_bytes()).hexdigest(),
@@ -417,6 +422,144 @@ class PhaseTest(unittest.TestCase):
         self.assertEqual(len(reviews), 1)
         self.assertEqual(reviews[0]["phaseId"], "P-READY")
         self.assertEqual(reviews[0]["candidate"]["head"], candidate)
+
+    def test_brief_uses_contract_command_timeout_and_keeps_round_timeout(self):
+        repo, worktree = self.make(name="brief-phase")
+        env = self.h_env(PI_DOUBLE_MODE="hang")
+        try:
+            sha = self.write_design(repo)
+            path = self.write_contract(
+                "brief.json", self.contract(repo, "P-BRIEF", design_sha=sha))
+            self.start(repo, worktree, "brief-phase", path, env)
+            repo.wait_round_state("brief-phase", "running")
+            brief = (repo.task_dir("brief-phase") / "rounds" / "1" / "brief.md").read_text(
+                encoding="utf-8")
+            self.assertIn("command_timeout_seconds=900", brief)
+            self.assertIn("--timeout-seconds 900", brief)
+            self.assertNotIn("--timeout-seconds 14400", brief)
+            self.assertIn("whole-round", brief)
+            self.assertIn("declared command", brief)
+        finally:
+            repo.cancel("brief-phase", env=env)
+            repo.wait_terminal("brief-phase", env=env, timeout=25)
+        legacy, legacy_wt = self.make(name="brief-legacy")
+        try:
+            self.start(legacy, legacy_wt, "brief-legacy", None, env)
+            legacy.wait_round_state("brief-legacy", "running")
+            legacy_brief = (legacy.task_dir("brief-legacy") / "rounds" / "1"
+                            / "brief.md").read_text(encoding="utf-8")
+            self.assertIn("--timeout-seconds 14400", legacy_brief)
+            self.assertNotIn("command_timeout_seconds", legacy_brief)
+        finally:
+            legacy.cancel("brief-legacy", env=env)
+            legacy.wait_terminal("brief-legacy", env=env, timeout=25)
+
+    def test_receipt_command_identity_gates_readiness_board_and_accept(self):
+        fixture = self.ready_accept_fixture("cmd-gate", "P-CMDGATE")
+        repo, env = fixture["repo"], fixture["env"]
+        task, candidate = "cmd-gate", fixture["candidate"]
+        checks = repo.task_dir(task) / "rounds" / "1" / "round.checks"
+        review = fixture["review"]
+
+        def readiness():
+            return cli_json("readiness", "--repo", str(repo.root), "--task", task,
+                            "--round", "1", env=env)
+
+        def refuse_accept():
+            proc = run_board("decide", "--repo", str(repo.root), "--task", task,
+                             "--event-id", review["id"], "--decision", "accept",
+                             "--reviewed-head", candidate, "--phase", "P-CMDGATE",
+                             "--contract-hash", fixture["contractSha256"], env=env, expect=2)
+            self.assertIn("readiness", proc.stderr)
+
+        # Known mismatch: same check id and head, different argv -> failed. The
+        # live accept gate re-reads the same normalized verdict and refuses.
+        mismatched = self.synth_receipt(checks, "A1", 0, candidate,
+                                        argv=["python3", "-c", "other"])
+        item = readiness()["items"][0]
+        self.assertEqual(item["status"], "failed")
+        self.assertIn("argv", item["reason"])
+        refuse_accept()
+
+        # Malformed identity: argv is not a list -> unknown, never a pass.
+        malformed = self.synth_receipt(checks, "A1", 0, candidate, argv="not-a-list")
+        item = readiness()["items"][0]
+        self.assertEqual(item["status"], "unknown")
+        self.assertIn("argv", item["reason"])
+        refuse_accept()
+
+        # The board consumes the same verdict: the old review event is
+        # superseded and the blocked event carries the failed item.
+        self.refresh(repo, task, env)
+        self.assertEqual(self.pending(repo, task, "review_required"), [])
+        blocked = self.pending(repo, task, "phase_blocked")
+        self.assertEqual(len(blocked), 1)
+        self.assertEqual(blocked[0]["evidence"]["reason"], "required_check_failed")
+        # Gate-failed attempts stay on disk as preserved evidence.
+        self.assertTrue(mismatched.is_file())
+        self.assertTrue(malformed.is_file())
+
+        # A fresh matching receipt covers again on the same candidate; the
+        # superseded review event is not re-published for the same fingerprint.
+        self.synth_receipt(checks, "A1", 0, candidate, command=fixture["command"])
+        self.assertEqual(readiness()["status"], "ready")
+        self.assertEqual(readiness()["items"][0]["status"], "covered")
+
+    def test_receipt_timeout_bound_gates_readiness_board_and_accept(self):
+        fixture = self.ready_accept_fixture("timeout-gate", "P-TIMEOUTGATE")
+        repo, env = fixture["repo"], fixture["env"]
+        task, candidate = "timeout-gate", fixture["candidate"]
+        checks = repo.task_dir(task) / "rounds" / "1" / "round.checks"
+        review = fixture["review"]
+
+        def readiness():
+            return cli_json("readiness", "--repo", str(repo.root), "--task", task,
+                            "--round", "1", env=env)
+
+        def refuse_accept():
+            proc = run_board("decide", "--repo", str(repo.root), "--task", task,
+                             "--event-id", review["id"], "--decision", "accept",
+                             "--reviewed-head", candidate, "--phase", "P-TIMEOUTGATE",
+                             "--contract-hash", fixture["contractSha256"], env=env, expect=2)
+            self.assertIn("readiness", proc.stderr)
+
+        # Over-cap wrapper deadline -> failed.
+        over = self.synth_receipt(checks, "A1", 0, candidate, command=fixture["command"],
+                                  timeout_seconds=901)
+        item = readiness()["items"][0]
+        self.assertEqual(item["status"], "failed")
+        self.assertIn("timeout", item["reason"])
+        refuse_accept()
+
+        # Missing deadline -> unknown, never a pass.
+        missing = self.synth_receipt(checks, "A1", 0, candidate, command=fixture["command"])
+        data = json.loads(missing.read_text(encoding="utf-8"))
+        del data["deadline_at"]
+        missing.write_text(json.dumps(data), encoding="utf-8")
+        item = readiness()["items"][0]
+        self.assertEqual(item["status"], "unknown")
+        self.assertIn("timing", item["reason"])
+        refuse_accept()
+
+        # Contradictory deadline -> unknown, never a pass.
+        self.synth_receipt(checks, "A1", 0, candidate, command=fixture["command"],
+                           deadline_at=time.time() - 100)
+        item = readiness()["items"][0]
+        self.assertEqual(item["status"], "unknown")
+        self.assertIn("contradictory", item["reason"])
+        refuse_accept()
+
+        # The board shares the verdict; failed attempts stay on disk.
+        self.refresh(repo, task, env)
+        self.assertEqual(self.pending(repo, task, "review_required"), [])
+        self.assertEqual(len(self.pending(repo, task, "phase_blocked")), 1)
+        self.assertTrue(over.is_file())
+        self.assertTrue(missing.is_file())
+
+        # A within-cap matching receipt restores coverage on the same candidate.
+        self.synth_receipt(checks, "A1", 0, candidate, command=fixture["command"])
+        self.assertEqual(readiness()["status"], "ready")
+        self.assertEqual(readiness()["items"][0]["status"], "covered")
 
     def test_failed_required_check_escalates_without_auto_continue(self):
         repo, worktree = self.make()
@@ -716,7 +859,8 @@ class PhaseTest(unittest.TestCase):
         counts = {"run": 3, "pass": 3, "fail": 0, "skip": 0,
                   "format": "go_verbose_top_level"}
         for item in ("A1", "A2", "A3"):
-            self.synth_receipt(checks, item, 0, candidate, counts=dict(counts))
+            self.synth_receipt(checks, item, 0, candidate, counts=dict(counts),
+                               command="go test ./...")
         repo.wait_terminal("counts-ready")
         readiness = cli_json("readiness", "--repo", str(repo.root), "--task", "counts-ready",
                              "--round", "1", env=env)
@@ -754,17 +898,17 @@ class PhaseTest(unittest.TestCase):
         repo2.wait_round_state("counts-block", "running")
         candidate2 = self.head(worktree2)
         checks2 = repo2.task_dir("counts-block") / "rounds" / "1" / "round.checks"
-        self.synth_receipt(checks2, "B1", 0, candidate2)  # no counts -> unknown
-        self.synth_receipt(checks2, "B2", 0, candidate2,
+        self.synth_receipt(checks2, "B1", 0, candidate2, command="go test")  # no counts -> unknown
+        self.synth_receipt(checks2, "B2", 0, candidate2, command="go test",
                            counts={"run": 3, "pass": 2, "fail": 0, "skip": 1})
-        self.synth_receipt(checks2, "B3", 0, candidate2,
+        self.synth_receipt(checks2, "B3", 0, candidate2, command="go test",
                            counts={"run": 3, "pass": 3, "fail": 0, "skip": 0})
         # Both rules declared: minRun must still be checked after forbidSkip.
-        self.synth_receipt(checks2, "B4", 0, candidate2,
+        self.synth_receipt(checks2, "B4", 0, candidate2, command="go test",
                            counts={"run": 3, "pass": 3, "fail": 0, "skip": 0})
-        self.synth_receipt(checks2, "B5", 0, candidate2,
+        self.synth_receipt(checks2, "B5", 0, candidate2, command="go test",
                            counts={"run": 3, "pass": 1, "fail": 0, "skip": 2})
-        self.synth_receipt(checks2, "B6", 0, candidate2)  # no counts -> unknown
+        self.synth_receipt(checks2, "B6", 0, candidate2, command="go test")  # no counts -> unknown
         repo2.wait_terminal("counts-block")
         readiness2 = cli_json("readiness", "--repo", str(repo2.root), "--task", "counts-block",
                               "--round", "1", env=env2)
@@ -779,14 +923,18 @@ class PhaseTest(unittest.TestCase):
         repo, worktree = self.make()
         env = self.h_env(PI_DOUBLE_MODE="delay-ok", PI_DOUBLE_DELAY="15")
         sha = self.write_design(repo)
-        path = self.write_contract("p.json", self.contract(repo, "P-MID", design_sha=sha))
+        command = self.python_command("-c", "print('mid')")
+        item = [{"id": "A1", "description": "the behavior works", "command": command,
+                 "passCondition": "exit 0", "evidence": "pi_check receipt for A1"}]
+        path = self.write_contract("p.json", self.contract(repo, "P-MID", design_sha=sha,
+                                                            items=item))
         self.start(repo, worktree, "mid-head", path, env)
         repo.wait_round_state("mid-head", "running")
         start_head = self.head(worktree)
         checks = repo.task_dir("mid-head") / "rounds" / "1" / "round.checks"
         old = subprocess.run(
             [sys.executable, str(CHECK), "--output-dir", str(checks), "--id", "A1",
-             "--", sys.executable, "-c", "print('old')"], cwd=str(worktree),
+             "--timeout-seconds", "900", "--", *shlex.split(command)], cwd=str(worktree),
             capture_output=True, text=True, env=env, timeout=60)
         self.assertEqual(old.returncode, 0, old.stderr)
         old_receipt = Path(json.loads(old.stdout)["receipt"]).name
@@ -802,7 +950,7 @@ class PhaseTest(unittest.TestCase):
         self.assertNotEqual(new_head, start_head)
         new = subprocess.run(
             [sys.executable, str(CHECK), "--output-dir", str(checks), "--id", "A1",
-             "--", sys.executable, "-c", "print('new')"], cwd=str(worktree),
+             "--timeout-seconds", "900", "--", *shlex.split(command)], cwd=str(worktree),
             capture_output=True, text=True, env=env, timeout=60)
         self.assertEqual(new.returncode, 0, new.stderr)
         new_receipt = Path(json.loads(new.stdout)["receipt"]).name
@@ -903,8 +1051,9 @@ class PhaseTest(unittest.TestCase):
         repo.wait_round_state("counts-task", "running")
         candidate = self.head(worktree)
         checks = repo.task_dir("counts-task") / "rounds" / "1" / "round.checks"
-        self.synth_receipt(checks, "A1", 0, candidate)  # no parseable counts
-        self.synth_receipt(checks, "A2", 0, candidate)  # non-test command, no counts needed
+        self.synth_receipt(checks, "A1", 0, candidate, command="go test ./...")  # no counts
+        self.synth_receipt(checks, "A2", 0, candidate,
+                           command="git diff --check")  # non-test, no counts needed
         repo.wait_terminal("counts-task")
         readiness = cli_json("readiness", "--repo", str(repo.root), "--task", "counts-task",
                              "--round", "1", env=env)
@@ -1064,19 +1213,31 @@ class PhaseTest(unittest.TestCase):
         self.assertEqual(card["phase"]["acceptedHead"], head)
         self.assertEqual(self.pending(repo, "gate-task"), [])
 
-    def ready_accept_fixture(self, name: str, phase_id: str) -> dict:
+    def python_command(self, *args) -> str:
+        """Declared command string matching a receipt run with the same argv."""
+        return shlex.join([sys.executable, *args])
+
+    def ready_accept_fixture(self, name: str, phase_id: str, *,
+                             command: str | None = None,
+                             command_timeout: float = 900) -> dict:
         """Real passing receipt, pending review event and writer-free terminal state."""
         repo, worktree = self.make(name=f"repo-{name}")
         env = self.h_env(PI_DOUBLE_MODE="delay-ok", PI_DOUBLE_DELAY="6")
         sha = self.write_design(repo)
-        path = self.write_contract(f"{name}.json", self.contract(repo, phase_id, design_sha=sha))
+        command = command or self.python_command("-c", "print('ok')")
+        item = {"id": "A1", "description": "the behavior works", "command": command,
+                "passCondition": "exit 0", "evidence": "pi_check receipt for A1"}
+        path = self.write_contract(f"{name}.json", self.contract(
+            repo, phase_id, design_sha=sha, items=[item],
+            extra={"commandTimeoutSeconds": command_timeout}))
         self.start(repo, worktree, name, path, env)
         repo.wait_round_state(name, "running")
         candidate = self.head(worktree)
         checks = repo.task_dir(name) / "rounds" / "1" / "round.checks"
         check = subprocess.run(
             [sys.executable, str(CHECK), "--output-dir", str(checks), "--id", "A1",
-             "--", sys.executable, "-c", "print('ok')"], cwd=str(worktree),
+             "--timeout-seconds", f"{command_timeout:g}",
+             "--", *shlex.split(command)], cwd=str(worktree),
             capture_output=True, text=True, env=env, timeout=60)
         if check.returncode != 0:
             raise AssertionError(check.stderr)
@@ -1097,7 +1258,8 @@ class PhaseTest(unittest.TestCase):
             raise AssertionError(f"expected one review event for {name}, got {len(review)}")
         frozen = json.loads((repo.task_dir(name) / "phase.json").read_text(encoding="utf-8"))
         return {"repo": repo, "worktree": worktree, "env": env, "candidate": candidate,
-                "review": review[0], "contractSha256": frozen["contractSha256"]}
+                "command": command, "review": review[0],
+                "contractSha256": frozen["contractSha256"]}
 
     def test_terminal_execution_facts_are_enforced_by_the_gate(self):
         # Known failure (nonzero exit, cancelled, timed out) is not_ready;
@@ -1146,14 +1308,18 @@ class PhaseTest(unittest.TestCase):
         repo, worktree = self.make()
         env = self.h_env(PI_DOUBLE_MODE="delay-ok", PI_DOUBLE_DELAY="6")
         sha = self.write_design(repo)
-        path = self.write_contract("p.json", self.contract(repo, "P-SNAP", design_sha=sha))
+        command = self.python_command("-c", "print('ok')")
+        item = [{"id": "A1", "description": "the behavior works", "command": command,
+                 "passCondition": "exit 0", "evidence": "pi_check receipt for A1"}]
+        path = self.write_contract("p.json", self.contract(repo, "P-SNAP", design_sha=sha,
+                                                            items=item))
         self.start(repo, worktree, "snap-task", path, env)
         repo.wait_round_state("snap-task", "running")
         candidate = self.head(worktree)
         checks = repo.task_dir("snap-task") / "rounds" / "1" / "round.checks"
         check = subprocess.run(
             [sys.executable, str(CHECK), "--output-dir", str(checks), "--id", "A1",
-             "--", sys.executable, "-c", "print('ok')"], cwd=str(worktree),
+             "--timeout-seconds", "900", "--", *shlex.split(command)], cwd=str(worktree),
             capture_output=True, text=True, env=env, timeout=60)
         self.assertEqual(check.returncode, 0, check.stderr)
         # While the round is active the verified snapshot item produces one

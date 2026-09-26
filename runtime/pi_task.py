@@ -21,6 +21,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -1028,6 +1029,56 @@ def evaluate_execution_gate(state: dict):
     return True, "ok", None
 
 
+def _safe_argv(value):
+    """Bounded argv list from a receipt; malformed values become unknown (None)."""
+    if not isinstance(value, list) or not 1 <= len(value) <= 64:
+        return None
+    argv = []
+    for entry in value:
+        if not isinstance(entry, str) or not entry or len(entry) > 4096:
+            return None
+        argv.append(entry)
+    return argv
+
+
+def _receipt_contract_violation(spec: dict, contract: dict, item: dict):
+    """Validate one receipt against the item's declared command and timeout cap.
+
+    Returns ``(status, reason)`` when the receipt cannot cover the item: a known
+    command or timeout mismatch is ``failed``; missing, malformed or contradictory
+    identity/timing evidence stays ``unknown``. ``(None, None)`` means both the
+    command identity and the wrapper timing bound were verified.
+    """
+    declared = spec.get("command")
+    if not isinstance(declared, str) or not declared.strip():
+        return ("unknown", "acceptance item command is missing or malformed")
+    try:
+        expected = shlex.split(declared, posix=True)
+    except ValueError:
+        return ("unknown", "acceptance item command cannot be parsed")
+    got = item.get("argv")
+    if got is None:
+        return ("unknown", "receipt has no parseable argv identity")
+    if got != expected:
+        return ("failed", "receipt argv does not match the declared acceptance command")
+    limit = contract.get("commandTimeoutSeconds")
+    if isinstance(limit, bool) or not isinstance(limit, (int, float)) \
+            or not math.isfinite(float(limit)) or float(limit) <= 0:
+        return ("unknown", "contract command timeout is missing or malformed")
+    limit = float(limit)
+    started = item.get("startedAt")
+    deadline = item.get("deadlineAt")
+    if started is None or deadline is None:
+        return ("unknown", "receipt has no complete wrapper timing evidence")
+    if deadline < started:
+        return ("unknown", "receipt wrapper timing is contradictory")
+    wrapper = deadline - started
+    if wrapper > limit + 1e-6:
+        return ("failed", f"receipt wrapper deadline {wrapper:g}s exceeds the declared command "
+                          f"timeout {limit:g}s")
+    return (None, None)
+
+
 def evaluate_acceptance_items(contract: dict, candidate_head, checks: dict, checks_dir: Path):
     """The single receipt-validity evaluation shared by every consumer.
 
@@ -1073,7 +1124,11 @@ def evaluate_acceptance_items(contract: dict, candidate_head, checks: dict, chec
             entry["logRef"] = str(checks_dir / newest["log"])
             entry["evidenceLevel"] = "receipt_metadata"
             counts = newest.get("testCounts")
-            if newest.get("timedOut"):
+            contract_status, contract_reason = _receipt_contract_violation(spec, contract, newest)
+            if contract_status is not None:
+                entry.update(status=contract_status, reason=contract_reason,
+                             evidenceLevel="receipt_metadata_only")
+            elif newest.get("timedOut"):
                 entry.update(status="failed", reason="check timed out")
             elif newest.get("cancelled"):
                 entry.update(status="failed", reason="check was cancelled")
@@ -1533,11 +1588,27 @@ def compose_brief(task: dict, round_number: int, prompt: str, prior: dict | None
         lines += ["", f"Previous round {prior.get('round')}: outcome={prior.get('state')} "
                       f"exit={prior.get('exitCode')} head={prior.get('endHead')}. "
                       "That is execution evidence only; read its summary before continuing."]
+    command_timeout = task["timeoutSeconds"]
+    if isinstance(phase_record, dict):
+        contract_timeout = (phase_record.get("contract") or {}).get("commandTimeoutSeconds")
+        if isinstance(contract_timeout, (int, float)) and not isinstance(contract_timeout, bool) \
+                and math.isfinite(float(contract_timeout)) and float(contract_timeout) > 0:
+            command_timeout = float(contract_timeout)
+        timeout_literal = f"{float(command_timeout):g}"
+        timeout_note = ("The helper --timeout-seconds above is the phase contract's per-command "
+                        "cap; the whole-round supervisor timeout is separate. Phase acceptance "
+                        "receipts must use the item's declared command and a wrapper deadline "
+                        "within that cap.")
+    else:
+        timeout_literal = str(int(command_timeout))
+        timeout_note = ("The helper --timeout-seconds above is the project round timeout; legacy "
+                        "tasks without a phase contract keep this example.")
     lines += [
         "",
         "Record real check evidence with this task's frozen helper:",
         f'  python3 "{helper}" --output-dir "{checks_dir}" --id <safe-id> \\',
-        f'      --timeout-seconds {int(task["timeoutSeconds"])} -- <real check command>',
+        f'      --timeout-seconds {timeout_literal} -- <real check command>',
+        timeout_note,
         "Receipts capture the true exit/signal/timeout, log sha256, HEAD and dirty state.",
         "Optional declared directory budget for that check (path and budget required together):",
         f'  python3 "{helper}" --output-dir "{checks_dir}" --id <safe-id> \\',
@@ -2416,9 +2487,30 @@ def _safe_receipt(path: Path):
             "cancelled": bool(data.get("cancelled")), "failed": failed,
             "testCounts": _sanitize_counts(data.get("test_counts")),
             "startedAt": _number(data.get("started_at")), "endedAt": _number(data.get("ended_at")),
+            "deadlineAt": _number(data.get("deadline_at")),
+            "argv": _safe_argv(data.get("argv")),
             "log": log_name, "logSha256": digest, "receipt": path.name, "head": head,
             "dirty": dirty,
             "resourceLimit": sanitize_snapshot(data.get("resource_limit") or data.get("resourceLimit"))}, None
+
+
+def _redact_receipt_metadata(checks: dict) -> dict:
+    """Status-safe copy: internal command identity and wrapper timing are never returned."""
+    try:
+        public = json.loads(json.dumps(checks))
+    except (TypeError, ValueError):
+        return {"dir": checks.get("dir"), "exists": checks.get("exists"),
+                "partial": checks.get("partial"), "running": None,
+                "receipts": {"recent": []}, "resourceGuard": {},
+                "note": "receipt metadata is not serializable"}
+    receipts = public.get("receipts")
+    if isinstance(receipts, dict):
+        for value in receipts.values():
+            for item in (value if isinstance(value, list) else [value]):
+                if isinstance(item, dict):
+                    item.pop("argv", None)
+                    item.pop("deadlineAt", None)
+    return public
 
 
 def _scan_checks(checks_dir: Path) -> dict:
@@ -3078,7 +3170,7 @@ def build_status(repo_arg: str, task_arg: str, round_arg=None) -> dict:
         "briefSha256": state.get("briefSha256"),
         "ownership": {"activeWorker": task_held, "supervisorAlive": supervisor_alive},
         "processes": processes, "executionActivity": execution_activity,
-        "checks": checks, "evidence": evidence_paths(task_dir, selected_number),
+        "checks": _redact_receipt_metadata(checks), "evidence": evidence_paths(task_dir, selected_number),
         "phase": phase_info, "phaseProblem": phase_problem, "progress": progress,
         "acceptance": "not_verified", "notes": notes,
     }

@@ -58,7 +58,12 @@ never queue. A recorded user pause blocks progress echoes, auto-continuation and
 phase requires the previous one accepted on the board and no conflicting worker. One normalized
 phase evidence snapshot (candidate known/unknown, per-item grades, scope, execution, readiness) is
 built by `pi_task` and consumed by the board, progress events, `readiness` and the accept gate;
-there is no second candidate or receipt-validity inference. `accept` re-reads the live status and
+there is no second candidate or receipt-validity inference. A phase acceptance receipt must present
+the item's declared command and a wrapper deadline within the contract's `commandTimeoutSeconds`;
+a known command or timeout mismatch can never cover the item, missing or contradictory
+identity/timing stays unknown, and every consumer uses that one verdict. The generated phase brief
+uses that per-command cap while a legacy task keeps the project round-timeout example; the
+whole-round supervisor timeout is a separate limit. `accept` re-reads the live status and
 refuses when the round, contract revision, candidate, readiness, worktree HEAD or writer-free state
 no longer match the stored event. Tasks without a
 contract keep the legacy review path. O1 is accepted at candidate `7331da9`; O2 ran a real two-round
@@ -78,7 +83,7 @@ python3 /absolute/task/tools/pi_check.py --output-dir /absolute/round/round.chec
 python3 /absolute/task/tools/pi_copy.py /absolute/source /absolute/new-destination --max-bytes 104857600
 ```
 
-Replace example commands and limits with meaningful project budgets. A running marker reports wrapper start, actual deadline, child identity and optional directory guard. Final immutable receipts bind command, revision, exit and log hash. Failed, skipped, interrupted, unknown or zero-test attempts never become a pass. The command timeout and whole Pi round timeout are separate.
+Replace example commands and limits with meaningful project budgets. A running marker reports wrapper start, actual deadline, child identity and optional directory guard. Final immutable receipts bind command, revision, exit and log hash. Failed, skipped, interrupted, unknown or zero-test attempts never become a pass. The command timeout and whole Pi round timeout are separate. For a phase task the per-command `--timeout-seconds` must not exceed the contract's `commandTimeoutSeconds`; a receipt outside that bound or with a different command can never cover its acceptance item.
 
 Directory guards measure declared regular-file bytes without following symlinks. An observed known breach stops only the owned command group and records the failure; an incomplete measurement stays unknown. The copy helper preserves literal symlinks and refuses existing destinations, recursion, known overages or unknown verification. These rules prevent the 14 MB → 6.5 GB expansion incident without asking the main model to poll.
 

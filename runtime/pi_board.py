@@ -951,16 +951,21 @@ def _phase_blocked_reason(readiness: dict, auto: dict, status: dict) -> str:
     if execution_status == "not_terminal":
         return "round_not_terminal"
     last = (status.get("phase") or {}).get("lastDecision") or {}
-    if last.get("reason"):
+    if last.get("reason") and last.get("reason") != "ready":
         # The script's post-round classification (for example a pause or a
-        # budget stop) is authoritative for that round's delivery gap.
+        # budget stop) is authoritative for that round's delivery gap. A stale
+        # "ready" is not a blocked reason once the current receipts disagree.
         return str(last["reason"])
     scope = readiness.get("scope")
     if isinstance(scope, dict):
         scope = scope.get("status")
     if scope == "violation":
         return "scope_violation"
-    statuses = {item.get("status") for item in readiness.get("items") or []}
+    items = readiness.get("items")
+    if not isinstance(items, list):
+        evidence = (status.get("phase") or {}).get("evidence")
+        items = evidence.get("items") if isinstance(evidence, dict) else None
+    statuses = {item.get("status") for item in items or [] if isinstance(item, dict)}
     if statuses & {"failed", "skipped", "unknown"}:
         return "required_check_failed"
     budget = readiness.get("budget") or {}

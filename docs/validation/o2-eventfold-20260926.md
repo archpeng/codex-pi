@@ -80,18 +80,30 @@ Pi 使用量取自 `rounds/1`、`rounds/2` 的 `round.summary.json`（两轮均 
 - 看板与队列：`/private/tmp/codex-pi-o2-eventfold-20260926/repo/.git/codex-pi/board.json`、`board.queue.json`
 - 设计与工作树：`/private/tmp/codex-pi-o2-eventfold-20260926/worktree/DESIGN.md`、`PLAN.md`
 
-## 附：O3 发布准备的机械校验（本仓库）
+## 附：O3 发布准备的变更与最终校验（本仓库）
 
-最终候选为本文件所在提交；确切 SHA 由本轮最终报告与 `round.meta` 的 `endHead` 给出。校验命令、
-限额与实际回执如下：
+O3 第一轮发布准备（R1，commit `07cd6e3`）用 `pi_check --timeout-seconds 14400` 运行
+`full_suite`，而冻结 R1 契约声明 `commandTimeoutSeconds=180`。该回执虽然 exit 0、219 tests OK，
+但 wrapper deadline 超过契约命令上限，按修正后的证据门不能覆盖验收项；GPT 主会话因此对 R1
+标记 `changes_requested`。R1 失败回执保留在 `rounds/1/round.checks/`，不作为最终候选证据。
 
-| id | 命令 | 限额 | 结果与冻结回执 |
-| --- | --- | --- | --- |
-| full_suite | `python3 -m unittest discover -s tests -p 'test_*.py' -v` | `pi_check --timeout-seconds 14400`；本仓库套件实测约 368 秒，高于契约声明的 180 秒命令超时，故按 brief 的 helper 模板使用 14400 秒；无目录预算（`resourceLimits=[]`） | 预期 219 tests OK（基线 `7331da9` 的 O1 R6 回执已为 219 tests / 368.0 秒 / 干净 HEAD）；最终提交后复跑，回执见 `rounds/1/round.checks/full_suite-*.{json,log}` |
-| plugin_validate | `python3 /Users/jlpeng/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py /private/tmp/codex-pi-o3-release-prep-20260926` | `pi_check --timeout-seconds 14400` | 基线预验证 exit 0、输出 `Plugin validation passed`；最终提交后复跑，回执见 `rounds/1/round.checks/plugin_validate-*.{json,log}` |
-| diff_check | `git diff --check`；`git diff --check 7331da9..HEAD` | 直接运行 | 预期 exit 0、无输出（提交后在干净 HEAD 上运行） |
+O3 第二轮契约（SHA-256
+`643b8a7f13a7d05ec2a5a86a8c052c124e06eb63e68000a55ac5a22c41ada6cc`）把
+`commandTimeoutSeconds` 提升为 600，并在源码中同时修复 brief 示例与唯一 receipt 判定：阶段
+brief 使用契约命令上限，receipt 必须匹配验收项声明命令且 wrapper deadline 不超过契约上限；
+`tests/test_phase.py` 与 `tests/test_progress_echo.py` 用真实 Git/回执/日志路径覆盖 match、
+known mismatch 与 unknown/malformed 路径，并验证 `readiness`、board 事件与 `decide` 接受门共享
+同一判断。最终必需检查在最终干净提交上使用冻结的 round-2 `pi_check.py`、显式
+`--timeout-seconds 600`：
 
-上述 `round.checks` 目录指
-`/Users/jlpeng/plugins/codex-pi/.git/codex-pi/tasks/CODEX-PI-O3-RELEASE-PREP-20260926/rounds/1/round.checks/`；
-`pi_check` 每次运行生成带 nonce 的确切文件名，本轮最终报告列出其完整路径。`exit 0` 只表示执行
-结束，不代表 GPT 验收。
+| 验收项 | 命令 | 回执 |
+| --- | --- | --- |
+| contract_enforcement | `python3 -m unittest discover -s tests -p 'test_phase.py' -v` | `rounds/2/round.checks/contract_enforcement-*.{json,log}` |
+| full_suite | `python3 -m unittest discover -s tests -p 'test_*.py' -v` | `rounds/2/round.checks/full_suite-*.{json,log}` |
+| plugin_validate | `python3 /Users/jlpeng/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py /private/tmp/codex-pi-o3-release-prep-20260926` | `rounds/2/round.checks/plugin_validate-*.{json,log}` |
+
+`rounds/2/round.checks` 指
+`/Users/jlpeng/plugins/codex-pi/.git/codex-pi/tasks/CODEX-PI-O3-RELEASE-PREP-20260926/rounds/2/round.checks/`；
+`pi_check` 每次运行生成带 nonce 的确切文件名，本轮最终报告列出其完整路径。另有 `git diff --check`
+在最终干净 HEAD 上运行。这些 `exit 0` 只表示执行结束，O3 是否接受仍由 GPT 主会话决定；本文件
+记录的是证据与文档，不是自我验收。
