@@ -405,6 +405,20 @@ def cmd_arm(args) -> dict:
         require_allowed_model(frozen.get("model"), "handoff frozen task")
     except ValueError as exc:
         raise ValueError(f"task {task!r} is not eligible for handoff: {exc}") from None
+    try:
+        from pi_board import board_file_for_common, read_board
+        board_file = board_file_for_common(common)
+        if board_file.is_file():
+            board, _problem = read_board(board_file)
+            card = (board or {}).get("cards", {}).get(task)
+            if isinstance(card, dict) and card.get("transport") == "cli-queue":
+                raise ValueError(
+                    f"task {task!r} is registered with the cli-queue transport; the board queue "
+                    "owns notifications, so the legacy Stop handoff is not armed for it")
+    except ValueError:
+        raise
+    except Exception:  # noqa: BLE001 - board read trouble must not change legacy arming
+        pass
     numbers = [number for number, _ in list_rounds(task_dir)]
     if round_number not in numbers:
         raise ValueError(f"unknown round {round_number} for task {task!r}; known rounds: {numbers}")
@@ -712,6 +726,23 @@ def binding_needs_recovery(binding: dict) -> bool:
     return False
 
 
+def _queue_recovery_lines(session: str) -> list:
+    """Bounded cli-queue/monitor recovery evidence for one routed thread."""
+    try:
+        from pi_board import route_summary
+        summary = route_summary(session)
+    except Exception:  # noqa: BLE001 - recovery must never crash the hook
+        return []
+    if not summary:
+        return []
+    lines = []
+    if summary.get("paused"):
+        lines.append("route pause is active after an interrupt; explicit resume is required "
+                     "(nothing resumes automatically)")
+    lines.extend(summary.get("lines") or [])
+    return [bounded(line, 400) for line in lines[:10]]
+
+
 def handle_recovery(event_name: str, session: str) -> dict:
     root = handoff_root()
     items = []
@@ -726,7 +757,8 @@ def handle_recovery(event_name: str, session: str) -> dict:
             continue
         if binding.get("sessionId") == session and binding_needs_recovery(binding):
             items.append(binding)
-    if not items and not invalid:
+    queue_lines = _queue_recovery_lines(session)
+    if not items and not invalid and not queue_lines:
         return {}
     items.sort(key=lambda item: (item.get("armedAt") or 0, str(item.get("eventKey"))))
     lines = ["Codex-Pi handoff recovery (no automatic continuation was generated):"]
@@ -743,6 +775,9 @@ def handle_recovery(event_name: str, session: str) -> dict:
             lines.append("  explicit re-arm with --resume is required; nothing resumes automatically")
     for key, reason in invalid[:4]:
         lines.append(f"- event {key} state=invalid reason={bounded(reason, 200)}")
+    if queue_lines:
+        lines.append("Codex-Pi cli-queue transport (read-only recovery evidence):")
+        lines.extend(queue_lines)
     return {"hookSpecificOutput": {"hookEventName": event_name,
                                    "additionalContext": bounded("\n".join(lines), MAX_MESSAGE_BYTES)}}
 
@@ -757,11 +792,11 @@ def handle_interrupt(session: str, event: dict) -> dict:
     atomic(session_marker_path(root, session),
            {"schemaVersion": SCHEMA_VERSION, "sessionId": session, "suspendedAt": time.time(),
             "generation": generation, "turnId": bounded(event.get("turn_id") or "", 200)})
-    # Persist the same interruption for the opt-in board gate/claims: only an
+    # Persist the same interruption for the opt-in cli-queue route: only an
     # explicit resume may clear it, and normal prompts/SessionStart never do.
     try:
-        from pi_board import pause_session
-        pause_session(session, "user interrupted this Codex session")
+        from pi_board import pause_route
+        pause_route(session, "user interrupted this Codex session")
     except Exception:  # noqa: BLE001 - the handoff path must never crash on this
         pass
     deadline = time.monotonic() + INTERRUPT_BUDGET_SECONDS
@@ -852,6 +887,25 @@ def resolve_candidate(root: Path, binding: dict):
 def deliver_terminal(root: Path, binding: dict, repo: Path, task: str, task_dir: Path,
                      round_number: int, raw_state: str, expected_generation: int):
     key = binding["eventKey"]
+    # Explicit ownership rule: a cli-queue board task is notified by the board
+    # queue, never by the legacy Stop handoff. Unrelated legacy tasks are
+    # untouched and keep their original behavior.
+    try:
+        from pi_board import board_file_for_common, read_board
+        board_file = board_file_for_common(git_common_dir(repo))
+        if board_file.is_file():
+            board, _problem = read_board(board_file)
+            card = (board or {}).get("cards", {}).get(task)
+            if isinstance(card, dict) and card.get("transport") == "cli-queue":
+                mark_binding_state(root, key, "suspended",
+                                   error="board cli-queue owns notifications for this task",
+                                   expect_generation=expected_generation, expect_armed=True)
+                return {"systemMessage": bounded(
+                    f"codex-pi handoff {key}: task {task} is registered with the cli-queue "
+                    "transport; the board queue owns notification and no legacy continuation "
+                    "was generated")}
+    except (ValueError, OSError, LockHeld):
+        pass
     try:
         result = build_result(str(repo), task, round_number)
         require_allowed_model(result.get("model"), "handoff frozen task")
@@ -1023,24 +1077,7 @@ def dispatch_hook(event: dict) -> dict:
         return handle_stop(session)
     if name == "Interrupt":
         return handle_interrupt(session, event)
-    if name == "UserPromptSubmit":
-        prompt = event.get("prompt")
-        if isinstance(prompt, str) and prompt.startswith("<heartbeat>"):
-            # Only an exact registered session/id/instructions envelope is
-            # eligible; every other prompt keeps the old recovery behavior.
-            try:
-                from pi_board import evaluate_gate  # lazy: ordinary prompts never load the board
-                output = evaluate_gate(event)
-            except Exception as exc:  # never crash the host hook
-                output = {"hookSpecificOutput": {
-                    "hookEventName": "UserPromptSubmit",
-                    "additionalContext": bounded(
-                        f"codex-pi board gate failed safely ({exc}); the automatic tick was "
-                        "allowed through", 300)}}
-            if output is not None:
-                return output
-        return handle_recovery(name, session)
-    if name == "SessionStart":
+    if name in ("SessionStart", "UserPromptSubmit"):
         return handle_recovery(name, session)
     return {}
 

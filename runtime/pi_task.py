@@ -534,15 +534,16 @@ def board_refresh_seconds() -> float:
 
 
 def refresh_board_best_effort(task: dict) -> None:
-    """Opt-in board projection refresh inside the existing supervisor loop.
+    """Opt-in board projection refresh + cli-queue dispatch in the supervisor loop.
 
     It reuses bounded status/check evidence, never scans transcripts and never
     raises: a monitor error becomes bounded local evidence and the run goes on.
-    Unregistered tasks return without touching any board file.
+    Unregistered tasks return without touching any board file and never invoke
+    the queue command.
     """
     try:
-        from pi_board import refresh_supervisor
-        refresh_supervisor(task)
+        from pi_board import supervisor_tick
+        supervisor_tick(task)
     except Exception as exc:  # noqa: BLE001 - monitoring must never kill the worker
         try:
             from pi_board import record_monitor_error
@@ -1821,6 +1822,62 @@ def cmd_wait(args) -> dict:
     return status
 
 
+def cmd_upgrade(args) -> dict:
+    """Safely replace a non-running task's frozen helper snapshot.
+
+    Existing live workers are never hot-edited: the task and supervisor locks
+    must both be free. The next ``continue`` then runs the new helpers.
+    """
+    root = canonical_root(Path(args.repo))
+    common = git_common_dir(root)
+    task = require_task_arg(args.task)
+    task_dir = task_dir_for(common, task)
+    if not task_dir.is_dir():
+        raise ValueError(f"unknown task {task!r}; no evidence at {task_dir}")
+    frozen = read_json(task_dir / "task.json", None)
+    if not isinstance(frozen, dict) or frozen.get("task") != task:
+        raise ValueError(f"task {task!r} has no readable task.json; inspect {task_dir}")
+    frozen_repo = frozen.get("repo")
+    if not isinstance(frozen_repo, str) or Path(frozen_repo).expanduser().resolve() != root:
+        raise ValueError(f"task {task!r} belongs to checkout {frozen_repo!r}, not {root}")
+    if lock_is_held(task_dir / ".task.lock") or lock_is_held(task_dir / ".supervisor.lock"):
+        raise ValueError("task is active; the frozen helper snapshot is never hot-edited while a "
+                         "worker or supervisor owns the task")
+    rounds = list_rounds(task_dir)
+    if not rounds:
+        raise ValueError(f"task {task!r} has no rounds yet")
+    source = Path(__file__).resolve().parent
+    staging = task_dir / "tools.new"
+    shutil.rmtree(staging, ignore_errors=True)
+    hashes = snapshot_helpers(source, staging)
+    tools = task_dir / "tools"
+    backup = task_dir / f"tools.old-{int(time.time())}"
+    moved_old = False
+    try:
+        if tools.exists():
+            os.replace(tools, backup)
+            moved_old = True
+        os.replace(staging, tools)
+    except OSError as exc:
+        shutil.rmtree(staging, ignore_errors=True)
+        if moved_old and not tools.exists() and backup.exists():
+            try:
+                os.replace(backup, tools)
+            except OSError:
+                pass
+        raise ValueError(f"helper snapshot upgrade failed safely: {exc}") from None
+    frozen.update(helperHashes=hashes, runtimeVersion=runtime_version(), upgradedAt=time.time())
+    history = frozen.get("upgradeHistory") if isinstance(frozen.get("upgradeHistory"), list) else []
+    frozen["upgradeHistory"] = (history[-4:] + [{"at": frozen["upgradedAt"],
+                                                  "runtimeVersion": frozen["runtimeVersion"]}])
+    atomic(task_dir / "task.json", frozen)
+    return {"ok": True, "task": task, "runtimeVersion": frozen["runtimeVersion"],
+            "helperHashes": hashes, "toolsDir": str(tools),
+            "backupDir": str(backup) if moved_old else None,
+            "note": "known task snapshot upgraded; the next round uses the new helpers. "
+                    "Active tasks are refused and never hot-edited."}
+
+
 def cmd_cancel(args) -> dict:
     task = require_task_arg(args.task)
     root = canonical_root(Path(args.repo))
@@ -1975,6 +2032,11 @@ def build_parser() -> argparse.ArgumentParser:
     cancel = sub.add_parser("cancel", help="request cancellation of the owned worker's process group")
     add_repo_task(cancel)
     cancel.set_defaults(func=cmd_cancel)
+
+    upgrade = sub.add_parser("upgrade", help="safely replace a task's frozen helper snapshot when "
+                                              "no worker is active")
+    add_repo_task(upgrade)
+    upgrade.set_defaults(func=cmd_upgrade)
 
     worker = sub.add_parser("_worker", help=argparse.SUPPRESS)
     worker.add_argument("--task-dir", required=True)

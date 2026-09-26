@@ -435,6 +435,11 @@ class LifecycleTest(unittest.TestCase):
         repo.start("dupe-live", worktree, env=env)
         repo.wait_round_state("dupe-live", "running")
         task_dir = repo.task_dir("dupe-live")
+        round_log = task_dir / "rounds" / "1" / "round.jsonl"
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not round_log.read_text(
+                encoding="utf-8", errors="replace").strip():
+            time.sleep(0.05)
         before = snapshot_files(task_dir)
         blocked = repo.start("dupe-live", worktree, env=env, expect=2)
         self.assertIn("already exists", blocked.stderr)
