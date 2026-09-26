@@ -133,29 +133,48 @@ class HandoffTest(unittest.TestCase):
         return repo, worktree
 
     def arm(self, repo, session: str, tmp: Path, env: dict, task: str = "alpha",
-            round_number: int = 1, wait_seconds: float = 60, expect: int | None = 0,
-            resume: bool = False):
+            round_number: int = 1, expect: int | None = 0, resume: bool = False):
         args = ["arm", "--repo", str(repo.root), "--task", task,
-                "--round", str(round_number), "--session-id", session,
-                "--wait-seconds", str(wait_seconds)]
+                "--round", str(round_number), "--session-id", session]
         if resume:
             args.append("--resume")
         return run_handoff(*args, env=env, expect=expect)
 
+    def legacy_wait(self, key: str, seconds: float = 14400) -> None:
+        """Rewrite a fresh record into a legacy 0.2 binding with a long wait."""
+        data = read_binding(self.tmp, key)
+        data["waitSeconds"] = seconds
+        binding_file(self.tmp, key).write_text(json.dumps(data), encoding="utf-8")
+
     # ------------------------------------------------------------------
-    def test_delayed_success_blocks_once_after_terminal_with_concurrent_hooks(self):
+    def test_quick_stop_never_waits_and_delivers_once_after_terminal(self):
         repo, worktree = self.make()
         env = h_env(self.tmp, PI_DOUBLE_MODE="delay-ok", PI_DOUBLE_DELAY="1.5")
         repo.start("alpha", worktree, env=env)
+        repo.wait_round_state("alpha", "running")
         arm = json.loads(self.arm(repo, "session-a", self.tmp, env).stdout)
         key = arm["eventKey"]
         self.assertEqual(arm["binding"]["state"], "armed")
+        self.assertEqual(read_binding(self.tmp, key)["waitSeconds"], 0)
+        self.legacy_wait(key)
+
+        started = time.monotonic()
+        pending = run_hook("Stop", "session-a", self.tmp, env, timeout=20)
+        elapsed = time.monotonic() - started
+        self.assertEqual(pending, {})
+        self.assertLess(elapsed, 5, "a live worker and legacy four-hour wait must not make Stop wait")
+        self.assertEqual(read_binding(self.tmp, key)["state"], "armed",
+                         "a pending event stays armed instead of expiring")
+        os.kill(wait_pi_pid(repo, "alpha"), 0)
+
+        result = repo.wait_terminal("alpha", env=env)
+        self.assertEqual(result["state"], "completed")
 
         processes = [start_hook("Stop", "session-a", self.tmp, env) for _ in range(2)]
         outputs = []
         for process in processes:
             stdout, stderr = process.communicate(
-                hook_payload("Stop", "session-a"), timeout=90)
+                hook_payload("Stop", "session-a"), timeout=30)
             self.assertEqual(process.returncode, 0, stderr)
             outputs.append(json.loads(stdout))
         blocks = [item for item in outputs if item.get("decision") == "block"]
@@ -187,7 +206,7 @@ class HandoffTest(unittest.TestCase):
         env = h_env(self.tmp, PI_DOUBLE_MODE="fail")
         repo.start("beta", worktree, env=env)
         repo.wait_terminal("beta", env=env)
-        arm = json.loads(self.arm(repo, "session-b", self.tmp, env, task="beta", wait_seconds=10).stdout)
+        arm = json.loads(self.arm(repo, "session-b", self.tmp, env, task="beta").stdout)
         first = run_hook("Stop", "session-b", self.tmp, env)
         self.assertEqual(first.get("decision"), "block")
         self.assertIn("terminal_state=failed", first["reason"])
@@ -202,8 +221,7 @@ class HandoffTest(unittest.TestCase):
         result = repo.wait_terminal("gamma", env=env)
         self.assertEqual(result["state"], "completed")
         armed = handoff_json("arm", "--repo", str(repo.root), "--task", "gamma",
-                             "--round", "1", "--session-id", "session-c",
-                             "--wait-seconds", "1", env=env)
+                             "--round", "1", "--session-id", "session-c", env=env)
         first = run_hook("Stop", "session-c", self.tmp, env)
         self.assertEqual(first.get("decision"), "block")
         self.assertEqual(run_hook("Stop", "session-c", self.tmp, env), {})
@@ -213,7 +231,8 @@ class HandoffTest(unittest.TestCase):
         repo, worktree = self.make(default_config(timeoutSeconds=1))
         env = h_env(self.tmp, PI_DOUBLE_MODE="hang")
         repo.start("timeout", worktree, env=env)
-        self.arm(repo, "session-t", self.tmp, env, task="timeout", wait_seconds=20)
+        repo.wait_terminal("timeout", env=env, timeout=25)
+        self.arm(repo, "session-t", self.tmp, env, task="timeout")
         output = run_hook("Stop", "session-t", self.tmp, env)
         self.assertEqual(output.get("decision"), "block")
         self.assertIn("terminal_state=timed_out", output["reason"])
@@ -222,83 +241,195 @@ class HandoffTest(unittest.TestCase):
         result = repo.wait_terminal("timeout", env=env)
         self.assertEqual(result["state"], "timed_out")
 
-    def test_hook_wait_timeout_leaves_pi_alive_with_recovery_evidence(self):
+    def test_pending_stop_leaves_pi_alive_and_event_armed(self):
         repo, worktree = self.make()
         env = h_env(self.tmp, PI_DOUBLE_MODE="hang")
         repo.start("waiting", worktree, env=env)
         repo.wait_round_state("waiting", "running")
-        armed = handoff_json("arm", "--repo", str(repo.root), "--task", "waiting",
-                             "--round", "1", "--session-id", "session-w",
-                             "--wait-seconds", "2", env=env)
+        armed = json.loads(self.arm(repo, "session-w", self.tmp, env, task="waiting").stdout)
         started = time.monotonic()
-        output = run_hook("Stop", "session-w", self.tmp, env, timeout=30)
+        output = run_hook("Stop", "session-w", self.tmp, env, timeout=20)
         elapsed = time.monotonic() - started
-        self.assertLess(elapsed, 20)
-        self.assertNotIn("decision", output)
-        self.assertIn("wait expired", output.get("systemMessage", ""))
+        self.assertLess(elapsed, 5)
+        self.assertEqual(output, {})
+        binding = read_binding(self.tmp, armed["eventKey"])
+        self.assertEqual(binding["state"], "armed")
+        self.assertIsNone(binding.get("lastWaitExpiredAt"))
         status = handoff_json("status", "--event-key", armed["eventKey"], env=env)
         item = status["bindings"][0]
-        self.assertEqual(item["state"], "expired")
-        self.assertIn("wait expired", item["lastError"] or "")
+        self.assertEqual(item["state"], "armed")
         self.assertTrue(item["evidence"]["taskDir"].endswith("tasks/waiting"))
         os.kill(wait_pi_pid(repo, "waiting"), 0)
         repo.cancel("waiting", env=env)
         self.assertEqual(repo.wait_terminal("waiting", env=env, timeout=25)["state"], "cancelled")
-
-    def test_expired_wait_requires_explicit_resume(self):
-        repo, worktree = self.make()
-        env = h_env(self.tmp, PI_DOUBLE_MODE="hang")
-        repo.start("expire", worktree, env=env)
-        repo.wait_round_state("expire", "running")
-        armed = json.loads(self.arm(repo, "session-ex", self.tmp, env, task="expire",
-                                    wait_seconds=1).stdout)
-        expired = run_hook("Stop", "session-ex", self.tmp, env, timeout=30)
-        self.assertNotIn("decision", expired)
-        self.assertIn("wait expired", expired.get("systemMessage", ""))
-        self.assertEqual(read_binding(self.tmp, armed["eventKey"])["state"], "expired")
-
-        repo.cancel("expire", env=env)
-        self.assertEqual(repo.wait_terminal("expire", env=env, timeout=25)["state"], "cancelled")
-        repeated = run_hook("Stop", "session-ex", self.tmp, env)
-        self.assertNotIn("decision", repeated, "an expired event must never auto-continue")
-        self.assertEqual(read_binding(self.tmp, armed["eventKey"])["state"], "expired")
-
-        blocked = self.arm(repo, "session-ex", self.tmp, env, task="expire", expect=2)
-        self.assertIn("--resume", blocked.stderr)
-        self.assertEqual(read_binding(self.tmp, armed["eventKey"])["state"], "expired")
-        resumed = json.loads(self.arm(repo, "session-ex", self.tmp, env, task="expire",
-                                      wait_seconds=5, resume=True).stdout)
-        self.assertTrue(resumed["resumed"])
-        self.assertEqual(read_binding(self.tmp, armed["eventKey"])["state"], "armed")
-        delivered = run_hook("Stop", "session-ex", self.tmp, env)
+        delivered = run_hook("Stop", "session-w", self.tmp, env)
         self.assertEqual(delivered.get("decision"), "block")
         self.assertIn("terminal_state=cancelled", delivered["reason"])
-        ack_event(armed["eventKey"], "session-ex", env)
+        self.assertTrue(read_binding(self.tmp, armed["eventKey"])["delivery"]["cancelled"])
+        ack_event(armed["eventKey"], "session-w", env)
 
-    def test_interrupt_while_stop_waits_prevents_continuation_promptly(self):
+    def test_arm_rejects_positive_wait_seconds_with_actionable_message(self):
         repo, worktree = self.make()
-        env = h_env(self.tmp, PI_DOUBLE_MODE="delay-ok", PI_DOUBLE_DELAY="8")
+        env = h_env(self.tmp, PI_DOUBLE_MODE="hang")
+        repo.start("nowait", worktree, env=env)
+        repo.wait_round_state("nowait", "running")
+        blocked = run_handoff("arm", "--repo", str(repo.root), "--task", "nowait",
+                              "--round", "1", "--session-id", "session-nw",
+                              "--wait-seconds", "60", env=env, expect=2)
+        self.assertIn("positive Stop wait window is no longer supported", blocked.stderr)
+        self.assertIn("bounded pi_task.py wait/status", blocked.stderr)
+        self.assertEqual(list((handoff_root(self.tmp) / "bindings").glob("*.json")), [])
+        os.kill(wait_pi_pid(repo, "nowait"), 0)
+        repo.cancel("nowait", env=env)
+        self.assertEqual(repo.wait_terminal("nowait", env=env, timeout=25)["state"], "cancelled")
+
+    def test_release_is_owner_scoped_idempotent_and_old_loop_compatible(self):
+        repo, worktree = self.make()
+        env = h_env(self.tmp, PI_DOUBLE_MODE="hang")
+        repo.start("release", worktree, env=env)
+        repo.wait_round_state("release", "running")
+        armed = json.loads(self.arm(repo, "session-rel", self.tmp, env, task="release").stdout)
+        key = armed["eventKey"]
+        self.legacy_wait(key)
+
+        wrong = run_handoff("release", "--event-key", key, "--session-id", "session-other",
+                            env=env, expect=2)
+        self.assertIn("does not match", wrong.stderr)
+        self.assertEqual(read_binding(self.tmp, key)["generation"], 1)
+        missing = run_handoff("release", "--event-key", key, env=env, expect=2)
+        self.assertIn("event owner session", missing.stderr)
+
+        # The 0.2 loop conditions are generation change or state change: a real
+        # polling observer must exit within its poll interval after release.
+        observer_script = (
+            "import json, sys, time\n"
+            "path = sys.argv[1]\n"
+            "started = time.monotonic()\n"
+            "while True:\n"
+            "    data = json.load(open(path))\n"
+            "    if data.get('generation') != 1 or data.get('state') != 'armed':\n"
+            "        print(json.dumps({'elapsed': time.monotonic() - started,\n"
+            "                          'generation': data.get('generation'),\n"
+            "                          'state': data.get('state')}))\n"
+            "        break\n"
+            "    time.sleep(0.1)\n")
+        observer = subprocess.Popen(
+            [sys.executable, "-c", observer_script, str(binding_file(self.tmp, key))],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        time.sleep(0.3)
+        released = handoff_json("release", "--event-key", key, "--session-id", "session-rel", env=env)
+        stdout, stderr = observer.communicate(timeout=10)
+        self.assertEqual(observer.returncode, 0, stderr)
+        observed = json.loads(stdout)
+        self.assertLess(observed["elapsed"], 3, "the waiting hook must observe release within a poll interval")
+        self.assertEqual(observed["generation"], 2)
+        self.assertEqual(observed["state"], "suspended")
+
+        self.assertFalse(released["alreadyReleased"])
+        binding = read_binding(self.tmp, key)
+        self.assertEqual(binding["state"], "suspended")
+        self.assertEqual(binding["releaseReason"], "released for bounded tool waiting")
+        self.assertEqual(binding["lastError"], "released for bounded tool waiting")
+        self.assertEqual(binding["generation"], 2)
+        self.assertEqual(binding["task"], "release")
+        self.assertEqual(binding["round"], 1)
+        self.assertFalse(session_marker(self.tmp, "session-rel").exists(),
+                         "release must not forge a user interrupt marker")
+        os.kill(wait_pi_pid(repo, "release"), 0)  # release never cancels Pi
+
+        duplicate = handoff_json("release", "--event-key", key, "--session-id", "session-rel", env=env)
+        self.assertTrue(duplicate["alreadyReleased"])
+        self.assertEqual(read_binding(self.tmp, key)["generation"], 2,
+                         "duplicate release must not bump generation again")
+        # A released event stays suspended: Stop neither delivers nor expires it.
+        self.assertEqual(run_hook("Stop", "session-rel", self.tmp, env), {})
+        self.assertEqual(read_binding(self.tmp, key)["state"], "suspended")
+        # Explicit resume uses the CAS generation path and bumps again.
+        resumed = json.loads(self.arm(repo, "session-rel", self.tmp, env, task="release", resume=True).stdout)
+        self.assertTrue(resumed["resumed"])
+        self.assertEqual(read_binding(self.tmp, key)["generation"], 3)
+        self.assertEqual(read_binding(self.tmp, key)["state"], "armed")
+        repo.cancel("release", env=env)
+        self.assertEqual(repo.wait_terminal("release", env=env, timeout=25)["state"], "cancelled")
+        delivered = run_hook("Stop", "session-rel", self.tmp, env)
+        self.assertEqual(delivered.get("decision"), "block")
+        ack_event(key, "session-rel", env)
+
+    def test_release_refuses_terminal_delivered_and_acked_records(self):
+        repo, worktree = self.make()
+        env = h_env(self.tmp, PI_DOUBLE_MODE="ok")
+        repo.start("releasedone", worktree, env=env)
+        repo.wait_terminal("releasedone", env=env)
+        armed = json.loads(self.arm(repo, "session-rd", self.tmp, env, task="releasedone").stdout)
+        key = armed["eventKey"]
+        data = read_binding(self.tmp, key)
+        data["state"] = "needs_recovery"
+        data["lastError"] = "synthetic recovery evidence"
+        binding_file(self.tmp, key).write_text(json.dumps(data), encoding="utf-8")
+        early = run_handoff("release", "--event-key", key, "--session-id", "session-rd",
+                            env=env, expect=2)
+        self.assertIn("release only migrates an armed", early.stderr)
+        self.assertEqual(read_binding(self.tmp, key)["state"], "needs_recovery")
+        data["state"] = "armed"
+        data["lastError"] = None
+        binding_file(self.tmp, key).write_text(json.dumps(data), encoding="utf-8")
+
+        delivered = run_hook("Stop", "session-rd", self.tmp, env)
+        self.assertEqual(delivered.get("decision"), "block")
+        blocked = run_handoff("release", "--event-key", key, "--session-id", "session-rd",
+                              env=env, expect=2)
+        self.assertIn("must not be erased", blocked.stderr)
+        self.assertEqual(read_binding(self.tmp, key)["state"], "delivered")
+        self.assertIsNotNone(read_binding(self.tmp, key)["deliveredAt"])
+
+        first = ack_event(key, "session-rd", env)
+        blocked = run_handoff("release", "--event-key", key, "--session-id", "session-rd",
+                              env=env, expect=2)
+        self.assertIn("must not be erased", blocked.stderr)
+        binding = read_binding(self.tmp, key)
+        self.assertEqual(binding["state"], "acked")
+        self.assertEqual(binding["ackedAt"], first["ackAt"])
+
+    def test_resumed_generation_is_not_demoted_by_quick_stop(self):
+        repo, worktree = self.make()
+        env = h_env(self.tmp, PI_DOUBLE_MODE="hang")
+        repo.start("genstop", worktree, env=env)
+        repo.wait_round_state("genstop", "running")
+        armed = json.loads(self.arm(repo, "session-gen", self.tmp, env, task="genstop").stdout)
+        key = armed["eventKey"]
+        self.assertEqual(run_hook("Stop", "session-gen", self.tmp, env), {})
+        self.assertEqual(read_binding(self.tmp, key)["state"], "armed")
+        self.assertEqual(read_binding(self.tmp, key)["generation"], 1)
+        handoff_json("release", "--event-key", key, "--session-id", "session-gen", env=env)
+        self.assertEqual(read_binding(self.tmp, key)["generation"], 2)
+        self.arm(repo, "session-gen", self.tmp, env, task="genstop", resume=True)
+        self.assertEqual(read_binding(self.tmp, key)["generation"], 3)
+        self.assertEqual(read_binding(self.tmp, key)["state"], "armed")
+        self.assertEqual(run_hook("Stop", "session-gen", self.tmp, env), {})
+        binding = read_binding(self.tmp, key)
+        self.assertEqual(binding["state"], "armed", "a quick Stop must not demote a resumed generation")
+        self.assertEqual(binding["generation"], 3)
+        repo.cancel("genstop", env=env)
+        self.assertEqual(repo.wait_terminal("genstop", env=env, timeout=25)["state"], "cancelled")
+
+    def test_quick_stop_then_interrupt_suspends_while_pi_continues(self):
+        repo, worktree = self.make()
+        env = h_env(self.tmp, PI_DOUBLE_MODE="hang")
         repo.start("interrupting", worktree, env=env)
         repo.wait_round_state("interrupting", "running")
-        armed = handoff_json("arm", "--repo", str(repo.root), "--task", "interrupting",
-                             "--round", "1", "--session-id", "session-i",
-                             "--wait-seconds", "60", env=env)
-        stop = start_hook("Stop", "session-i", self.tmp, env)
-        stop.stdin.write(hook_payload("Stop", "session-i"))
-        stop.stdin.close()
-        time.sleep(1.5)
+        armed = json.loads(self.arm(repo, "session-i", self.tmp, env, task="interrupting").stdout)
+        started = time.monotonic()
+        output = run_hook("Stop", "session-i", self.tmp, env, timeout=20)
+        self.assertLess(time.monotonic() - started, 5, "Stop must not wait for the live worker")
+        self.assertEqual(output, {})
+        self.assertEqual(read_binding(self.tmp, armed["eventKey"])["state"], "armed")
         started = time.monotonic()
         interrupt = run_hook("Interrupt", "session-i", self.tmp, env)
         self.assertEqual(interrupt, {})
         self.assertLess(time.monotonic() - started, 5, "Interrupt hook must return promptly")
-        returncode = stop.wait(timeout=15)
-        stdout, stderr = stop.stdout.read(), stop.stderr.read()
-        stop.stdout.close()
-        stop.stderr.close()
-        self.assertEqual(returncode, 0, stderr)
-        self.assertNotIn("decision", json.loads(stdout), "interrupted Stop must not continue")
         binding = read_binding(self.tmp, armed["eventKey"])
         self.assertEqual(binding["state"], "suspended")
+        self.assertIn("interrupted", binding["lastError"] or "")
         os.kill(wait_pi_pid(repo, "interrupting"), 0)  # Pi keeps running after a user interrupt
         repo.cancel("interrupting", env=env)
         self.assertEqual(repo.wait_terminal("interrupting", env=env, timeout=25)["state"],
@@ -310,8 +441,7 @@ class HandoffTest(unittest.TestCase):
         repo.start("wrong", worktree, env=env)
         repo.wait_terminal("wrong", env=env)
         armed = handoff_json("arm", "--repo", str(repo.root), "--task", "wrong",
-                             "--round", "1", "--session-id", "session-right",
-                             "--wait-seconds", "1", env=env)
+                             "--round", "1", "--session-id", "session-right", env=env)
         self.assertEqual(run_hook("Stop", "session-wrong", self.tmp, env), {})
         self.assertEqual(run_hook("Stop", "session-nobody", self.tmp, env), {})
         binding = read_binding(self.tmp, armed["eventKey"])
@@ -327,8 +457,7 @@ class HandoffTest(unittest.TestCase):
         repo.start("corrupt", worktree, env=env)
         repo.wait_terminal("corrupt", env=env)
         armed = handoff_json("arm", "--repo", str(repo.root), "--task", "corrupt",
-                             "--round", "1", "--session-id", "session-x",
-                             "--wait-seconds", "1", env=env)
+                             "--round", "1", "--session-id", "session-x", env=env)
         binding_file(self.tmp, armed["eventKey"]).write_text("{not json", encoding="utf-8")
         corrupt = run_hook("Stop", "session-x", self.tmp, env)
         self.assertNotIn("decision", corrupt)
@@ -338,8 +467,7 @@ class HandoffTest(unittest.TestCase):
         repo2.start("rewrite", worktree2, env=env)
         repo2.wait_terminal("rewrite", env=env)
         armed2 = handoff_json("arm", "--repo", str(repo2.root), "--task", "rewrite",
-                              "--round", "1", "--session-id", "session-y",
-                              "--wait-seconds", "1", env=env)
+                              "--round", "1", "--session-id", "session-y", env=env)
         data = read_binding(self.tmp, armed2["eventKey"])
         data["repo"] = "/definitely/missing/repo"
         binding_file(self.tmp, armed2["eventKey"]).write_text(json.dumps(data), encoding="utf-8")
@@ -351,8 +479,7 @@ class HandoffTest(unittest.TestCase):
         repo3.start("gone", worktree3, env=env)
         repo3.wait_terminal("gone", env=env)
         handoff_json("arm", "--repo", str(repo3.root), "--task", "gone",
-                     "--round", "1", "--session-id", "session-z2",
-                     "--wait-seconds", "1", env=env)
+                     "--round", "1", "--session-id", "session-z2", env=env)
         shutil.rmtree(repo3.root)
         gone = run_hook("Stop", "session-z2", self.tmp, env)
         self.assertNotIn("decision", gone)
@@ -380,8 +507,9 @@ class HandoffTest(unittest.TestCase):
 
     def test_arm_is_idempotent_and_refuses_live_rebind_across_sessions(self):
         repo, worktree = self.make()
-        env = h_env(self.tmp, PI_DOUBLE_MODE="delay-ok", PI_DOUBLE_DELAY="2")
+        env = h_env(self.tmp, PI_DOUBLE_MODE="ok")
         repo.start("rebind", worktree, env=env)
+        repo.wait_terminal("rebind", env=env)
         first = json.loads(self.arm(repo, "session-one", self.tmp, env, task="rebind").stdout)
         again = json.loads(self.arm(repo, "session-one", self.tmp, env, task="rebind").stdout)
         self.assertTrue(again["idempotent"])
@@ -395,8 +523,7 @@ class HandoffTest(unittest.TestCase):
         still_live = self.arm(repo, "session-two", self.tmp, env, task="rebind", expect=2)
         self.assertIn("ack it before rebinding", still_live.stderr)
         ack_event(first["eventKey"], "session-one", env)
-        rebound = json.loads(self.arm(repo, "session-two", self.tmp, env, task="rebind",
-                                      wait_seconds=5).stdout)
+        rebound = json.loads(self.arm(repo, "session-two", self.tmp, env, task="rebind").stdout)
         self.assertNotEqual(rebound["eventKey"], first["eventKey"])
         self.assertFalse(rebound["idempotent"])
 
@@ -407,7 +534,7 @@ class HandoffTest(unittest.TestCase):
         repo.wait_terminal("race-arm", env=env)
         processes = [subprocess.Popen(
             [sys.executable, str(HANDOFF), "arm", "--repo", str(repo.root), "--task", "race-arm",
-             "--round", "1", "--session-id", session, "--wait-seconds", "1"],
+             "--round", "1", "--session-id", session],
             env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             for session in ("race-one", "race-two")]
         results = [process.communicate(timeout=60) for process in processes]
@@ -424,14 +551,14 @@ class HandoffTest(unittest.TestCase):
         repo.start("rounds", worktree, env=env)
         repo.wait_terminal("rounds", env=env)
         one = handoff_json("arm", "--repo", str(repo.root), "--task", "rounds", "--round", "1",
-                           "--session-id", "session-r", "--wait-seconds", "1", env=env)
+                           "--session-id", "session-r", env=env)
         first = run_hook("Stop", "session-r", self.tmp, env)
         self.assertEqual(first.get("decision"), "block")
         ack_event(one["eventKey"], "session-r", env)
         repo.continue_task("rounds", env=env)
         repo.wait_terminal("rounds", env=env)
         two = handoff_json("arm", "--repo", str(repo.root), "--task", "rounds", "--round", "2",
-                           "--session-id", "session-r", "--wait-seconds", "1", env=env)
+                           "--session-id", "session-r", env=env)
         self.assertNotEqual(one["eventKey"], two["eventKey"])
         second = run_hook("Stop", "session-r", self.tmp, env, active=True)
         self.assertEqual(second.get("decision"), "block",
@@ -447,7 +574,7 @@ class HandoffTest(unittest.TestCase):
         repo.start("acking", worktree, env=env)
         repo.wait_terminal("acking", env=env)
         armed = handoff_json("arm", "--repo", str(repo.root), "--task", "acking", "--round", "1",
-                             "--session-id", "session-a", "--wait-seconds", "1", env=env)
+                             "--session-id", "session-a", env=env)
 
         early = run_handoff("ack", "--event-key", armed["eventKey"], "--session-id", "session-a",
                             env=env, expect=2)
@@ -483,7 +610,7 @@ class HandoffTest(unittest.TestCase):
         repo.start("schema", worktree, env=env)
         repo.wait_terminal("schema", env=env)
         armed = handoff_json("arm", "--repo", str(repo.root), "--task", "schema", "--round", "1",
-                             "--session-id", "session-iv1", "--wait-seconds", "1", env=env)
+                             "--session-id", "session-iv1", env=env)
         data = read_binding(self.tmp, armed["eventKey"])
         data["schemaVersion"] = 2
         binding_file(self.tmp, armed["eventKey"]).write_text(json.dumps(data), encoding="utf-8")
@@ -496,7 +623,7 @@ class HandoffTest(unittest.TestCase):
         repo2.start("rekey", worktree2, env=env)
         repo2.wait_terminal("rekey", env=env)
         armed2 = handoff_json("arm", "--repo", str(repo2.root), "--task", "rekey", "--round", "1",
-                              "--session-id", "session-iv2", "--wait-seconds", "1", env=env)
+                              "--session-id", "session-iv2", env=env)
         data2 = read_binding(self.tmp, armed2["eventKey"])
         data2["eventKey"] = "d" * 64
         binding_file(self.tmp, armed2["eventKey"]).write_text(json.dumps(data2), encoding="utf-8")
@@ -508,7 +635,7 @@ class HandoffTest(unittest.TestCase):
         repo3.start("frozen", worktree3, env=env)
         repo3.wait_terminal("frozen", env=env)
         armed3 = handoff_json("arm", "--repo", str(repo3.root), "--task", "frozen", "--round", "1",
-                              "--session-id", "session-iv3", "--wait-seconds", "1", env=env)
+                              "--session-id", "session-iv3", env=env)
         valid = read_binding(self.tmp, armed3["eventKey"])
         task_json = repo3.task_dir("frozen") / "task.json"
         frozen = json.loads(task_json.read_text(encoding="utf-8"))
@@ -531,7 +658,7 @@ class HandoffTest(unittest.TestCase):
         repo.start("recover", worktree, env=env)
         repo.wait_terminal("recover", env=env)
         armed = handoff_json("arm", "--repo", str(repo.root), "--task", "recover", "--round", "1",
-                             "--session-id", "session-u", "--wait-seconds", "1", env=env)
+                             "--session-id", "session-u", env=env)
         first = run_hook("Stop", "session-u", self.tmp, env)
         self.assertEqual(first.get("decision"), "block")
         self.assertEqual(run_hook("Stop", "session-u", self.tmp, env), {},
@@ -546,35 +673,29 @@ class HandoffTest(unittest.TestCase):
 
     def test_explicit_rearm_resumes_suspended_event(self):
         repo, worktree = self.make()
-        env = h_env(self.tmp, PI_DOUBLE_MODE="delay-ok", PI_DOUBLE_DELAY="6")
+        env = h_env(self.tmp, PI_DOUBLE_MODE="hang")
         repo.start("resume", worktree, env=env)
         repo.wait_round_state("resume", "running")
-        armed = json.loads(self.arm(repo, "session-e", self.tmp, env, task="resume",
-                                    wait_seconds=60).stdout)
-        stop = start_hook("Stop", "session-e", self.tmp, env)
-        stop.stdin.write(hook_payload("Stop", "session-e"))
-        stop.stdin.close()
-        time.sleep(1.2)
+        armed = json.loads(self.arm(repo, "session-e", self.tmp, env, task="resume").stdout)
+        self.assertEqual(run_hook("Stop", "session-e", self.tmp, env), {})
+        self.assertEqual(read_binding(self.tmp, armed["eventKey"])["state"], "armed")
         self.assertEqual(run_hook("Interrupt", "session-e", self.tmp, env), {})
-        self.assertEqual(stop.wait(timeout=15), 0)
-        stdout = stop.stdout.read()
-        stop.stdout.close()
-        stop.stderr.close()
-        self.assertNotIn("decision", json.loads(stdout), "a suspended event must not continue")
         self.assertEqual(read_binding(self.tmp, armed["eventKey"])["state"], "suspended")
 
         blocked = self.arm(repo, "session-e", self.tmp, env, task="resume", expect=2)
         self.assertIn("--resume", blocked.stderr)
         self.assertEqual(read_binding(self.tmp, armed["eventKey"])["state"], "suspended")
-        resumed = json.loads(self.arm(repo, "session-e", self.tmp, env, task="resume",
-                                      wait_seconds=60, resume=True).stdout)
+        resumed = json.loads(self.arm(repo, "session-e", self.tmp, env, task="resume", resume=True).stdout)
         self.assertFalse(resumed["idempotent"])
         self.assertTrue(resumed["resumed"])
         binding = read_binding(self.tmp, armed["eventKey"])
         self.assertEqual(binding["state"], "armed")
         self.assertEqual(binding["rearmCount"], 1)
+        repo.cancel("resume", env=env)
+        self.assertEqual(repo.wait_terminal("resume", env=env, timeout=25)["state"], "cancelled")
         delivered = run_hook("Stop", "session-e", self.tmp, env)
         self.assertEqual(delivered.get("decision"), "block")
+        self.assertIn("terminal_state=cancelled", delivered["reason"])
         ack_event(armed["eventKey"], "session-e", env)
 
     def test_interrupt_is_prompt_with_contended_binding_locks(self):
@@ -585,7 +706,7 @@ class HandoffTest(unittest.TestCase):
             repo.start(task, worktree, env=env)
             repo.wait_terminal(task, env=env)
             armed = handoff_json("arm", "--repo", str(repo.root), "--task", task, "--round", "1",
-                                 "--session-id", "session-lock", "--wait-seconds", "1", env=env)
+                                 "--session-id", "session-lock", env=env)
             keys.append(armed["eventKey"])
         handles = []
         try:
@@ -619,10 +740,8 @@ class HandoffTest(unittest.TestCase):
         repo_b.start("ready", worktree_b, env=env_ok)
         repo_b.wait_terminal("ready", env=env_ok)
 
-        first = json.loads(self.arm(repo_a, "session-m", self.tmp, env_ok, task="hang",
-                                    wait_seconds=60).stdout)
-        second = json.loads(self.arm(repo_b, "session-m", self.tmp, env_ok, task="ready",
-                                     wait_seconds=60).stdout)
+        first = json.loads(self.arm(repo_a, "session-m", self.tmp, env_ok, task="hang").stdout)
+        second = json.loads(self.arm(repo_b, "session-m", self.tmp, env_ok, task="ready").stdout)
         started = time.monotonic()
         output = run_hook("Stop", "session-m", self.tmp, env_ok, timeout=30)
         elapsed = time.monotonic() - started
@@ -647,7 +766,7 @@ class HandoffTest(unittest.TestCase):
         repo.start("shell", worktree, env=env)
         repo.wait_terminal("shell", env=env)
         armed = handoff_json("arm", "--repo", str(repo.root), "--task", "shell", "--round", "1",
-                             "--session-id", "session-shell", "--wait-seconds", "1", env=env)
+                             "--session-id", "session-shell", env=env)
 
         def shell_hook(name, session, active=False):
             proc = subprocess.run(["/bin/sh", "-c", resolved],
@@ -668,34 +787,34 @@ class HandoffTest(unittest.TestCase):
         self.assertEqual(stop.get("decision"), "block")
         ack_event(armed["eventKey"], "session-shell", env)
 
-    def test_wait_zero_inspects_once_then_expires(self):
+    def test_wait_zero_inspects_once_and_pending_stays_armed(self):
         env_ok = h_env(self.tmp, PI_DOUBLE_MODE="ok")
         repo, worktree = self.make(name="repo-zero-ready")
         repo.start("ready0", worktree, env=env_ok)
         repo.wait_terminal("ready0", env=env_ok)
-        armed = json.loads(self.arm(repo, "session-zero-ready", self.tmp, env_ok, task="ready0",
-                                    wait_seconds=0).stdout)
+        armed = json.loads(self.arm(repo, "session-zero-ready", self.tmp, env_ok, task="ready0").stdout)
         delivered = run_hook("Stop", "session-zero-ready", self.tmp, env_ok, timeout=30)
         self.assertEqual(delivered.get("decision"), "block",
-                         "wait-seconds 0 must still inspect an already-terminal round")
+                         "one quick pass must still inspect an already-terminal round")
         ack_event(armed["eventKey"], "session-zero-ready", env_ok)
 
         env_hang = h_env(self.tmp, PI_DOUBLE_MODE="hang")
         repo2, worktree2 = self.make(name="repo-zero-hang")
         repo2.start("hang0", worktree2, env=env_hang)
         repo2.wait_round_state("hang0", "running")
-        armed2 = json.loads(self.arm(repo2, "session-zero-hang", self.tmp, env_hang, task="hang0",
-                                     wait_seconds=0).stdout)
+        armed2 = json.loads(self.arm(repo2, "session-zero-hang", self.tmp, env_hang, task="hang0").stdout)
         pending = run_hook("Stop", "session-zero-hang", self.tmp, env_hang, timeout=30)
-        self.assertNotIn("decision", pending)
-        self.assertIn("wait expired", pending.get("systemMessage", ""))
-        self.assertEqual(read_binding(self.tmp, armed2["eventKey"])["state"], "expired")
+        self.assertEqual(pending, {})
+        self.assertEqual(read_binding(self.tmp, armed2["eventKey"])["state"], "armed")
         os.kill(wait_pi_pid(repo2, "hang0"), 0)
         repo2.cancel("hang0", env=env_hang)
         self.assertEqual(repo2.wait_terminal("hang0", env=env_hang, timeout=25)["state"],
                          "cancelled")
+        delivered2 = run_hook("Stop", "session-zero-hang", self.tmp, env_hang)
+        self.assertEqual(delivered2.get("decision"), "block")
+        ack_event(armed2["eventKey"], "session-zero-hang", env_hang)
 
-    def test_terminal_record_with_lingering_ownership_is_not_delivered(self):
+    def test_terminal_record_with_lingering_ownership_stays_armed(self):
         repo, worktree = self.make()
         env = h_env(self.tmp, PI_DOUBLE_MODE="hang")
         repo.start("locks", worktree, env=env)
@@ -705,13 +824,13 @@ class HandoffTest(unittest.TestCase):
         state.update(state="completed", exitCode=0, endedAt=time.time(),
                      timedOut=False, cancelled=False)
         state_path.write_text(json.dumps(state), encoding="utf-8")
-        armed = json.loads(self.arm(repo, "session-lockhold", self.tmp, env, task="locks",
-                                    wait_seconds=30).stdout)
+        armed = json.loads(self.arm(repo, "session-lockhold", self.tmp, env, task="locks").stdout)
         output = run_hook("Stop", "session-lockhold", self.tmp, env, timeout=30)
         self.assertNotIn("decision", output,
                          "a terminal record still holding worker ownership must not continue")
         self.assertIn("ownership", output.get("systemMessage", ""))
-        self.assertEqual(read_binding(self.tmp, armed["eventKey"])["state"], "needs_recovery")
+        self.assertEqual(read_binding(self.tmp, armed["eventKey"])["state"], "armed",
+                         "ownership-uncertain terminal rounds stay armed, not expired")
         repo.cancel("locks", env=env)
         self.assertEqual(repo.wait_terminal("locks", env=env, timeout=25)["state"], "cancelled")
 
@@ -720,8 +839,7 @@ class HandoffTest(unittest.TestCase):
         env = h_env(self.tmp, PI_DOUBLE_MODE="hang")
         repo.start("orphan-sup", worktree, env=env)
         repo.wait_round_state("orphan-sup", "running")
-        armed = json.loads(self.arm(repo, "session-orphan", self.tmp, env, task="orphan-sup",
-                                    wait_seconds=60).stdout)
+        armed = json.loads(self.arm(repo, "session-orphan", self.tmp, env, task="orphan-sup").stdout)
         supervisor_pid = latest_state(repo, "orphan-sup")["supervisorPid"]
         pi_pid = wait_pi_pid(repo, "orphan-sup")
         kill_pid(supervisor_pid, signal.SIGKILL)
@@ -735,85 +853,23 @@ class HandoffTest(unittest.TestCase):
             kill_pid(pi_pid, signal.SIGKILL)
             self.assertTrue(wait_gone(pi_pid, 10))
 
-    def test_resume_generation_race_blocks_stale_hook(self):
+    def test_unknown_record_delivery_is_refused(self):
         repo, worktree = self.make()
         env = h_env(self.tmp, PI_DOUBLE_MODE="hang")
-        repo.start("race-resume", worktree, env=env)
-        repo.wait_round_state("race-resume", "running")
-        armed = json.loads(self.arm(repo, "session-gen", self.tmp, env, task="race-resume",
-                                    wait_seconds=60).stdout)
-        stop = start_hook("Stop", "session-gen", self.tmp, env)
-        stop.stdin.write(hook_payload("Stop", "session-gen"))
-        stop.stdin.close()
-        time.sleep(0.5)
-        self.assertEqual(run_hook("Interrupt", "session-gen", self.tmp, env), {})
-        resumed = json.loads(self.arm(repo, "session-gen", self.tmp, env, task="race-resume",
-                                      wait_seconds=60, resume=True).stdout)
-        self.assertTrue(resumed["resumed"])
-        binding = read_binding(self.tmp, armed["eventKey"])
-        self.assertEqual(binding["generation"], 2)
-        self.assertEqual(binding["state"], "armed")
-        self.assertEqual(stop.wait(timeout=15), 0)
-        stale_output = json.loads(stop.stdout.read())
-        stop.stdout.close()
-        stop.stderr.close()
-        self.assertNotIn("decision", stale_output, "a stale hook must not deliver or expire a resume")
-        binding = read_binding(self.tmp, armed["eventKey"])
-        self.assertEqual(binding["state"], "armed")
-        self.assertEqual(binding["generation"], 2)
-
-        repo.cancel("race-resume", env=env)
-        self.assertEqual(repo.wait_terminal("race-resume", env=env, timeout=25)["state"],
-                         "cancelled")
-        fresh = run_hook("Stop", "session-gen", self.tmp, env)
-        self.assertEqual(fresh.get("decision"), "block")
-        ack_event(armed["eventKey"], "session-gen", env)
-
-    def test_stale_expiry_cannot_demote_delivered_or_acked(self):
-        env = h_env(self.tmp, PI_DOUBLE_MODE="hang")
-        for name, final_state in (("repo-demote-delivered", "delivered"),
-                                  ("repo-demote-acked", "acked")):
-            task = name.replace("repo-demote-", "demote-")
-            repo, worktree = self.make(name=name)
-            repo.start(task, worktree, env=env)
-            repo.wait_round_state(task, "running")
-            armed = json.loads(self.arm(repo, "session-demote", self.tmp, env, task=task,
-                                        wait_seconds=1).stdout)
-            stop = start_hook("Stop", "session-demote", self.tmp, env)
-            stop.stdin.write(hook_payload("Stop", "session-demote"))
-            stop.stdin.close()
-            time.sleep(0.9)
-            stream = binding_lock_file(self.tmp, armed["eventKey"]).open("a+")
-            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            try:
-                data = read_binding(self.tmp, armed["eventKey"])
-                data["state"] = final_state
-                data["deliveredAt"] = data.get("deliveredAt") or time.time()
-                data["delivery"] = data.get("delivery") or {
-                    "state": "completed", "exitCode": 0, "timedOut": False,
-                    "cancelled": False, "endedAt": time.time()}
-                if final_state == "acked":
-                    data["ackedFromState"] = "delivered"
-                    data["ackedAt"] = time.time()
-                binding_file(self.tmp, armed["eventKey"]).write_text(json.dumps(data), encoding="utf-8")
-                time.sleep(0.3)
-            finally:
-                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
-                stream.close()
-            returncode = stop.wait(timeout=20)
-            stale_output = json.loads(stop.stdout.read())
-            stop.stdout.close()
-            stop.stderr.close()
-            self.assertEqual(returncode, 0)
-            self.assertNotIn("decision", stale_output)
-            binding = read_binding(self.tmp, armed["eventKey"])
-            self.assertEqual(binding["state"], final_state,
-                             "a stale expiry must never demote a delivered/acked record")
-            self.assertIsNotNone(binding["deliveredAt"])
-            if final_state == "acked":
-                self.assertEqual(binding["ackedAt"], data["ackedAt"])
-            repo.cancel(task, env=env)
-            self.assertEqual(repo.wait_terminal(task, env=env, timeout=25)["state"], "cancelled")
+        repo.start("unknown", worktree, env=env)
+        state = repo.wait_round_state("unknown", "running")
+        armed = json.loads(self.arm(repo, "session-unknown", self.tmp, env, task="unknown").stdout)
+        state_path = repo.task_dir("unknown") / "rounds" / "1" / "round.state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state.update(state="unknown", exitCode=None, endedAt=time.time())
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        output = run_hook("Stop", "session-unknown", self.tmp, env, timeout=30)
+        self.assertNotIn("decision", output)
+        self.assertIn("unknown", output.get("systemMessage", ""))
+        self.assertEqual(read_binding(self.tmp, armed["eventKey"])["state"], "needs_recovery")
+        kill_pid(state.get("piPid"), signal.SIGKILL)
+        kill_pid(state.get("supervisorPid"), signal.SIGKILL)
+        wait_gone(state.get("piPid"), 10)
 
     def test_inflight_arm_honors_interrupt_during_arm(self):
         repo, worktree = self.make()
@@ -828,8 +884,7 @@ class HandoffTest(unittest.TestCase):
         try:
             proc = subprocess.Popen([sys.executable, str(HANDOFF), "arm",
                                      "--repo", str(repo.root), "--task", "inflight",
-                                     "--round", "1", "--session-id", "session-inflight",
-                                     "--wait-seconds", "5"],
+                                     "--round", "1", "--session-id", "session-inflight"],
                                     env=env, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, text=True)
             time.sleep(1.0)
@@ -851,7 +906,7 @@ class HandoffTest(unittest.TestCase):
         repo.cancel("inflight", env=env)
         self.assertEqual(repo.wait_terminal("inflight", env=env, timeout=25)["state"], "cancelled")
         resumed = json.loads(self.arm(repo, "session-inflight", self.tmp, env, task="inflight",
-                                      wait_seconds=5, resume=True).stdout)
+                                      resume=True).stdout)
         self.assertTrue(resumed["resumed"])
         delivered = run_hook("Stop", "session-inflight", self.tmp, env)
         self.assertEqual(delivered.get("decision"), "block")
@@ -868,7 +923,7 @@ class HandoffTest(unittest.TestCase):
         hand_env = dict(env)
         hand_env["PI_BIN"] = str(pi_trap)
         armed = handoff_json("arm", "--repo", str(repo.root), "--task", "trap", "--round", "1",
-                             "--session-id", "session-z", "--wait-seconds", "1", env=hand_env)
+                             "--session-id", "session-z", env=hand_env)
         output = run_hook("Stop", "session-z", self.tmp, hand_env)
         self.assertEqual(output.get("decision"), "block")
         handoff_json("status", "--event-key", armed["eventKey"], env=hand_env)
@@ -882,7 +937,7 @@ class HandoffTest(unittest.TestCase):
         self.assertEqual(stop["type"], "command")
         self.assertEqual(stop["command"], 'python3 "${PLUGIN_ROOT}/runtime/pi_handoff.py" hook')
         self.assertFalse(stop["async"])
-        self.assertEqual(stop["timeout"], 14410)
+        self.assertLessEqual(stop["timeout"], 10, "the Stop hook must have a short hard timeout")
         interrupt = config["hooks"]["Interrupt"][0]["hooks"][0]
         self.assertEqual(interrupt["timeout"], 3)
         self.assertIn("UserPromptSubmit", config["hooks"])
@@ -890,6 +945,7 @@ class HandoffTest(unittest.TestCase):
         self.assertIn("arm", proc.stdout)
         self.assertIn("status", proc.stdout)
         self.assertIn("ack", proc.stdout)
+        self.assertIn("release", proc.stdout)
         arm_help = run_handoff("arm", "--help", env=h_env(self.tmp))
         self.assertIn("--resume", arm_help.stdout)
 

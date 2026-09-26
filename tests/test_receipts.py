@@ -6,6 +6,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -41,11 +42,31 @@ class ReceiptTest(unittest.TestCase):
         return subprocess.run(
             [sys.executable, str(RUNTIME / "pi_check.py"), "--output-dir", str(self.checks),
              "--id", check_id, "--", *command],
-            capture_output=True, text=True, timeout=60)
+            capture_output=True, text=True, timeout=60, cwd=str(self.tmp))
 
     def run_summary(self, *args):
         return subprocess.run([sys.executable, str(RUNTIME / "pi_summary.py"), *args],
                               capture_output=True, text=True, timeout=60)
+
+    def start_pi_check(self, check_id: str, *command: str,
+                       timeout_seconds: float | None = None):
+        argv = [sys.executable, str(RUNTIME / "pi_check.py"), "--output-dir", str(self.checks),
+                "--id", check_id]
+        if timeout_seconds is not None:
+            argv += ["--timeout-seconds", str(timeout_seconds)]
+        argv += ["--", *command]
+        return subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, cwd=str(self.tmp))
+
+    def wait_for_marker(self, check_id: str, timeout: float = 15) -> Path:
+        deadline = time.monotonic() + timeout
+        while True:
+            found = sorted(self.checks.glob(f"{check_id}-*.running"))
+            if found:
+                return found[0]
+            if time.monotonic() >= deadline:
+                raise AssertionError(f"running marker for {check_id} never appeared")
+            time.sleep(0.05)
 
     def test_pi_check_records_true_exit_hash_and_counts(self):
         proc = self.run_pi_check(
@@ -134,6 +155,69 @@ class ReceiptTest(unittest.TestCase):
                                     "--run-dir", str(self.tmp), "--checks-dir", str(self.tmp / "absent"))
         self.assertIn("total=0", overview.stdout)
         self.assertIn("Absence is missing evidence", overview.stdout)
+
+    def test_running_marker_is_visible_before_finish_and_removed_after_success(self):
+        proc = self.start_pi_check(
+            "brief", sys.executable, "-c",
+            "import time; print('check started', flush=True); time.sleep(2)")
+        marker = self.wait_for_marker("brief")
+        data = json.loads(marker.read_text(encoding="utf-8"))
+        self.assertEqual(data["id"], "brief")
+        self.assertIsInstance(data["pid"], int)
+        self.assertGreater(data["deadline_at"], data["started_at"])
+        self.assertEqual(data["deadline_scope"],
+                         "wrapper timeout only; never an inner command deadline")
+        self.assertEqual(data["log"], marker.name.replace(".running", ".log"))
+        self.assertTrue((self.checks / data["log"]).is_file(),
+                        "the marker must be available while the child is still running")
+        stdout, stderr = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 0, stderr)
+        self.assertTrue(stdout)
+        self.assertFalse(marker.exists(), "a completed receipt must remove the running marker")
+        receipt = json.loads(next(self.checks.glob("brief-*.json")).read_text(encoding="utf-8"))
+        self.assertEqual(receipt["running_marker"], marker.name)
+        self.assertEqual(receipt["exit_code"], 0)
+
+    def test_running_marker_removed_after_failure_timeout_and_cancel(self):
+        failed = self.start_pi_check("failfast", sys.executable, "-c", "import sys; sys.exit(7)")
+        self.assertEqual(failed.wait(timeout=30), 7)
+        failed.communicate(timeout=10)
+        self.assertEqual(list(self.checks.glob("failfast-*.running")), [])
+        receipt = json.loads(next(self.checks.glob("failfast-*.json")).read_text(encoding="utf-8"))
+        self.assertEqual(receipt["exit_code"], 7)
+        self.assertFalse(receipt["timed_out"])
+
+        timed = self.start_pi_check("wraptimeout", sys.executable, "-c",
+                                    "import time; time.sleep(30)", timeout_seconds=1)
+        marker = self.wait_for_marker("wraptimeout")
+        self.assertTrue(marker.exists())
+        self.assertEqual(timed.wait(timeout=30), 124)
+        timed.communicate(timeout=10)
+        self.assertEqual(list(self.checks.glob("wraptimeout-*.running")), [])
+        receipt = json.loads(next(self.checks.glob("wraptimeout-*.json")).read_text(encoding="utf-8"))
+        self.assertTrue(receipt["timed_out"])
+        self.assertEqual(receipt["exit_code"], 124)
+
+        cancelled = self.start_pi_check("wrappedcancel", sys.executable, "-c",
+                                        "import time; time.sleep(30)")
+        self.wait_for_marker("wrappedcancel")
+        cancelled.terminate()
+        self.assertEqual(cancelled.wait(timeout=30), 143)
+        cancelled.communicate(timeout=10)
+        self.assertEqual(list(self.checks.glob("wrappedcancel-*.running")), [])
+        receipt = json.loads(next(self.checks.glob("wrappedcancel-*.json")).read_text(encoding="utf-8"))
+        self.assertEqual(receipt["exit_code"], 143)
+        self.assertFalse(receipt["timed_out"])
+
+    def test_inner_failure_stays_nonzero_without_wrapper_timeout(self):
+        proc = self.run_pi_check(
+            "inner-timeout", sys.executable, "-c",
+            "print('panic: test timed out after 10m0s'); raise SystemExit(1)")
+        self.assertEqual(proc.returncode, 1)
+        receipt = json.loads(Path(json.loads(proc.stdout)["receipt"]).read_text(encoding="utf-8"))
+        self.assertEqual(receipt["exit_code"], 1)
+        self.assertFalse(receipt["timed_out"])
+        self.assertIsNone(receipt["error"])
 
 
 if __name__ == "__main__":

@@ -43,9 +43,9 @@ class ConfigTest(unittest.TestCase):
         self.assertIn("unsupported keys", proc.stderr)
 
     def test_config_traversal_and_absolute_references_rejected(self):
-        for bad in ("../../etc/passwd", "/etc/passwd", "docs/../../secrets.md"):
+        for index, bad in enumerate(("../../etc/passwd", "/etc/passwd", "docs/../../secrets.md")):
             with self.subTest(reference=bad):
-                repo = Repo(self.tmp, name=f"traversal-{abs(hash(bad)) % 10000}",
+                repo = Repo(self.tmp, name=f"traversal-{index}",
                             config=default_config(constraints=[bad]))
                 proc = run_cli("project", "--repo", str(repo.root), expect=2)
                 self.assertIn("rejected", proc.stderr)

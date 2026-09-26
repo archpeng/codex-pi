@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
-"""Synchronous Codex Stop handoff for explicit Codex-Pi review cycles.
+"""Bounded Codex Stop handoff for explicit Codex-Pi review cycles.
 
 The Codex main session explicitly *arms* an existing Pi task round for its own
 Codex session. Later, when that Codex turn stops, the synchronous Stop hook for
-the same session multiplexes the durable round evidence (never raw logs, never
-the Pi transcript) and, once a round is terminal, returns a single continuation
-prompt with validated identifiers and result/ack commands. Pi output is never
-copied into the hook reason.
+the same session performs exactly one quick read-only check and, if the round is
+already terminal with released ownership, returns a single continuation prompt
+with validated identifiers and result/ack commands. It never waits for an active
+Pi task; pending events stay armed for a later Stop. Pi output is never copied
+into the hook reason.
+
+Legacy records with the old long ``waitSeconds`` remain readable, and the
+owner-scoped ``release`` operation lets a main session migrate an already-waiting
+0.2 hook without cancelling Pi: the record moves to ``suspended`` with the
+explicit reason ``released for bounded tool waiting`` and a new generation. The
+waiting hook observes that generation/state change on its next poll and exits;
+the round keeps running.
 
 This module never invokes the Codex CLI and never starts a model. It only reads
 the existing ``pi_task`` lifecycle evidence and writes its own binding records
@@ -48,15 +56,16 @@ from pi_task import (  # noqa: E402
 )
 
 SCHEMA_VERSION = 1
-DEFAULT_WAIT_SECONDS = 14400
+# New records carry waitSeconds 0: the Stop hook performs one quick pass and
+# never waits for an active Pi task. MAX_WAIT_SECONDS only keeps legacy 0.2
+# records (which may still say 14400) readable and validates old evidence.
+DEFAULT_WAIT_SECONDS = 0
 MAX_WAIT_SECONDS = 14400
 MAX_EVENT_BYTES = 1_000_000
 MAX_REASON_BYTES = 6000
 MAX_MESSAGE_BYTES = 900
-ORPHAN_GRACE_SECONDS = 3.0
-RELEASE_GRACE_SECONDS = 3.0
-POLL_SECONDS = 0.5
 INTERRUPT_BUDGET_SECONDS = 0.75
+RELEASE_REASON = "released for bounded tool waiting"
 LIVE_STATES = ("armed", "suspended", "delivered")
 RESUMABLE_STATES = ("suspended", "expired", "needs_recovery")
 VALID_STATES = ("armed", "delivered", "acked", "suspended", "expired", "needs_recovery", "stale")
@@ -348,6 +357,7 @@ def compact_binding(binding: dict, root: Path) -> dict:
         "waitSeconds": binding.get("waitSeconds"), "attempts": binding.get("attempts"),
         "deliveredAt": binding.get("deliveredAt"), "ackedAt": binding.get("ackedAt"),
         "ackedFromState": binding.get("ackedFromState"), "suspendedAt": binding.get("suspendedAt"),
+        "releaseReason": binding.get("releaseReason"), "releasedAt": binding.get("releasedAt"),
         "lastWaitExpiredAt": binding.get("lastWaitExpiredAt"),
         "lastCheckedAt": binding.get("lastCheckedAt"), "lastError": binding.get("lastError"),
         "delivery": binding.get("delivery"), "liveRoundState": live,
@@ -414,8 +424,14 @@ def cmd_arm(args) -> dict:
     session = args.session_id if args.session_id else os.environ.get("CODEX_THREAD_ID")
     session = validate_session_id(session)
     wait_seconds = DEFAULT_WAIT_SECONDS if args.wait_seconds is None else float(args.wait_seconds)
-    if not (0 <= wait_seconds <= MAX_WAIT_SECONDS):
-        raise ValueError(f"wait-seconds must be between 0 and {MAX_WAIT_SECONDS}")
+    if wait_seconds > 0:
+        raise ValueError(
+            "a positive Stop wait window is no longer supported: the Stop hook performs one quick "
+            "check and leaves pending events armed instead of waiting for an active Pi task; "
+            "omit --wait-seconds (legacy records remain readable) and use bounded pi_task.py wait/status "
+            "from ordinary tool calls")
+    if wait_seconds < 0:
+        raise ValueError("--wait-seconds must not be negative")
 
     root = handoff_root()
     key = event_key(session, repo, task, round_number)
@@ -618,6 +634,67 @@ def cmd_ack(args) -> dict:
         return {"ok": True, "alreadyAcked": already, "eventKey": key, "ackAt": binding.get("ackedAt"),
                 "binding": compact_binding(binding, root),
                 "note": "acknowledgement marks result collection only; it is never acceptance"}
+    finally:
+        os.close(fd)
+
+
+# ---------------------------------------------------------------------------
+# release (migrate a waiting 0.2 hook without cancelling Pi)
+# ---------------------------------------------------------------------------
+
+def cmd_release(args) -> dict:
+    """Owner-scoped, idempotent release of one armed waiting event.
+
+    The old 0.2 Stop hook holds ``state == 'armed'`` and blocks until terminal or
+    its (possibly legacy 14400-second) wait deadline. Release performs a locked
+    compare-and-set to ``suspended`` with the explicit reason
+    ``released for bounded tool waiting`` and a bumped generation, so a running
+    0.2 hook observes the generation/state change on its next poll and exits its
+    wait. Pi keeps running, no session interrupt marker is written, no delivery
+    or acceptance is forged, and delivered/acked/terminal records are preserved.
+    """
+    root = handoff_root()
+    key = str(args.event_key)
+    if not EVENT_KEY_RE.fullmatch(key):
+        raise ValueError("event-key must be a 64-character lowercase hex digest")
+    session = args.session_id or os.environ.get("CODEX_THREAD_ID")
+    if not session:
+        raise ValueError("release requires the event owner session: pass --session-id or set "
+                         "CODEX_THREAD_ID")
+    session = validate_session_id(session)
+    fd = lock_fd(binding_lock_path(root, key), blocking=True, timeout=10)
+    try:
+        path = binding_path(root, key)
+        raw = read_json(path, None)
+        binding, reason = validate_binding(raw, key)
+        if binding is None:
+            raise ValueError(f"handoff event {key} is invalid or unknown: {reason}")
+        if binding.get("sessionId") != session:
+            raise ValueError("release session does not match the stored event owner; pass the exact "
+                             "--session-id of the event owner")
+        state = binding.get("state")
+        if state in ("delivered", "acked") or binding.get("deliveredAt") or binding.get("ackedAt"):
+            raise ValueError(f"handoff event {key} is {state!r}; terminal delivered/acked evidence must "
+                             "not be erased by release")
+        if state == "suspended" and binding.get("releaseReason") == RELEASE_REASON:
+            return {"ok": True, "alreadyReleased": True, "eventKey": key,
+                    "binding": compact_binding(binding, root),
+                    "note": "this event was already released for bounded tool waiting; no duplicate write"}
+        if state != "armed":
+            raise ValueError(f"handoff event {key} is {state!r}; release only migrates an armed waiting "
+                             "hook (recovery states keep their explicit --resume requirement)")
+        now = time.time()
+        binding.update(state="suspended", suspendedAt=now, lastCheckedAt=now,
+                       lastError=RELEASE_REASON, releaseReason=RELEASE_REASON, releasedAt=now,
+                       generation=binding_generation(binding) + 1)
+        if args.note:
+            binding["releaseNote"] = bounded(args.note, 500)
+        atomic(path, binding)
+        return {"ok": True, "alreadyReleased": False, "eventKey": key,
+                "binding": compact_binding(binding, root),
+                "note": "released for bounded tool waiting; Pi keeps running, a 0.2 hook sees the "
+                        "generation/state change and exits its wait, and explicit --resume is required "
+                        "to re-arm"}
     finally:
         os.close(fd)
 
@@ -849,21 +926,26 @@ def _report(key: str, message: str) -> dict:
 
 
 def handle_stop(session: str) -> dict:
-    """One bounded invocation: multiplex every armed event of this session."""
+    """One quick pass: deliver an already-terminal exact round or leave pending armed.
+
+    This never sleeps, polls or waits for an active Pi task regardless of a
+    legacy ``waitSeconds=14400`` on the record. Pending events stay armed for a
+    later Stop; genuinely unknown ownership becomes ``needs_recovery`` exactly
+    as before, and delivered/acked records are never demoted.
+    """
     root = handoff_root()
     reports = []
-    preexisting = []
-    candidates = []
+    deliverables = []
     for key, raw in session_binding_records(root, session):
         if raw is None:
-            preexisting.append({"systemMessage": bounded(
+            reports.append({"systemMessage": bounded(
                 f"codex-pi handoff {key}: binding evidence is corrupt or missing; no continuation generated")})
             continue
         binding, reason = validate_binding(raw, key)
         if binding is None:
             mark_binding_state(root, key, "needs_recovery", error=f"invalid binding: {reason}",
                                expect_armed=True)
-            preexisting.append({"systemMessage": bounded(
+            reports.append({"systemMessage": bounded(
                 f"codex-pi handoff {key}: invalid binding ({reason}); no continuation generated")})
             continue
         if binding.get("sessionId") != session or binding.get("state") != "armed":
@@ -872,135 +954,59 @@ def handle_stop(session: str) -> dict:
             mark_binding_state(root, key, "suspended", error="user interrupted this Codex session",
                                expect_generation=binding_generation(binding), expect_armed=True)
             continue
-        candidates.append(binding)
-    if not candidates:
-        pool = reports or preexisting
-        return pool[0] if pool else {}
-
-    start = time.monotonic()
-    deadlines = {binding["eventKey"]: start + min(float(binding["waitSeconds"]), MAX_WAIT_SECONDS)
-                 for binding in candidates}
-    overall = max(deadlines.values()) if deadlines else start
-    resolved = {}
-    orphans = {}
-    terminal_holds = {}
-    while candidates:
-        now = time.monotonic()
-        for binding in list(candidates):
-            key = binding["eventKey"]
-            generation = binding_generation(binding)
-            current = read_json(binding_path(root, key), None)
-            record, reason = validate_binding(current, key)
-            if record is None:
-                if current is not None:
-                    mark_binding_state(root, key, "needs_recovery", error=f"invalid binding: {reason}",
-                                       expect_generation=generation, expect_armed=True)
+        generation = binding_generation(binding)
+        repo, task, task_dir, round_dir, problem_state, problem = resolve_candidate(root, binding)
+        if problem:
+            mark_binding_state(root, key, problem_state, error=problem,
+                               expect_generation=generation, expect_armed=True)
+            reports.append(_report(key, problem))
+            continue
+        numbers = [number for number, _ in list_rounds(task_dir)]
+        if not numbers or numbers[-1] != binding.get("round"):
+            latest = numbers[-1] if numbers else None
+            mark_binding_state(root, key, "stale", error=f"round superseded by {latest}",
+                               expect_generation=generation, expect_armed=True)
+            reports.append(_report(key, f"codex-pi handoff {key}: round was superseded by {latest}; "
+                                        "no continuation generated"))
+            continue
+        state = read_json(round_dir / "round.state.json", None)
+        raw_state = state.get("state") if isinstance(state, dict) else None
+        if raw_state in TERMINAL_STATES:
+            held = lock_is_held(task_dir / ".task.lock") or lock_is_held(task_dir / ".supervisor.lock")
+            if held:
                 reports.append({"systemMessage": bounded(
-                    f"codex-pi handoff {key}: invalid binding ({reason}); no continuation generated")})
-                candidates.remove(binding)
+                    f"codex-pi handoff {key}: round {binding.get('round')} is terminal but worker "
+                    "ownership is still held; no continuation was generated and the event stays "
+                    "armed for the next Stop. Inspect with " + status_command(key))})
                 continue
-            if binding_generation(record) != generation:
-                # A newer explicit resume now owns this event; a stale hook must
-                # neither deliver it nor demote it to expired.
-                candidates.remove(binding)
-                continue
-            if record.get("state") != "armed":
-                candidates.remove(binding)
-                continue
-            if interrupted_since(root, session, record):
-                mark_binding_state(root, key, "suspended", error="user interrupted this Codex session",
-                                   expect_generation=generation, expect_armed=True)
-                candidates.remove(binding)
-                continue
-            if key not in resolved:
-                repo, task, task_dir, round_dir, problem_state, problem = resolve_candidate(root, record)
-                if problem:
-                    mark_binding_state(root, key, problem_state, error=problem,
-                                       expect_generation=generation, expect_armed=True)
-                    reports.append(_report(key, problem))
-                    candidates.remove(binding)
-                    continue
-                resolved[key] = (repo, task, task_dir, round_dir)
-            repo, task, task_dir, round_dir = resolved[key]
-            numbers = [number for number, _ in list_rounds(task_dir)]
-            if not numbers or numbers[-1] != record.get("round"):
-                latest = numbers[-1] if numbers else None
-                mark_binding_state(root, key, "stale", error=f"round superseded by {latest}",
-                                   expect_generation=generation, expect_armed=True)
-                reports.append(_report(key, f"codex-pi handoff {key}: round was superseded by {latest}; "
-                                            "no continuation generated"))
-                candidates.remove(binding)
-                continue
-            state = read_json(round_dir / "round.state.json", None)
-            raw_state = state.get("state") if isinstance(state, dict) else None
-            if raw_state in TERMINAL_STATES:
-                held = lock_is_held(task_dir / ".task.lock") or lock_is_held(task_dir / ".supervisor.lock")
-                if held:
-                    first = terminal_holds.get(key)
-                    if first is None:
-                        terminal_holds[key] = now
-                    elif now - first >= RELEASE_GRACE_SECONDS:
-                        mark_binding_state(root, key, "needs_recovery",
-                                           error="terminal record but ownership was still held",
-                                           expect_generation=generation, expect_armed=True)
-                        reports.append(_report(key, f"codex-pi handoff {key}: terminal record but worker "
-                                                    "ownership is still held; outcome is not released and "
-                                                    "no continuation was generated"))
-                        candidates.remove(binding)
-                    continue
-                terminal_holds.pop(key, None)
-                outcome = deliver_terminal(root, record, repo, task, task_dir, record["round"],
-                                           raw_state, generation)
-                if outcome is not None and outcome.get("decision") == "block":
-                    return outcome
-                if outcome is not None:
-                    reports.append(outcome)
-                candidates.remove(binding)
-                continue
-            if raw_state == "unknown":
-                mark_binding_state(root, key, "needs_recovery", error="round ownership state is unknown",
-                                   expect_generation=generation, expect_armed=True)
-                reports.append(_report(key, f"codex-pi handoff {key}: round ownership is unknown/orphaned "
-                                            "(state unknown); no continuation generated"))
-                candidates.remove(binding)
-                continue
-            supervised = lock_is_held(task_dir / ".supervisor.lock")
-            if not supervised and (raw_state in ACTIVE_STATES or raw_state is None):
-                first = orphans.get(key)
-                if first is None:
-                    orphans[key] = now
-                elif now - first >= ORPHAN_GRACE_SECONDS:
-                    mark_binding_state(root, key, "needs_recovery",
-                                       error=f"supervisor lease missing while round state was {raw_state!r}",
-                                       expect_generation=generation, expect_armed=True)
-                    reports.append(_report(key, f"codex-pi handoff {key}: supervisor ownership is unknown "
-                                                f"(state={raw_state!r}); outcome is not completed and no "
-                                                "continuation was generated"))
-                    candidates.remove(binding)
-                    continue
-            else:
-                orphans.pop(key, None)
-            if now >= deadlines.get(key, overall):
-                mark_binding_state(root, key, "expired",
-                                   error=f"hook wait expired while round state was {raw_state!r}",
-                                   expect_generation=generation, expect_armed=True)
-                reports.append({"systemMessage": bounded(
-                    f"codex-pi handoff {key}: wait expired while round {record['round']} was {raw_state!r}; "
-                    "Pi keeps running and no continuation was generated; explicit --resume is required. "
-                    "Inspect with " + status_command(key))})
-                candidates.remove(binding)
-                continue
-        if candidates:
-            time.sleep(min(POLL_SECONDS, max(0.05, overall - time.monotonic())))
-    for binding in candidates:
-        key = binding["eventKey"]
-        mark_binding_state(root, key, "expired", error="hook wait expired while ownership stayed active",
-                           expect_generation=binding_generation(binding), expect_armed=True)
-        reports.append({"systemMessage": bounded(
-            f"codex-pi handoff {key}: wait expired; no continuation was generated; "
-            "explicit --resume is required. Inspect with " + status_command(key))})
-    pool = reports or preexisting
-    return pool[0] if pool else {}
+            deliverables.append((binding, repo, task, task_dir, raw_state, generation))
+            continue
+        if raw_state == "unknown":
+            mark_binding_state(root, key, "needs_recovery", error="round ownership state is unknown",
+                               expect_generation=generation, expect_armed=True)
+            reports.append(_report(key, f"codex-pi handoff {key}: round ownership is unknown/orphaned "
+                                        "(state unknown); no continuation generated"))
+            continue
+        supervised = lock_is_held(task_dir / ".supervisor.lock")
+        if raw_state in ACTIVE_STATES and not supervised:
+            mark_binding_state(root, key, "needs_recovery",
+                               error=f"supervisor lease missing while round state was {raw_state!r}",
+                               expect_generation=generation, expect_armed=True)
+            reports.append(_report(key, f"codex-pi handoff {key}: supervisor ownership is unknown "
+                                        f"(state={raw_state!r}); outcome is not completed and no "
+                                        "continuation was generated"))
+            continue
+        # Active, starting or otherwise non-terminal: keep the event armed and
+        # return immediately. Bounded pi_task.py wait/status calls are the
+        # supported way to observe progress; this hook never waits for Pi.
+    for binding, repo, task, task_dir, raw_state, generation in deliverables:
+        outcome = deliver_terminal(root, binding, repo, task, task_dir, binding["round"],
+                                   raw_state, generation)
+        if outcome is not None and outcome.get("decision") == "block":
+            return outcome
+        if outcome is not None:
+            reports.append(outcome)
+    return reports[0] if reports else {}
 
 
 def dispatch_hook(event: dict) -> dict:
@@ -1052,8 +1058,9 @@ def build_parser() -> argparse.ArgumentParser:
     arm.add_argument("--task", required=True)
     arm.add_argument("--round", type=int, required=True)
     arm.add_argument("--session-id", help="Codex session id (default: CODEX_THREAD_ID)")
-    arm.add_argument("--wait-seconds", type=float, default=DEFAULT_WAIT_SECONDS,
-                     help=f"Stop hook wait, 0..{MAX_WAIT_SECONDS} (default {DEFAULT_WAIT_SECONDS})")
+    arm.add_argument("--wait-seconds", type=float, default=None,
+                     help="legacy compatibility only: any positive value is rejected because the Stop "
+                          "hook performs one quick check and never waits for an active Pi task")
     arm.add_argument("--resume", action="store_true",
                      help="explicitly re-arm a suspended, expired or needs_recovery event")
     arm.set_defaults(func=cmd_arm)
@@ -1075,6 +1082,12 @@ def build_parser() -> argparse.ArgumentParser:
     ack.add_argument("--round", type=int)
     ack.add_argument("--note")
     ack.set_defaults(func=cmd_ack)
+
+    release = sub.add_parser("release", help="migrate one armed waiting hook without cancelling Pi")
+    release.add_argument("--event-key", required=True, help="exact 64-hex event key")
+    release.add_argument("--session-id", help="event owner session id (default: CODEX_THREAD_ID)")
+    release.add_argument("--note", help="optional bounded release note")
+    release.set_defaults(func=cmd_release)
 
     hook = sub.add_parser("hook", help=argparse.SUPPRESS)
     hook.set_defaults(func=None)

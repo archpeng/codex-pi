@@ -18,6 +18,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -936,6 +937,365 @@ def load_round_summary(task_dir: Path, task: dict, round_dir: Path, number: int)
                 "error": f"summary unavailable: {exc}"}
 
 
+# ---------------------------------------------------------------------------
+# bounded read-only status (no summaries, no transcript scans, no mutation)
+# ---------------------------------------------------------------------------
+
+STATUS_MAX_DIR_ENTRIES = 512
+STATUS_MAX_RECEIPTS = 200
+STATUS_MAX_FILE_BYTES = 2_000_000
+STATUS_MAX_MARKER_BYTES = 16_384
+STATUS_TAIL_BYTES = 8192
+STATUS_TAIL_LINES = 20
+STATUS_MAX_LINE = 400
+CHECK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,99}\Z")
+LOG_DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
+VALID_COUNT_KEYS = ("run", "pass", "fail", "skip")
+VALID_COUNT_FORMATS = ("go_verbose_top_level",)
+MAX_COUNT_VALUE = 10 ** 12
+
+
+def _mtime(path: Path):
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _number(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    return value if math.isfinite(value) else None
+
+
+def _clip(text, limit: int = STATUS_MAX_LINE) -> str:
+    text = str(text).replace("\x00", " ").strip()
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def _safe_basename(value):
+    """Bounded single-component file name; never a path, dotfile or separator."""
+    if not isinstance(value, str) or not value or len(value) > 255:
+        return None
+    if value in (".", "..") or value.startswith(".") or "/" in value or "\\" in value \
+            or "\x00" in value:
+        return None
+    return value
+
+
+def _read_bounded_json(path: Path, limit: int):
+    """Read at most ``limit`` bytes and parse JSON; never parse unbounded data."""
+    try:
+        with path.open("rb") as stream:
+            raw = stream.read(limit + 1)
+    except OSError:
+        return None, "unreadable"
+    if len(raw) > limit:
+        return None, "oversized"
+    try:
+        return json.loads(raw.decode("utf-8")), None
+    except ValueError:
+        return None, "invalid"
+
+
+def _sanitize_counts(value):
+    """Keep only the fixed numeric counters and the known format marker."""
+    if not isinstance(value, dict):
+        return None
+    counts = {}
+    for key in VALID_COUNT_KEYS:
+        item = value.get(key)
+        if isinstance(item, int) and not isinstance(item, bool) and 0 <= item <= MAX_COUNT_VALUE:
+            counts[key] = item
+    if not counts:
+        return None
+    fmt = value.get("format")
+    if isinstance(fmt, str) and fmt in VALID_COUNT_FORMATS:
+        counts["format"] = fmt
+    return counts
+
+
+def _pid_running(pid) -> bool:
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _tail_evidence(path: Path):
+    """Bounded tail read: never the full log or transcript."""
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        return {"path": str(path), "error": _clip(exc, 200)}
+    try:
+        with path.open("rb") as stream:
+            if size > STATUS_TAIL_BYTES:
+                stream.seek(size - STATUS_TAIL_BYTES)
+            raw = stream.read(STATUS_TAIL_BYTES)
+    except OSError as exc:
+        return {"path": str(path), "bytes": size, "error": _clip(exc, 200)}
+    lines = raw.decode("utf-8", errors="replace").splitlines()[-STATUS_TAIL_LINES:]
+    return {"path": str(path), "bytes": size, "mtime": _mtime(path),
+            "tail": [_clip(line) for line in lines],
+            "truncated": size > STATUS_TAIL_BYTES}
+
+
+def _safe_receipt(path: Path):
+    """Small safe receipt metadata; rejects unrelated JSON and unbounded strings."""
+    data, problem = _read_bounded_json(path, STATUS_MAX_FILE_BYTES)
+    if problem is not None:
+        return None, f"{problem} receipt"
+    if not isinstance(data, dict) or data.get("schema_version") != 1:
+        return None, "unrecognized receipt shape"
+    check_id = data.get("id")
+    log_name = data.get("log")
+    digest = data.get("log_sha256")
+    if not isinstance(check_id, str) or not CHECK_ID_RE.fullmatch(check_id):
+        return None, "unsafe receipt id"
+    if not isinstance(log_name, str) or not log_name.endswith(".log") \
+            or _safe_basename(log_name) is None:
+        return None, "unsafe receipt log identity"
+    if not isinstance(digest, str) or not LOG_DIGEST_RE.fullmatch(digest):
+        return None, "unsafe receipt log hash"
+    code = data.get("exit_code")
+    if code is not None and (isinstance(code, bool) or not isinstance(code, int)):
+        return None, "unsafe receipt exit code"
+    failed = (code is not None and code != 0) or bool(data.get("timed_out"))
+    return {"id": check_id, "exitCode": code, "timedOut": bool(data.get("timed_out")),
+            "failed": failed, "testCounts": _sanitize_counts(data.get("test_counts")),
+            "startedAt": _number(data.get("started_at")), "endedAt": _number(data.get("ended_at")),
+            "log": log_name, "receipt": path.name}, None
+
+
+def _scan_checks(checks_dir: Path) -> dict:
+    result = {"dir": str(checks_dir), "exists": checks_dir.is_dir(), "entries": 0,
+              "partial": False, "running": None, "legacyCandidate": None, "ignored": [],
+              "ignoredCount": 0,
+              "receipts": {"total": 0, "scanned": 0, "truncated": False, "partial": False,
+                           "failedAttempts": 0, "latest": None, "latestFailed": None,
+                           "latestSuccessful": None}}
+
+    def note_ignored(name: str, reason: str) -> None:
+        result["ignoredCount"] += 1
+        if len(result["ignored"]) < 20:
+            result["ignored"].append({"name": name, "reason": reason})
+
+    if not result["exists"]:
+        return result
+    try:
+        entries = []
+        for index, entry in enumerate(checks_dir.iterdir()):
+            if index >= STATUS_MAX_DIR_ENTRIES:
+                result["partial"] = True
+                break
+            if entry.is_file():
+                entries.append(entry)
+    except OSError:
+        return result
+    result["entries"] = len(entries)
+    result["receipts"]["partial"] = result["partial"]
+    markers = [path for path in entries if path.name.endswith(".running")]
+    receipt_files = [path for path in entries if path.name.endswith(".json")]
+    logs = [path for path in entries if path.name.endswith(".log")]
+    resolved = checks_dir.resolve()
+
+    # Valid receipts first: only proven receipts may suppress a log candidate or
+    # supersede a stale running marker. Unrelated or corrupt .json stays visible
+    # as ignored evidence and never hides an unreceipted log.
+    parsed = []
+    for receipt in sorted(receipt_files, key=_mtime, reverse=True)[:STATUS_MAX_RECEIPTS]:
+        item, problem = _safe_receipt(receipt)
+        if item is None:
+            note_ignored(receipt.name, problem)
+            continue
+        parsed.append(item)
+    result["receipts"]["total"] = len(receipt_files)
+    result["receipts"]["scanned"] = len(parsed)
+    result["receipts"]["truncated"] = len(receipt_files) > STATUS_MAX_RECEIPTS
+    result["receipts"]["failedAttempts"] = sum(1 for item in parsed if item["failed"])
+    valid_receipt_stems = {Path(item["receipt"]).stem for item in parsed}
+
+    def order(item):
+        return item.get("endedAt") or item.get("startedAt") or 0
+
+    result["receipts"]["latest"] = max(parsed, key=order, default=None)
+    result["receipts"]["latestFailed"] = max((item for item in parsed if item["failed"]),
+                                              key=order, default=None)
+    result["receipts"]["latestSuccessful"] = max((item for item in parsed if not item["failed"]),
+                                                  key=order, default=None)
+
+    active_marker_stems = set()
+    for marker in sorted(markers, key=_mtime, reverse=True):
+        stem = marker.name[: -len(".running")]
+        if stem in valid_receipt_stems:
+            note_ignored(marker.name, "stale running marker superseded by a valid receipt")
+            continue
+        data, problem = _read_bounded_json(marker, STATUS_MAX_MARKER_BYTES)
+        started = _number(data.get("started_at")) if isinstance(data, dict) else None
+        deadline = _number(data.get("deadline_at")) if isinstance(data, dict) else None
+        timeout = _number(data.get("timeout_seconds")) if isinstance(data, dict) else None
+        marker_id = data.get("id") if isinstance(data, dict) else None
+        log_name = data.get("log") if isinstance(data, dict) else None
+        pid = data.get("pid") if isinstance(data, dict) else None
+        if problem is not None or started is None or deadline is None or deadline < started \
+                or timeout is None or not 0 < timeout <= 604800 \
+                or not isinstance(marker_id, str) or not CHECK_ID_RE.fullmatch(marker_id) \
+                or not isinstance(log_name, str) or not log_name.endswith(".log") \
+                or _safe_basename(log_name) is None:
+            note_ignored(marker.name, f"{problem or 'invalid'} running marker")
+            continue
+        log_path = checks_dir / log_name
+        if not inside(log_path, resolved):
+            note_ignored(marker.name, "unsafe running marker log identity")
+            continue
+        now = time.time()
+        if result["running"] is None:
+            result["running"] = {
+                "marker": marker.name, "id": marker_id,
+                "pid": pid if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 else None,
+                "pidAlive": _pid_running(pid), "startedAt": started, "deadlineAt": deadline,
+                "elapsedMs": int(max(0.0, now - started) * 1000), "timeoutSeconds": timeout,
+                "deadlinePassed": bool(now > deadline),
+                "deadlineScope": "wrapper timeout only; never an inner command deadline",
+                "log": log_name, "logEvidence": _tail_evidence(log_path),
+                "uncertain": True,
+                "note": "a running marker proves a wrapper attempt started; a live pid is not progress"}
+        active_marker_stems.add(stem)
+
+    for log in sorted(logs, key=_mtime, reverse=True):
+        if log.stem in valid_receipt_stems or log.stem in active_marker_stems:
+            continue
+        result["legacyCandidate"] = {
+            "log": log.name, "uncertain": True,
+            "reason": "no validated receipt and no live running marker; quiet output is not failure",
+            "recordedAt": _mtime(log), "logEvidence": _tail_evidence(log),
+            "note": "legacy attempt candidate only: not proof of an active, hung or failed check"}
+        break
+    return result
+
+
+def _wait_probe(repo_arg: str, task_arg: str, round_arg=None) -> str:
+    """Cheap active-state probe: one state read plus two lock checks, no scans."""
+    task = require_task_arg(task_arg)
+    root = canonical_root(Path(repo_arg))
+    common = git_common_dir(root)
+    task_dir = task_dir_for(common, task)
+    if not task_dir.is_dir():
+        raise ValueError(f"unknown task {task!r} for repository {root}; no evidence at {task_dir}")
+    rounds = list_rounds(task_dir)
+    if not rounds:
+        raise ValueError(f"task {task!r} has no rounds yet; start it before waiting")
+    latest_number = rounds[-1][0]
+    selected_number = latest_number if round_arg is None else int(round_arg)
+    if selected_number not in [number for number, _ in rounds]:
+        raise ValueError(f"round {selected_number} does not exist for task {task!r}")
+    selected_dir = task_dir / "rounds" / str(selected_number)
+    task_held = lock_is_held(task_dir / ".task.lock")
+    supervisor_alive = lock_is_held(task_dir / ".supervisor.lock")
+    state = read_json(selected_dir / "round.state.json", None)
+    state = state if isinstance(state, dict) else {}
+    return effective_state(state, task_held, supervisor_alive, selected_number == latest_number)
+
+
+def build_status(repo_arg: str, task_arg: str, round_arg=None) -> dict:
+    """Bounded read-only state snapshot. Never starts Pi, builds a summary or scans a transcript."""
+    task = require_task_arg(task_arg)
+    root = canonical_root(Path(repo_arg))
+    common = git_common_dir(root)
+    task_dir = task_dir_for(common, task)
+    if not task_dir.is_dir():
+        raise ValueError(f"unknown task {task!r} for repository {root}; no evidence at {task_dir}")
+    frozen = read_json(task_dir / "task.json", None)
+    if not isinstance(frozen, dict):
+        raise ValueError(f"task {task!r} has no readable task.json under {task_dir}")
+    rounds = list_rounds(task_dir)
+    if not rounds:
+        raise ValueError(f"task {task!r} has no rounds yet; start it before reading status")
+    latest_number = rounds[-1][0]
+    if round_arg is None:
+        selected_number = latest_number
+    else:
+        selected_number = int(round_arg)
+        if selected_number not in [number for number, _ in rounds]:
+            raise ValueError(f"round {selected_number} does not exist for task {task!r}")
+    selected_dir = task_dir / "rounds" / str(selected_number)
+    task_held = lock_is_held(task_dir / ".task.lock")
+    supervisor_alive = lock_is_held(task_dir / ".supervisor.lock")
+    state = read_json(selected_dir / "round.state.json", None)
+    if not isinstance(state, dict):
+        state = {}
+    raw_state = state.get("state")
+    effective = effective_state(state, task_held, supervisor_alive, selected_number == latest_number)
+    started = _number(state.get("startedAt"))
+    ended = _number(state.get("endedAt"))
+    now = time.time()
+    elapsed_ms = int(((ended if ended is not None else now) - started) * 1000) if started is not None else None
+    timeout = _number(frozen.get("timeoutSeconds"))
+    deadline_at = started + timeout if started is not None and timeout is not None else None
+    checks = _scan_checks(selected_dir / "round.checks")
+    execution_activity = {}
+    for label, name in (("roundJsonl", "round.jsonl"), ("roundErr", "round.err")):
+        path = selected_dir / name
+        try:
+            info = path.stat()
+            execution_activity[label] = {"path": str(path), "bytes": info.st_size,
+                                         "mtime": info.st_mtime}
+        except OSError:
+            execution_activity[label] = {"path": str(path), "bytes": None, "mtime": None}
+    execution_activity["note"] = ("raw execution evidence size/mtime only; a quiet or growing transcript "
+                                  "is activity evidence, never useful progress and never acceptance")
+    processes = {"taskLockHeld": task_held, "supervisorLeaseHeld": supervisor_alive}
+    for key in ("supervisorPid", "piPid"):
+        value = state.get(key)
+        processes[key] = value if isinstance(value, int) and not isinstance(value, bool) else None
+    notes = ["status is a bounded read-only snapshot; it generates no summary and parses no transcript",
+             "process existence and quiet logs are never progress or failure",
+             "exit 0 means the Pi process completed execution only; acceptance stays not_verified"]
+    if raw_state in ACTIVE_STATES and not supervisor_alive:
+        notes.append("the recorded state is active but no supervisor lease is held; ownership is "
+                    "unknown, not progress")
+    if raw_state in TERMINAL_STATES and task_held and not supervisor_alive:
+        notes.append("a Pi descendant may still hold the task lock after a terminal record; inspect "
+                     "before reuse")
+    if checks["running"] is not None:
+        notes.append("the running marker and wrapper deadline come from pi_check; an inner command "
+                     "deadline is never inferred from shell syntax")
+    if checks["legacyCandidate"] is not None:
+        notes.append("the latest unreceipted check log is an explicitly uncertain legacy candidate; "
+                     "it is not proof of an active, hung or failed check")
+    if checks["partial"]:
+        notes.append("the checks directory was only partially inspected (bounded subset of entries); "
+                     "totals, latest receipts and candidates are not global and may be incomplete")
+    elif checks["receipts"]["truncated"]:
+        notes.append("receipt parsing was bounded to the newest entries; failed counts and latest "
+                     "receipts may be incomplete")
+    return {
+        "schemaVersion": 1, "task": task, "repo": frozen.get("repo") or str(root),
+        "worktree": frozen.get("worktree"), "readOnly": bool(frozen.get("readOnly")),
+        "model": frozen.get("model"), "thinking": frozen.get("thinking"),
+        "runtimeVersion": frozen.get("runtimeVersion"),
+        "session": {"sessionId": frozen.get("sessionId"), "sessionDir": frozen.get("sessionDir")},
+        "round": selected_number, "latestRound": latest_number,
+        "state": effective, "recordedState": raw_state,
+        "startedAt": started, "endedAt": ended, "elapsedMs": elapsed_ms, "deadlineAt": deadline_at,
+        "exitCode": state.get("exitCode"), "timedOut": bool(state.get("timedOut")),
+        "cancelled": bool(state.get("cancelled")),
+        "startHead": state.get("startHead"), "endHead": state.get("endHead") or state.get("head"),
+        "briefSha256": state.get("briefSha256"),
+        "ownership": {"activeWorker": task_held, "supervisorAlive": supervisor_alive},
+        "processes": processes, "executionActivity": execution_activity,
+        "checks": checks, "evidence": evidence_paths(task_dir, selected_number),
+        "acceptance": "not_verified", "notes": notes,
+    }
+
+
 def build_result(repo_arg: str, task_arg: str, round_arg=None) -> dict:
     task = require_task_arg(task_arg)
     root = canonical_root(Path(repo_arg))
@@ -1011,6 +1371,10 @@ def cmd_result(args) -> dict:
     return build_result(args.repo, args.task, args.round)
 
 
+def cmd_status(args) -> dict:
+    return build_status(args.repo, args.task, args.round)
+
+
 def cmd_wait(args) -> dict:
     timeout_ms = args.timeout_ms
     if timeout_ms is None:
@@ -1018,19 +1382,27 @@ def cmd_wait(args) -> dict:
     timeout_ms = max(0, min(60000, int(timeout_ms)))
     deadline = time.monotonic() + timeout_ms / 1000
     timed_out = False
+    state = None
     while True:
-        result = build_result(args.repo, args.task, args.round)
-        if result["state"] not in ACTIVE_STATES:
+        state = _wait_probe(args.repo, args.task, args.round)
+        if state not in ACTIVE_STATES:
             break
         if time.monotonic() >= deadline:
             timed_out = True
             break
         time.sleep(min(0.3, max(0.05, deadline - time.monotonic())))
-    result["wait"] = {"timeoutMs": timeout_ms, "timedOut": timed_out,
-                      "note": "waiting never cancels the worker; an explicitly armed trusted Stop handoff "
-                              "may deliver a continuation, but there is no automatic wake otherwise, so do not "
-                              "spin repeated waits"}
-    return result
+    wait = {"timeoutMs": timeout_ms, "timedOut": timed_out,
+            "note": "waiting never cancels the worker; repeat bounded waits only when needed",
+            "instruction": ("repeat short bounded waits only when needed; process user steering between "
+                            "calls; avoid verbose unchanged narration; collect the full result once when "
+                            "the round is delivered")}
+    if state in TERMINAL_STATES:
+        result = build_result(args.repo, args.task, args.round)
+        result["wait"] = wait
+        return result
+    status = build_status(args.repo, args.task, args.round)
+    status["wait"] = wait
+    return status
 
 
 def cmd_cancel(args) -> dict:
@@ -1165,6 +1537,11 @@ def build_parser() -> argparse.ArgumentParser:
     add_repo_task(result)
     result.add_argument("--round", type=int)
     result.set_defaults(func=cmd_result)
+
+    status = sub.add_parser("status", help="fast read-only round/check snapshot (no summary generation)")
+    add_repo_task(status)
+    status.add_argument("--round", type=int)
+    status.set_defaults(func=cmd_status)
 
     wait = sub.add_parser("wait", help="bounded internal wait for a terminal state (never cancels)")
     add_repo_task(wait)
