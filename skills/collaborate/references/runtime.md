@@ -27,7 +27,7 @@ Normal supervision stays inside the detached Pi supervisor. Do independent work,
 
 `result` is collected once per terminal round. It retains raw pointers and bounded summaries, all attempts, model usage and native Pi session evidence below the Git common directory `codex-pi/tasks/`. Open only the relevant receipt/log/diff. Continue the exact saved task for repairs; do not replace a live or unknown worker with a new identity. A reused session does not keep idle Pi processes alive after the round ends.
 
-## Phase contracts (0.5, O1)
+## Phase contracts (0.5: accepted O1, verified O2)
 
 An authorized complete phase may be dispatched with a frozen contract: give `start`/`continue` a
 `--contract-file` JSON (schema in `docs/validation/phase-autonomy-o1-20260926.md`). The contract
@@ -61,9 +61,12 @@ built by `pi_task` and consumed by the board, progress events, `readiness` and t
 there is no second candidate or receipt-validity inference. `accept` re-reads the live status and
 refuses when the round, contract revision, candidate, readiness, worktree HEAD or writer-free state
 no longer match the stored event. Tasks without a
-contract keep the legacy review path. See
+contract keep the legacy review path. O1 is accepted at candidate `7331da9`; O2 ran a real two-round
+fixture (R1 `changes_requested`, same-session R2 accepted) documented in
+[o2-eventfold-20260926.md](../../docs/validation/o2-eventfold-20260926.md); formal O3 installation and
+business-task migration are still pending. See
 [docs/validation/phase-autonomy-o1-20260926.md](../../docs/validation/phase-autonomy-o1-20260926.md)
-for operations and the O2/O3 unverified boundary.
+for operations and the current verification boundary.
 
 ## Checks and resource protection
 
