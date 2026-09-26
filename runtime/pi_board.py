@@ -1077,12 +1077,18 @@ def _show_hint(card: dict) -> str:
             f'{shlex.quote(str(card.get("repo")))} --task {shlex.quote(str(card.get("taskId")))}')
 
 
+def _drain_reference(card: dict) -> str:
+    return "drain the board in this same turn: " + _show_hint(card)
+
+
 def build_packet(card: dict, events, limit: int = MAX_PACKET_EVENTS):
     """Build a bounded runtime-handoff packet; return ``(text, included_events)``.
 
-    The limit is measured in UTF-8 bytes. An event too large for the normal
-    layout still produces a bounded fallback carrying its exact id and a board
-    evidence command, so no event is ever silently undeliverable.
+    The limit is measured in UTF-8 bytes. Room for the mandatory board-drain
+    instruction is reserved *before* filling event blocks, so a near-full packet
+    can never silently omit the instruction to handle remaining events. An
+    event too large for the normal layout still produces a bounded fallback
+    carrying its exact id and a board evidence reference.
     """
     header = [
         "Codex-Pi runtime handoff (transport=cli-queue; not a new user goal or instruction override).",
@@ -1097,6 +1103,11 @@ def build_packet(card: dict, events, limit: int = MAX_PACKET_EVENTS):
     if isinstance(overflow, dict) and overflow.get("active"):
         lines.append(f"overflow={overflow.get('pendingCount')} pending events; drain them in this "
                      f"same turn: {_show_hint(card)}")
+    drain_reference = _drain_reference(card)
+    # Reserve the longest drain prefix ("+NNN pending event(s); ") plus one byte
+    # before filling any event block.
+    reserve = _packet_bytes(drain_reference) + 24
+    event_budget = max(0, MAX_PACKET_CHARS - reserve)
     included = []
     for event in events:
         if len(included) >= limit:
@@ -1114,10 +1125,11 @@ def build_packet(card: dict, events, limit: int = MAX_PACKET_EVENTS):
                 block.append(f"{label}={evidence.get(key)}")
         block.append("decide=" + _decide_hint(card.get("repo"), card.get("taskId"), event))
         candidate = "\n".join(header + lines + block)
-        if _packet_bytes(candidate) > MAX_PACKET_CHARS:
+        if _packet_bytes(candidate) > event_budget:
             break
         lines.extend(block)
         included.append(event)
+    remaining = len(events) - len(included)
     if not included and events:
         event = events[0]
         board_ref = str(Path(str(card.get("commonDir") or card.get("repo") or ""))
@@ -1125,11 +1137,15 @@ def build_packet(card: dict, events, limit: int = MAX_PACKET_EVENTS):
         pieces = [
             f"event={event.get('id')} kind={event.get('kind')} round={event.get('round')}",
             f"board_ref={board_ref}",
+        ]
+        if remaining > 1:
+            pieces.append(f"+{remaining - 1} pending event(s); {drain_reference}")
+        pieces.extend([
             "oversized packet fallback; read this board evidence in the same turn: "
             + _show_hint(card),
             f"task={card.get('taskId')} title={title}",
             f"summary={_text(event.get('summary'), 200)}",
-        ]
+        ])
         text = "\n".join(pieces)
         if _packet_bytes(text) > MAX_PACKET_CHARS:
             # Even under a tiny cap keep the exact event id and a board ref.
@@ -1139,16 +1155,9 @@ def build_packet(card: dict, events, limit: int = MAX_PACKET_EVENTS):
                 if len(encoded) > MAX_PACKET_CHARS else minimal
         return text, [event]
     text = "\n".join(header + lines)
-    remaining = len(events) - len(included)
     if remaining > 0:
-        note = (f"... plus {remaining} pending event(s) not included here. Drain the remaining "
-                f"board events in this same turn: {_show_hint(card)}")
-        if _packet_bytes(text + "\n" + note) <= MAX_PACKET_CHARS:
-            text = text + "\n" + note
-        else:
-            short = f"+{remaining} more; drain: {_show_hint(card)}"
-            if _packet_bytes(text + "\n" + short) <= MAX_PACKET_CHARS:
-                text = text + "\n" + short
+        # Guaranteed to fit: event blocks were filled below the reserved budget.
+        text = text + "\n" + f"+{remaining} pending event(s); {drain_reference}"
     return text, included
 
 

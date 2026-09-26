@@ -1030,6 +1030,77 @@ class BoardTest(unittest.TestCase):
                              "captured output must be bounded while the child runs")
         self.assertEqual(len(self.marker_lines(marker)), 1)
 
+    def test_near_full_packet_keeps_the_mandatory_drain_instruction(self):
+        repo, _worktree = self.make()
+        board = board_only(repo, task_id="near-full", thread=THREAD_A,
+                           transport=pi_board.TRANSPORT_CLI_QUEUE)
+        card = board["cards"]["near-full"]
+        events = []
+        for index in range(4):
+            evidence = {"briefRef": "b" * 1336} if index == 0 else {"guardPath": "p"}
+            events.append(pi_board.add_event(card, "resource_breach", 3,
+                                             f"near-{index}:p:1", "s" * 100,
+                                             {"round": 3, "head": None}, evidence,
+                                             "q" * 100, index))
+        text, included = pi_board.build_packet(card, events)
+        self.assertTrue(included)
+        self.assertLess(len(included), 4, "a near-full packet must omit events, not the instruction")
+        self.assertIn("pending event(s)", text)
+        self.assertIn("same turn", text)
+        self.assertIn("pi_board.py show", text)
+        self.assertLessEqual(len(text.encode("utf-8")), pi_board.MAX_PACKET_CHARS)
+        for event in included:
+            self.assertIn(event["id"], text)
+        omitted = [event for event in events if event not in included]
+        for event in omitted:
+            self.assertNotIn(event["id"], text)
+
+    def test_limit_count_overflow_keeps_the_drain_instruction(self):
+        repo, _worktree = self.make()
+        board = board_only(repo, task_id="count-full", thread=THREAD_A,
+                           transport=pi_board.TRANSPORT_CLI_QUEUE)
+        card = board["cards"]["count-full"]
+        events = [pi_board.add_event(card, "resource_breach", 3, f"count-{i}:p:1", "s",
+                                     {"round": 3, "head": None}, {}, "q", i)
+                  for i in range(5)]
+        text, included = pi_board.build_packet(card, events)
+        self.assertEqual(len(included), pi_board.MAX_PACKET_EVENTS)
+        self.assertIn("pending event(s)", text)
+        self.assertIn("same turn", text)
+        self.assertLessEqual(len(text.encode("utf-8")), pi_board.MAX_PACKET_CHARS)
+
+    def test_utf8_near_full_packet_keeps_drain_and_byte_bound(self):
+        repo, _worktree = self.make()
+        board = board_only(repo, task_id="utf8-near", thread=THREAD_A,
+                           transport=pi_board.TRANSPORT_CLI_QUEUE)
+        card = board["cards"]["utf8-near"]
+        events = [pi_board.add_event(card, "resource_breach", 3, f"multi-{i}:p:1", "é" * 200,
+                                     {"round": 3, "head": None}, {"briefRef": "é" * 300},
+                                     "q" * 120, i) for i in range(4)]
+        text, included = pi_board.build_packet(card, events)
+        self.assertTrue(included)
+        self.assertLessEqual(len(text.encode("utf-8")), pi_board.MAX_PACKET_CHARS)
+        self.assertIn("pending event(s)", text, "the drain instruction must survive the byte reserve")
+
+    def test_oversized_fallback_with_remaining_events(self):
+        repo, _worktree = self.make()
+        board = board_only(repo, task_id="oversize-many", thread=THREAD_A,
+                           transport=pi_board.TRANSPORT_CLI_QUEUE)
+        card = board["cards"]["oversize-many"]
+        events = [pi_board.add_event(card, "resource_breach", 3, f"big-{i}:p:1", "x" * 300,
+                                     {"round": 3, "head": None}, {}, "q" * 300, i)
+                  for i in range(3)]
+        original = pi_board.MAX_PACKET_CHARS
+        pi_board.MAX_PACKET_CHARS = 300
+        try:
+            text, included = pi_board.build_packet(card, events)
+        finally:
+            pi_board.MAX_PACKET_CHARS = original
+        self.assertEqual(included, [events[0]])
+        self.assertIn(events[0]["id"], text)
+        self.assertTrue("board_ref=" in text or "show" in text)
+        self.assertLessEqual(len(text.encode("utf-8")), 300)
+
     def test_default_codex_bin_is_resolved_to_an_absolute_path(self):
         repo, worktree = self.make()
         env = self.h_env(self.tmp, PI_DOUBLE_MODE="ok")
@@ -1153,6 +1224,55 @@ class BoardTest(unittest.TestCase):
         queue = self.read_queue(repo)["tasks"]["prespawn"]
         self.assertTrue(any(claim.get("status") == "queued"
                             for claim in queue["claims"].values()), queue)
+
+    def make_snapshot_task(self, repo, task: str, state: str = "running",
+                           meta_text: str = "exit=None\n"):
+        task_dir = self.make_frozen_task(repo, task)
+        (task_dir / "cancel.json").unlink()
+        state_path = task_dir / "rounds" / "1" / "round.state.json"
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+        data["state"] = state
+        state_path.write_text(json.dumps(data), encoding="utf-8")
+        (task_dir / "rounds" / "1" / "round.meta").write_text(meta_text, encoding="utf-8")
+        tools = task_dir / "tools"
+        tools.mkdir(parents=True, exist_ok=True)
+        (tools / "pi_board.py").write_text("junk\n", encoding="utf-8")
+        return task_dir
+
+    def test_upgrade_requires_a_well_formed_terminal_round(self):
+        repo, _worktree = self.make()
+        env = self.h_env(self.tmp)
+        for state in ("running", "starting", "unknown"):
+            task = f"snap-{state}"
+            task_dir = self.make_snapshot_task(repo, task, state=state)
+            frozen_before = (task_dir / "task.json").read_bytes()
+            refused = run_cli("upgrade", "--repo", repo.root, "--task", task,
+                              env=env, expect=2)
+            self.assertIn("not terminal-known", refused.stderr)
+            self.assertEqual((task_dir / "tools" / "pi_board.py").read_text(encoding="utf-8"),
+                             "junk\n", "refused upgrades must not touch helper bytes")
+            self.assertEqual((task_dir / "task.json").read_bytes(), frozen_before,
+                             "refused upgrades must not touch task metadata")
+            self.assertFalse((task_dir / "tools.new").exists())
+
+        missing = self.make_snapshot_task(repo, "snap-missing", state="completed")
+        (missing / "rounds" / "1" / "round.state.json").unlink()
+        refused = run_cli("upgrade", "--repo", repo.root, "--task", "snap-missing",
+                          env=env, expect=2)
+        self.assertIn("no readable round.state.json", refused.stderr)
+
+        noexit = self.make_snapshot_task(repo, "snap-noexit", state="completed", meta_text="")
+        refused = run_cli("upgrade", "--repo", repo.root, "--task", "snap-noexit",
+                          env=env, expect=2)
+        self.assertIn("no exit evidence", refused.stderr)
+
+        done = self.make_snapshot_task(repo, "snap-done", state="completed", meta_text="exit=0\n")
+        ok = json.loads(run_cli("upgrade", "--repo", repo.root, "--task", "snap-done",
+                                env=env, expect=0).stdout)
+        self.assertTrue(ok["ok"])
+        self.assertEqual((done / "tools" / "pi_board.py").read_bytes(),
+                         (RUNTIME / "pi_board.py").read_bytes())
+        self.assertFalse((done / "tools.new").exists())
 
     def test_upgrade_refused_when_lifecycle_locks_are_acquired_first(self):
         repo, worktree = self.make()

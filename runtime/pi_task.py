@@ -1861,8 +1861,26 @@ def cmd_upgrade(args) -> dict:
         frozen_repo = frozen.get("repo")
         if not isinstance(frozen_repo, str) or Path(frozen_repo).expanduser().resolve() != root:
             raise ValueError(f"task {task!r} belongs to checkout {frozen_repo!r}, not {root}")
-        if not list_rounds(task_dir):
+        rounds = list_rounds(task_dir)
+        if not rounds:
             raise ValueError(f"task {task!r} has no rounds yet")
+        # A missing/unreadable round state is not proof of terminal execution.
+        latest_number, latest_dir = rounds[-1]
+        round_state = read_json(latest_dir / "round.state.json", None)
+        if not isinstance(round_state, dict):
+            raise ValueError(f"latest round {latest_number} has no readable round.state.json; "
+                             "unknown state is not proof of terminal execution; refusing to "
+                             "replace helpers")
+        if round_state.get("round") not in (None, latest_number):
+            raise ValueError(f"latest round state identity mismatch (round="
+                             f"{round_state.get('round')!r}); refusing to replace helpers")
+        if round_state.get("state") not in TERMINAL_STATES:
+            raise ValueError(f"latest round {latest_number} is not terminal-known "
+                             f"(state={round_state.get('state')!r}); refusing to replace helpers")
+        meta_path = latest_dir / "round.meta"
+        if not meta_path.is_file() or "exit" not in read_meta(meta_path):
+            raise ValueError(f"latest round {latest_number} has no exit evidence; refusing to "
+                             "replace helpers")
         source = Path(__file__).resolve().parent
         staging = task_dir / "tools.new"
         shutil.rmtree(staging, ignore_errors=True)
