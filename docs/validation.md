@@ -32,10 +32,16 @@ Pi 实施提交 `bc03a45` 已由 Codex 主会话复核，并以 `8076c8c` 接入
 随后执行 `hooks/hooks.json` 中的实际 shell 命令：第一次返回 `block`，重复执行返回 `{}`，
 同会话两次 ack 均成功。此测试的 session 是隔离的测试身份，**不冒充桌面宿主的续行**。
 
-宿主端状态：旧版 `collaborate` skill 已在当前任务加载；新版源码、hook 定义已准备好，
-应用刷新、审核信任及真实同任务续行仍待验证。同步 Stop 在宿主处理停止事件期间等待，
-不提供应用关闭后的自动唤醒，也不保证通知记录写入后宿主必然收到。
-没有修改受管理的插件缓存或信任记录。全过程没有调用 Codex CLI。
+宿主端状态：`0.2.0+codex.20260926015337` 已加载，安装缓存的 manifest、hook 定义和运行时代码
+与已验证源码一致。用户在应用中完成信任后，[真实桌面续行](validation/handoff-desktop-smoke.json)通过：
+应用执行已安装插件的 Stop hook，在同一个 Codex 任务
+`01a0da81-3b76-7fd0-aac2-0169cb6de7a1` 生成续行提示；主会话收取真实 DeepSeek 结果并完成 ack，
+状态为 `acked`、通知次数为 1。没有人工调用 hook 来模拟该宿主事件。
+这次桌面验证使用已完成的真实 Pi 轮次；等待、失败、中断、超时及并发边界由上述进程测试覆盖。
+
+同步 Stop 在宿主处理停止事件期间等待，不提供应用关闭后的自动唤醒，
+也不保证通知记录写入后宿主必然收到。没有修改受管理的插件缓存或信任记录。
+全过程没有调用 Codex CLI。
 
 ## 0.1.0 既有运行时证据
 
@@ -52,7 +58,7 @@ Pi 实施提交 `bc03a45` 已由 Codex 主会话复核，并以 `8076c8c` 接入
 本地安装配置：`~/.agents/plugins/marketplace.json` 已登记 `codex-pi@personal`，
 策略为 `INSTALLED_BY_DEFAULT`；`~/.codex/config.toml` 已启用插件。旧 skill 已确认加载。
 电脑操作工具禁止控制 Codex 应用，用户也禁止调用 Codex CLI，因此新版安装刷新与 hook 信任
-需要用户在应用中完成；skill 可用不能代替 hook 已加载、已信任的证据。
+由用户在应用中完成；本次已用实际 Stop 续行补充运行证据，skill 可用仍不能代替 hook 运行证据。
 
 原始测试及 smoke 日志位于 `/tmp/pi-collab-research-20260926`，属于可清理的本机临时证据；
 关键结果和测试输出已保存在本目录。常规项目运行的原始证据保存在各自 Git common dir 的 `codex-pi/tasks/` 中。

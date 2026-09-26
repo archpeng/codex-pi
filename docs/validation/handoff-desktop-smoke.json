@@ -1,0 +1,129 @@
+{
+  "schemaVersion": 1,
+  "recordedAt": 1790388117.1112251,
+  "pluginVersion": "0.2.0+codex.20260926015337",
+  "sourceImplementationCommit": "8076c8c",
+  "sessionId": "01a0da81-3b76-7fd0-aac2-0169cb6de7a1",
+  "eventKey": "d0935ab2ed99f1be3625923697207660a44d2cea2e38a7fbc33c29c4706e1db5",
+  "hostHookRunId": "stop:8:/Users/jlpeng/.codex/plugins/cache/personal/codex-pi/0.2.0+codex.20260926015337/hooks/hooks.json",
+  "actualHostContinuationObserved": true,
+  "hookManuallyInvoked": false,
+  "scope": "Actual desktop Stop continued this same Codex task for a real completed Pi round; waiting and failure boundaries are covered by subprocess tests.",
+  "statusBeforeAck": {
+    "ok": true,
+    "count": 1,
+    "bindings": [
+      {
+        "eventKey": "d0935ab2ed99f1be3625923697207660a44d2cea2e38a7fbc33c29c4706e1db5",
+        "sessionId": "01a0da81-3b76-7fd0-aac2-0169cb6de7a1",
+        "repo": "/private/tmp/codex-pi-hooks-20260926/live-smoke/repo",
+        "task": "HOOK-LIVE-SMOKE",
+        "round": 1,
+        "state": "delivered",
+        "armedAt": 1790388081.138068,
+        "generation": 1,
+        "observedInterruptGeneration": 0,
+        "waitSeconds": 30.0,
+        "attempts": 1,
+        "deliveredAt": 1790388092.427872,
+        "ackedAt": null,
+        "ackedFromState": null,
+        "suspendedAt": null,
+        "lastWaitExpiredAt": null,
+        "lastCheckedAt": 1790388092.427872,
+        "lastError": null,
+        "delivery": {
+          "state": "completed",
+          "exitCode": 0,
+          "timedOut": false,
+          "cancelled": false,
+          "endedAt": 1790388092.427871
+        },
+        "liveRoundState": {
+          "roundState": "completed",
+          "exitCode": 0,
+          "timedOut": false,
+          "cancelled": false
+        },
+        "evidence": {
+          "taskDir": "/private/tmp/codex-pi-hooks-20260926/live-smoke/repo/.git/codex-pi/tasks/HOOK-LIVE-SMOKE",
+          "roundDir": "/private/tmp/codex-pi-hooks-20260926/live-smoke/repo/.git/codex-pi/tasks/HOOK-LIVE-SMOKE/rounds/1",
+          "state": "/private/tmp/codex-pi-hooks-20260926/live-smoke/repo/.git/codex-pi/tasks/HOOK-LIVE-SMOKE/rounds/1/round.state.json",
+          "summary": "/private/tmp/codex-pi-hooks-20260926/live-smoke/repo/.git/codex-pi/tasks/HOOK-LIVE-SMOKE/rounds/1/round.summary.json",
+          "checksDir": "/private/tmp/codex-pi-hooks-20260926/live-smoke/repo/.git/codex-pi/tasks/HOOK-LIVE-SMOKE/rounds/1/round.checks"
+        },
+        "commands": {
+          "status": "python3 /Users/jlpeng/.codex/plugins/cache/personal/codex-pi/0.2.0+codex.20260926015337/runtime/pi_handoff.py status --event-key d0935ab2ed99f1be3625923697207660a44d2cea2e38a7fbc33c29c4706e1db5",
+          "ack": "python3 /Users/jlpeng/.codex/plugins/cache/personal/codex-pi/0.2.0+codex.20260926015337/runtime/pi_handoff.py ack --event-key d0935ab2ed99f1be3625923697207660a44d2cea2e38a7fbc33c29c4706e1db5",
+          "result": "python3 /private/tmp/codex-pi-hooks-20260926/live-smoke/repo/.git/codex-pi/tasks/HOOK-LIVE-SMOKE/tools/pi_task.py result --repo /private/tmp/codex-pi-hooks-20260926/live-smoke/repo --task HOOK-LIVE-SMOKE --round 1"
+        },
+        "acceptance": "not_verified"
+      }
+    ],
+    "note": "status is bounded recovery evidence only; it never delivers, re-arms or accepts"
+  },
+  "ack": {
+    "ok": true,
+    "alreadyAcked": false,
+    "eventKey": "d0935ab2ed99f1be3625923697207660a44d2cea2e38a7fbc33c29c4706e1db5",
+    "ackAt": 1790388117.078652,
+    "binding": {
+      "eventKey": "d0935ab2ed99f1be3625923697207660a44d2cea2e38a7fbc33c29c4706e1db5",
+      "sessionId": "01a0da81-3b76-7fd0-aac2-0169cb6de7a1",
+      "repo": "/private/tmp/codex-pi-hooks-20260926/live-smoke/repo",
+      "task": "HOOK-LIVE-SMOKE",
+      "round": 1,
+      "state": "acked",
+      "armedAt": 1790388081.138068,
+      "generation": 1,
+      "observedInterruptGeneration": 0,
+      "waitSeconds": 30.0,
+      "attempts": 1,
+      "deliveredAt": 1790388092.427872,
+      "ackedAt": 1790388117.078652,
+      "ackedFromState": "delivered",
+      "suspendedAt": null,
+      "lastWaitExpiredAt": null,
+      "lastCheckedAt": 1790388092.427872,
+      "lastError": null,
+      "delivery": {
+        "state": "completed",
+        "exitCode": 0,
+        "timedOut": false,
+        "cancelled": false,
+        "endedAt": 1790388092.427871
+      },
+      "liveRoundState": {
+        "roundState": "completed",
+        "exitCode": 0,
+        "timedOut": false,
+        "cancelled": false
+      },
+      "evidence": {
+        "taskDir": "/private/tmp/codex-pi-hooks-20260926/live-smoke/repo/.git/codex-pi/tasks/HOOK-LIVE-SMOKE",
+        "roundDir": "/private/tmp/codex-pi-hooks-20260926/live-smoke/repo/.git/codex-pi/tasks/HOOK-LIVE-SMOKE/rounds/1",
+        "state": "/private/tmp/codex-pi-hooks-20260926/live-smoke/repo/.git/codex-pi/tasks/HOOK-LIVE-SMOKE/rounds/1/round.state.json",
+        "summary": "/private/tmp/codex-pi-hooks-20260926/live-smoke/repo/.git/codex-pi/tasks/HOOK-LIVE-SMOKE/rounds/1/round.summary.json",
+        "checksDir": "/private/tmp/codex-pi-hooks-20260926/live-smoke/repo/.git/codex-pi/tasks/HOOK-LIVE-SMOKE/rounds/1/round.checks"
+      },
+      "commands": {
+        "status": "python3 /Users/jlpeng/.codex/plugins/cache/personal/codex-pi/0.2.0+codex.20260926015337/runtime/pi_handoff.py status --event-key d0935ab2ed99f1be3625923697207660a44d2cea2e38a7fbc33c29c4706e1db5",
+        "ack": "python3 /Users/jlpeng/.codex/plugins/cache/personal/codex-pi/0.2.0+codex.20260926015337/runtime/pi_handoff.py ack --event-key d0935ab2ed99f1be3625923697207660a44d2cea2e38a7fbc33c29c4706e1db5",
+        "result": "python3 /private/tmp/codex-pi-hooks-20260926/live-smoke/repo/.git/codex-pi/tasks/HOOK-LIVE-SMOKE/tools/pi_task.py result --repo /private/tmp/codex-pi-hooks-20260926/live-smoke/repo --task HOOK-LIVE-SMOKE --round 1"
+      },
+      "acceptance": "not_verified"
+    },
+    "note": "acknowledgement marks result collection only; it is never acceptance"
+  },
+  "result": {
+    "task": "HOOK-LIVE-SMOKE",
+    "round": 1,
+    "state": "completed",
+    "exitCode": 0,
+    "model": "deepseek/deepseek-flash",
+    "activeWorker": false,
+    "supervisorAlive": false
+  },
+  "modelCheck": "matched",
+  "finalExcerpt": "HOOK_DEEPSEEK_READY"
+}
