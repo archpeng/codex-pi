@@ -1,0 +1,6 @@
+interface:
+  display_name: "Codex + Pi"
+  short_description: "主会话设计验收、Pi 连续实施，跨项目复用执行与证据工具"
+  default_prompt: "使用 $collaborate 将当前项目已授权的任务交给 Pi 实施，并在当前主会话完成验收。"
+policy:
+  allow_implicit_invocation: true

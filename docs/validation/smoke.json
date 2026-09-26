@@ -1,0 +1,52 @@
+{
+  "date": "2026-09-26",
+  "scope": "Real installed Pi CLI, read-only detached execution and exact-session continuation; not business acceptance",
+  "rounds": [
+    {
+      "round": 1,
+      "state": "completed",
+      "session": {
+        "sessionId": "LIVE-CLI-FLASH",
+        "sessionDir": "/private/tmp/pi-collab-research-20260926/live-smoke/repo/.git/codex-pi/tasks/LIVE-CLI-FLASH/session"
+      },
+      "reportedModels": {
+        "deepseek/deepseek-flash": 1
+      },
+      "modelCheck": "matched",
+      "reply": "ACK",
+      "usage": {
+        "input": 1843,
+        "cacheRead": 256,
+        "cacheWrite": 0,
+        "output": 52,
+        "totalTokens": 2151
+      },
+      "rawLog": "/private/tmp/pi-collab-research-20260926/live-smoke/repo/.git/codex-pi/tasks/LIVE-CLI-FLASH/rounds/1/round.jsonl",
+      "rawSha256": "ed4aa355f82ec015db79942c29d6f0f3321d87913d62fbe5f7a7e43913500ec0",
+      "productAcceptance": "not_verified"
+    },
+    {
+      "round": 2,
+      "state": "completed",
+      "session": {
+        "sessionId": "LIVE-CLI-FLASH",
+        "sessionDir": "/private/tmp/pi-collab-research-20260926/live-smoke/repo/.git/codex-pi/tasks/LIVE-CLI-FLASH/session"
+      },
+      "reportedModels": {
+        "deepseek/deepseek-flash": 1
+      },
+      "modelCheck": "matched",
+      "reply": "BAKE_PI_DIRECT_7f82e9",
+      "usage": {
+        "input": 745,
+        "cacheRead": 2048,
+        "cacheWrite": 0,
+        "output": 50,
+        "totalTokens": 2843
+      },
+      "rawLog": "/private/tmp/pi-collab-research-20260926/live-smoke/repo/.git/codex-pi/tasks/LIVE-CLI-FLASH/rounds/2/round.jsonl",
+      "rawSha256": "d383c09fffe43e72adcbdc1606433474a86b4ef4c0d09cd8cd5a61de51cb69a1",
+      "productAcceptance": "not_verified"
+    }
+  ]
+}

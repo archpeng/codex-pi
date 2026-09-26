@@ -1,0 +1,58 @@
+test_full_lifecycle_never_executes_codex (test_codex_trap.CodexTrapTest.test_full_lifecycle_never_executes_codex) ... ok
+test_worker_environment_keeps_trap_without_running_it (test_codex_trap.CodexTrapTest.test_worker_environment_keeps_trap_without_running_it) ... ok
+test_actual_user_project_paths_are_read_only (test_config.ConfigTest.test_actual_user_project_paths_are_read_only) ... ok
+test_config_traversal_and_absolute_references_rejected (test_config.ConfigTest.test_config_traversal_and_absolute_references_rejected) ... ok
+test_configured_and_primary_checkouts_rejected_as_worktree (test_config.ConfigTest.test_configured_and_primary_checkouts_rejected_as_worktree) ... ok
+test_disallowed_model_rejected_by_project_and_start (test_config.ConfigTest.test_disallowed_model_rejected_by_project_and_start) ... ok
+test_invalid_limits_rejected (test_config.ConfigTest.test_invalid_limits_rejected) ... ok
+test_invalid_schema_version (test_config.ConfigTest.test_invalid_schema_version) ... ok
+test_linked_checkout_keeps_its_own_config (test_config.ConfigTest.test_linked_checkout_keeps_its_own_config) ... ok
+test_minimal_config_gets_documented_defaults (test_config.ConfigTest.test_minimal_config_gets_documented_defaults) ... ok
+test_missing_config_hints_configured_checkout_without_loading_it (test_config.ConfigTest.test_missing_config_hints_configured_checkout_without_loading_it) ... ok
+test_missing_config_is_actionable_and_no_pi_runs (test_config.ConfigTest.test_missing_config_is_actionable_and_no_pi_runs) ... ok
+test_project_info_returns_root_config_capabilities_and_limits (test_config.ConfigTest.test_project_info_returns_root_config_capabilities_and_limits) ... ok
+test_readme_only_constraints_are_allowed (test_config.ConfigTest.test_readme_only_constraints_are_allowed) ... ok
+test_repo_path_traversal_is_resolved_through_git (test_config.ConfigTest.test_repo_path_traversal_is_resolved_through_git) ... ok
+test_symlinked_config_escape_rejected (test_config.ConfigTest.test_symlinked_config_escape_rejected) ... ok
+test_task_id_traversal_rejected (test_config.ConfigTest.test_task_id_traversal_rejected) ... ok
+test_unknown_config_key_rejected (test_config.ConfigTest.test_unknown_config_key_rejected) ... ok
+test_cancel_on_terminal_task_signals_nothing (test_lifecycle.LifecycleTest.test_cancel_on_terminal_task_signals_nothing) ... ok
+test_cancel_stops_descendants_that_ignore_sigterm (test_lifecycle.LifecycleTest.test_cancel_stops_descendants_that_ignore_sigterm) ... ok
+test_continue_preserves_frozen_repo_identity (test_lifecycle.LifecycleTest.test_continue_preserves_frozen_repo_identity) ... ok
+test_continue_refused_while_worker_lock_is_held (test_lifecycle.LifecycleTest.test_continue_refused_while_worker_lock_is_held) ... ok
+test_continue_rejects_tampered_primary_worktree (test_lifecycle.LifecycleTest.test_continue_rejects_tampered_primary_worktree) ... ok
+test_duplicate_start_preserves_active_round (test_lifecycle.LifecycleTest.test_duplicate_start_preserves_active_round) ... ok
+test_duplicate_start_preserves_completed_evidence (test_lifecycle.LifecycleTest.test_duplicate_start_preserves_completed_evidence) ... ok
+test_duplicate_start_preserves_failed_evidence (test_lifecycle.LifecycleTest.test_duplicate_start_preserves_failed_evidence) ... ok
+test_failed_attempt_stays_visible_and_continue_uses_same_session (test_lifecycle.LifecycleTest.test_failed_attempt_stays_visible_and_continue_uses_same_session) ... ok
+test_internal_worker_revalidates_frozen_model (test_lifecycle.LifecycleTest.test_internal_worker_revalidates_frozen_model) ... ok
+test_lingering_descendant_dies_after_normal_completion (test_lifecycle.LifecycleTest.test_lingering_descendant_dies_after_normal_completion) ... ok
+test_linked_repo_input_cannot_use_primary_checkout (test_lifecycle.LifecycleTest.test_linked_repo_input_cannot_use_primary_checkout) ... ok
+test_missing_model_usage_stays_unknown (test_lifecycle.LifecycleTest.test_missing_model_usage_stays_unknown) ... ok
+test_parallel_max_workers_starts_have_one_winner (test_lifecycle.LifecycleTest.test_parallel_max_workers_starts_have_one_winner) ... ok
+test_parallel_same_worktree_starts_have_one_winner (test_lifecycle.LifecycleTest.test_parallel_same_worktree_starts_have_one_winner) ... ok
+test_project_isolation_for_same_task_id (test_lifecycle.LifecycleTest.test_project_isolation_for_same_task_id) ... ok
+test_read_only_limits_pi_tools (test_lifecycle.LifecycleTest.test_read_only_limits_pi_tools) ... ok
+test_reported_model_mismatch_stays_visible_and_not_verified (test_lifecycle.LifecycleTest.test_reported_model_mismatch_stays_visible_and_not_verified) ... ok
+test_same_task_worktree_and_max_workers_are_enforced (test_lifecycle.LifecycleTest.test_same_task_worktree_and_max_workers_are_enforced) ... ok
+test_snapshot_check_helper_works_from_task_tools (test_lifecycle.LifecycleTest.test_snapshot_check_helper_works_from_task_tools) ... ok
+test_stale_frozen_model_cannot_continue_and_evidence_is_preserved (test_lifecycle.LifecycleTest.test_stale_frozen_model_cannot_continue_and_evidence_is_preserved) ... ok
+test_stale_round_evidence_blocks_continue (test_lifecycle.LifecycleTest.test_stale_round_evidence_blocks_continue) ... ok
+test_start_completes_with_bounded_evidence_and_no_acceptance (test_lifecycle.LifecycleTest.test_start_completes_with_bounded_evidence_and_no_acceptance) ... ok
+test_supervisor_sigkill_orphan_pi_keeps_capacity_and_unknown (test_lifecycle.LifecycleTest.test_supervisor_sigkill_orphan_pi_keeps_capacity_and_unknown) ... ok
+test_timeout_is_recorded_and_kills_the_pi_process (test_lifecycle.LifecycleTest.test_timeout_is_recorded_and_kills_the_pi_process) ... ok
+test_unknown_after_supervisor_crash_is_never_success (test_lifecycle.LifecycleTest.test_unknown_after_supervisor_crash_is_never_success) ... ok
+test_unknown_round_rejected (test_lifecycle.LifecycleTest.test_unknown_round_rejected) ... ok
+test_wait_timeout_does_not_cancel_and_result_remains_bounded (test_lifecycle.LifecycleTest.test_wait_timeout_does_not_cancel_and_result_remains_bounded) ... ok
+test_worker_survives_caller_exit (test_lifecycle.LifecycleTest.test_worker_survives_caller_exit) ... ok
+test_worktree_validation (test_lifecycle.LifecycleTest.test_worktree_validation) ... ok
+test_missing_receipts_are_reported_as_absence (test_receipts.ReceiptTest.test_missing_receipts_are_reported_as_absence) ... ok
+test_pi_check_records_true_exit_hash_and_counts (test_receipts.ReceiptTest.test_pi_check_records_true_exit_hash_and_counts) ... ok
+test_reasoning_usage_is_not_added_twice (test_receipts.ReceiptTest.test_reasoning_usage_is_not_added_twice) ... ok
+test_summary_counts_every_failed_attempt_beyond_display_cap (test_receipts.ReceiptTest.test_summary_counts_every_failed_attempt_beyond_display_cap) ... ok
+
+----------------------------------------------------------------------
+Ran 52 tests in 37.321s
+
+OK
+UNITTEST_EXIT=0

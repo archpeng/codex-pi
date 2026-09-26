@@ -1,0 +1,130 @@
+{
+  "schemaVersion": 1,
+  "task": "LIVE-CLI-FLASH",
+  "repo": "/private/tmp/pi-collab-research-20260926/live-smoke/repo",
+  "worktree": "/private/tmp/pi-collab-research-20260926/live-smoke/worker",
+  "readOnly": true,
+  "model": "deepseek/deepseek-flash",
+  "thinking": "max",
+  "session": {
+    "sessionId": "LIVE-CLI-FLASH",
+    "sessionDir": "/private/tmp/pi-collab-research-20260926/live-smoke/repo/.git/codex-pi/tasks/LIVE-CLI-FLASH/session"
+  },
+  "round": 1,
+  "latestRound": 1,
+  "state": "completed",
+  "exitCode": 0,
+  "timedOut": false,
+  "cancelled": false,
+  "activeWorker": false,
+  "supervisorAlive": false,
+  "execution": "completed_execution",
+  "acceptance": "not_verified",
+  "rounds": [
+    {
+      "round": 1,
+      "state": "completed",
+      "exitCode": 0,
+      "timedOut": false,
+      "cancelled": false,
+      "startedAt": 1790384429.2170959,
+      "endedAt": 1790384430.055468,
+      "durationMs": 838,
+      "startHead": "298d99be55b4c9589e87e71fc75e387c08c61fad",
+      "endHead": "298d99be55b4c9589e87e71fc75e387c08c61fad",
+      "briefSha256": "b72bd8ced0d0bf86018ea02e2546c04d801928226e1d0acb7878d5fd2eb91788",
+      "summaryError": null,
+      "evidence": {
+        "taskDir": "/private/tmp/pi-collab-research-20260926/live-smoke/repo/.git/codex-pi/tasks/LIVE-CLI-FLASH",
+        "toolsDir": "/private/tmp/pi-collab-research-20260926/live-smoke/repo/.git/codex-pi/tasks/LIVE-CLI-FLASH/tools",
+        "supervisorLog": "/private/tmp/pi-collab-research-20260926/live-smoke/repo/.git/codex-pi/tasks/LIVE-CLI-FLASH/supervisor.log",
+        "roundDir": "/private/tmp/pi-collab-research-20260926/live-smoke/repo/.git/codex-pi/tasks/LIVE-CLI-FLASH/rounds/1",
+        "brief": "/private/tmp/pi-collab-research-20260926/live-smoke/repo/.git/codex-pi/tasks/LIVE-CLI-FLASH/rounds/1/brief.md",
+        "jsonl": "/private/tmp/pi-collab-research-20260926/live-smoke/repo/.git/codex-pi/tasks/LIVE-CLI-FLASH/rounds/1/round.jsonl",
+        "stderr": "/private/tmp/pi-collab-research-20260926/live-smoke/repo/.git/codex-pi/tasks/LIVE-CLI-FLASH/rounds/1/round.err",
+        "meta": "/private/tmp/pi-collab-research-20260926/live-smoke/repo/.git/codex-pi/tasks/LIVE-CLI-FLASH/rounds/1/round.meta",
+        "state": "/private/tmp/pi-collab-research-20260926/live-smoke/repo/.git/codex-pi/tasks/LIVE-CLI-FLASH/rounds/1/round.state.json",
+        "summaryJson": "/private/tmp/pi-collab-research-20260926/live-smoke/repo/.git/codex-pi/tasks/LIVE-CLI-FLASH/rounds/1/round.summary.json",
+        "summaryText": "/private/tmp/pi-collab-research-20260926/live-smoke/repo/.git/codex-pi/tasks/LIVE-CLI-FLASH/rounds/1/round.summary.txt",
+        "checksDir": "/private/tmp/pi-collab-research-20260926/live-smoke/repo/.git/codex-pi/tasks/LIVE-CLI-FLASH/rounds/1/round.checks"
+      }
+    }
+  ],
+  "summary": {
+    "schema_version": 1,
+    "source": "/private/tmp/pi-collab-research-20260926/live-smoke/repo/.git/codex-pi/tasks/LIVE-CLI-FLASH/rounds/1/round.jsonl",
+    "source_bytes": 39108,
+    "checks_dir": "/private/tmp/pi-collab-research-20260926/live-smoke/repo/.git/codex-pi/tasks/LIVE-CLI-FLASH/rounds/1/round.checks",
+    "turns": 1,
+    "assistant_messages": 1,
+    "models": {
+      "deepseek/deepseek-flash": 1
+    },
+    "expected_model": "deepseek/deepseek-flash",
+    "model_check": "matched",
+    "usage": {
+      "input": 1843,
+      "cacheRead": 256,
+      "cacheWrite": 0,
+      "output": 52,
+      "totalTokens": 2151
+    },
+    "usage_complete": true,
+    "reported_cost_usd": 0.000616836,
+    "cost_samples": 1,
+    "stop_reasons": {
+      "stop": 1
+    },
+    "tool_counts": {},
+    "guardrail_flags": [],
+    "guardrail_flag_count": 0,
+    "errors": [],
+    "error_count": 0,
+    "malformed_lines": 0,
+    "final_excerpt": "ACK",
+    "process_exit": "0",
+    "checks": {
+      "total": 0,
+      "counts": {
+        "failed": 0,
+        "timed_out": 0,
+        "unverified_log": 0,
+        "unknown_exit": 0,
+        "skipped": 0,
+        "zero_run": 0,
+        "unknown_counts": 0
+      },
+      "receipts": [],
+      "listed": 0,
+      "absence": "missing evidence: no check receipts were recorded",
+      "note": "all attempts are aggregated; retries do not erase failures"
+    },
+    "acceptance": "not_verified"
+  },
+  "summaryText": "Pi evidence: turns=1 messages=1 process_exit=0\nmodel_check=matched models={'deepseek/deepseek-flash': 1}\nusage={'input': 1843, 'cacheRead': 256, 'cacheWrite': 0, 'output': 52, 'totalTokens': 2151} complete=True reported_cost_usd=0.000616836\ntools={} malformed_lines=0\nacceptance=not_verified (requires PLAN checks and independent review)\nerrors: count=0\nguardrail_flags: count=0\ncommands: total=0 unknown_exit=0 tool_errors=0\nreceipt_attempts: total=0 failed=0 timed_out=0 unverified_log=0 unknown_exit=0 skipped=0 zero_run=0 unknown_counts=0\nAll attempts counted; retries do not erase failures. Absence is missing evidence.\nfinal excerpt (untrusted report):\nACK\nfull evidence: /private/tmp/pi-collab-research-20260926/live-smoke/repo/.git/codex-pi/tasks/LIVE-CLI-FLASH/rounds/1/round.jsonl; use --json or --commands only for a specific investigation",
+  "usageComplete": true,
+  "evidence": {
+    "taskDir": "/private/tmp/pi-collab-research-20260926/live-smoke/repo/.git/codex-pi/tasks/LIVE-CLI-FLASH",
+    "toolsDir": "/private/tmp/pi-collab-research-20260926/live-smoke/repo/.git/codex-pi/tasks/LIVE-CLI-FLASH/tools",
+    "supervisorLog": "/private/tmp/pi-collab-research-20260926/live-smoke/repo/.git/codex-pi/tasks/LIVE-CLI-FLASH/supervisor.log",
+    "roundDir": "/private/tmp/pi-collab-research-20260926/live-smoke/repo/.git/codex-pi/tasks/LIVE-CLI-FLASH/rounds/1",
+    "brief": "/private/tmp/pi-collab-research-20260926/live-smoke/repo/.git/codex-pi/tasks/LIVE-CLI-FLASH/rounds/1/brief.md",
+    "jsonl": "/private/tmp/pi-collab-research-20260926/live-smoke/repo/.git/codex-pi/tasks/LIVE-CLI-FLASH/rounds/1/round.jsonl",
+    "stderr": "/private/tmp/pi-collab-research-20260926/live-smoke/repo/.git/codex-pi/tasks/LIVE-CLI-FLASH/rounds/1/round.err",
+    "meta": "/private/tmp/pi-collab-research-20260926/live-smoke/repo/.git/codex-pi/tasks/LIVE-CLI-FLASH/rounds/1/round.meta",
+    "state": "/private/tmp/pi-collab-research-20260926/live-smoke/repo/.git/codex-pi/tasks/LIVE-CLI-FLASH/rounds/1/round.state.json",
+    "summaryJson": "/private/tmp/pi-collab-research-20260926/live-smoke/repo/.git/codex-pi/tasks/LIVE-CLI-FLASH/rounds/1/round.summary.json",
+    "summaryText": "/private/tmp/pi-collab-research-20260926/live-smoke/repo/.git/codex-pi/tasks/LIVE-CLI-FLASH/rounds/1/round.summary.txt",
+    "checksDir": "/private/tmp/pi-collab-research-20260926/live-smoke/repo/.git/codex-pi/tasks/LIVE-CLI-FLASH/rounds/1/round.checks"
+  },
+  "notes": [
+    "exit 0 means the Pi process completed execution; it is never acceptance PASS",
+    "acceptance requires the project's own checks and independent main review"
+  ],
+  "runtimeVersion": "0.1.0",
+  "wait": {
+    "timeoutMs": 60000,
+    "timedOut": false,
+    "note": "waiting never cancels the worker, and there is no automatic wake after your turn ends; do not spin repeated waits"
+  }
+}

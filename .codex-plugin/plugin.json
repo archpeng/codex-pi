@@ -1,0 +1,23 @@
+{
+  "name": "codex-pi",
+  "version": "0.1.0",
+  "description": "跨项目的 Codex 主会话与 Pi 协作：直接 CLI、持久执行与精简证据，Pi 仅允许 DeepSeek Flash，不调用 Codex CLI。",
+  "author": {
+    "name": "Local personal tools"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex + Pi",
+    "shortDescription": "主会话决策验收，Pi 连续实施，脚本等待并保存证据。",
+    "longDescription": "一套公共 Python 脚本与每个项目少量约束。只使用当前 Codex 主会话和 deepseek/deepseek-flash Pi 子 agent；不需要 MCP，不调用 Codex CLI，不把执行结束当作验收通过。",
+    "developerName": "Local personal tools",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "使用 $collaborate，将当前项目已授权的完整任务交给 Pi 实施，由当前主会话设计并验收。"
+    ]
+  }
+}
