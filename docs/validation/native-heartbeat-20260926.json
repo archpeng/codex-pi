@@ -1,0 +1,164 @@
+{
+  "schemaVersion": 1,
+  "observedAtUtc": "2026-09-26T04:24:38.914684+00:00",
+  "targetThread": "01a0d58b-8d1f-7e51-a8ec-8a7559b8661d",
+  "automationId": "pi-harness",
+  "cadenceSeconds": 120,
+  "source": {
+    "path": "/Users/jlpeng/.codex/sessions/2026/09/25/rollout-2026-09-25T06-31-27-01a0d58b-8d1f-7e51-a8ec-8a7559b8661d.jsonl",
+    "startByte": 44253728,
+    "endByte": 48253728,
+    "sliceSha256": "89037b290acb053f09edc7738fa512f93a61296f1f784931737df7dc43e95062"
+  },
+  "firstSchedulerReceipt": {
+    "observedAtUtc": "2026-09-26T04:10:36.626589+00:00",
+    "scheduledAtUtc": "2026-09-26T04:10:22.421Z",
+    "codexTaskId": "01a0d58b-8d1f-7e51-a8ec-8a7559b8661d",
+    "automationId": "pi-harness",
+    "piTask": "DSH-017-upgrade",
+    "round": 3,
+    "state": "running",
+    "observation": "首次实际原生heartbeat调度到本会话；不是手工探针或模拟回执。"
+  },
+  "beats": [
+    {
+      "startedAt": "2026-09-26T04:10:22.477Z",
+      "heartbeatAt": "2026-09-26T04:10:22.728Z",
+      "endedAt": "2026-09-26T04:10:40.528Z",
+      "calls": [
+        {
+          "at": "2026-09-26T04:10:36.450Z",
+          "tool": "exec",
+          "operation": "pi_task.py status",
+          "returnedAt": "2026-09-26T04:10:36.634Z"
+        }
+      ],
+      "modelCalls": 2,
+      "tokens": {
+        "input_tokens": 502680,
+        "cached_input_tokens": 484224,
+        "output_tokens": 366,
+        "reasoning_output_tokens": 0
+      },
+      "deltaMatchesLast": true,
+      "durationSeconds": 18.051
+    },
+    {
+      "startedAt": "2026-09-26T04:12:22.451Z",
+      "heartbeatAt": "2026-09-26T04:12:22.661Z",
+      "endedAt": "2026-09-26T04:12:34.316Z",
+      "calls": [
+        {
+          "at": "2026-09-26T04:12:29.486Z",
+          "tool": "exec",
+          "operation": "pi_task.py status",
+          "returnedAt": "2026-09-26T04:12:29.731Z"
+        }
+      ],
+      "modelCalls": 2,
+      "tokens": {
+        "input_tokens": 505429,
+        "cached_input_tokens": 503808,
+        "output_tokens": 151,
+        "reasoning_output_tokens": 0
+      },
+      "deltaMatchesLast": true,
+      "durationSeconds": 11.865
+    },
+    {
+      "startedAt": "2026-09-26T04:14:22.428Z",
+      "heartbeatAt": "2026-09-26T04:14:22.635Z",
+      "endedAt": "2026-09-26T04:14:33.825Z",
+      "calls": [
+        {
+          "at": "2026-09-26T04:14:30.591Z",
+          "tool": "exec",
+          "operation": "pi_task.py status",
+          "returnedAt": "2026-09-26T04:14:30.763Z"
+        }
+      ],
+      "modelCalls": 2,
+      "tokens": {
+        "input_tokens": 507890,
+        "cached_input_tokens": 506240,
+        "output_tokens": 151,
+        "reasoning_output_tokens": 0
+      },
+      "deltaMatchesLast": true,
+      "durationSeconds": 11.397
+    },
+    {
+      "startedAt": "2026-09-26T04:16:22.430Z",
+      "heartbeatAt": "2026-09-26T04:16:22.708Z",
+      "endedAt": "2026-09-26T04:16:34.145Z",
+      "calls": [
+        {
+          "at": "2026-09-26T04:16:29.449Z",
+          "tool": "exec",
+          "operation": "pi_task.py status",
+          "returnedAt": "2026-09-26T04:16:29.663Z"
+        }
+      ],
+      "modelCalls": 2,
+      "tokens": {
+        "input_tokens": 510351,
+        "cached_input_tokens": 508800,
+        "output_tokens": 151,
+        "reasoning_output_tokens": 0
+      },
+      "deltaMatchesLast": true,
+      "durationSeconds": 11.715
+    },
+    {
+      "startedAt": "2026-09-26T04:18:22.459Z",
+      "heartbeatAt": "2026-09-26T04:18:22.812Z",
+      "endedAt": "2026-09-26T04:18:33.445Z",
+      "calls": [
+        {
+          "at": "2026-09-26T04:18:30.369Z",
+          "tool": "exec",
+          "operation": "pi_task.py status",
+          "returnedAt": "2026-09-26T04:18:30.733Z"
+        }
+      ],
+      "modelCalls": 2,
+      "tokens": {
+        "input_tokens": 512812,
+        "cached_input_tokens": 511232,
+        "output_tokens": 151,
+        "reasoning_output_tokens": 0
+      },
+      "deltaMatchesLast": true,
+      "durationSeconds": 10.986
+    },
+    {
+      "startedAt": "2026-09-26T04:20:22.449Z",
+      "heartbeatAt": "2026-09-26T04:20:22.664Z",
+      "endedAt": "2026-09-26T04:20:33.215Z",
+      "calls": [
+        {
+          "at": "2026-09-26T04:20:29.534Z",
+          "tool": "exec",
+          "operation": "pi_task.py status",
+          "returnedAt": "2026-09-26T04:20:29.772Z"
+        }
+      ],
+      "modelCalls": 2,
+      "tokens": {
+        "input_tokens": 515273,
+        "cached_input_tokens": 513664,
+        "output_tokens": 151,
+        "reasoning_output_tokens": 0
+      },
+      "deltaMatchesLast": true,
+      "durationSeconds": 10.766
+    }
+  ],
+  "limits": [
+    "Observed same-task scheduling while the app/host were available, not a hard latency SLA.",
+    "First beat includes a validation receipt; later beats only check status.",
+    "Token counters are raw observed usage, not subscription quota or equivalent-dollar cost.",
+    "Reasoning output is included in output; do not add it again.",
+    "These running-round checks do not prove delivery review or business acceptance."
+  ]
+}

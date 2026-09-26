@@ -1,58 +1,44 @@
-# Local runtime
+# Local runtime commands
 
-The plugin provides a skill and deterministic Python scripts; no MCP server or additional Node packages are required. The worker runner only calls Pi; it starts no Codex executable, API client or reviewer. An opted-in, trusted synchronous host hook can return a continuation reason to the existing Codex task. It reuses the user's installed Pi and provider authentication without copying credentials into the plugin.
+Python scripts call the existing Pi CLI. Pi is pinned to `deepseek/deepseek-flash`, thinking `max`; any other model is rejected. The optional Codex `queue` transport delivers to the existing desktop task without invoking a second model. Authentication stays in the user's existing local configuration. No extra MCP, heartbeat or service is installed.
 
-The main conversation supplies a Git repository, a task identifier and an isolated worktree. Create worktrees with ordinary Git. `start` is a new task; `continue` is another immutable round using that task's saved session. A pending or unknown task must be inspected, not replayed with a new identity to bypass its lock.
-
-Each project has `.agents/codex-pi.json`:
-
-```json
-{
-  "schemaVersion": 1,
-  "model": "deepseek/deepseek-flash",
-  "thinking": "max",
-  "constraints": ["AGENTS.md"],
-  "checks": ["The affected behavior tests and this project's required checks"],
-  "maxWorkers": 1,
-  "timeoutSeconds": 14400
-}
-```
-
-Constraints are existing project documents. Checks are guidance for choosing and performing the actual acceptance, not trusted success declarations or shell hooks. Shared database identity, phase dependencies and permission boundaries remain project decisions. The only allowed model is `deepseek/deepseek-flash`. Any other project model or frozen task model is rejected before launching Pi; there is no automatic fallback.
-
-Execution facts are stored below the repository's Git common directory, under `codex-pi/tasks/`. They do not replace PLAN, contracts or owner facts. Raw stdout/JSONL, stderr, the brief and receipts remain local. The result is bounded; follow its pointers for actual evidence. Keep these artifacts private just like source and build logs; the plugin makes no external publication.
-
-`status` reads a bounded progress snapshot without generating a transcript summary. `wait` waits in software for at most 60 seconds and returns current state; timeout leaves Pi running. Use separate ordinary tool calls while actively waiting, processing user input between them. Do not bury repeated waits in one long tool call, end the main turn expecting an idle wake, or read full logs on every interval. Execution timeout is independent. A missing supervisor is not proof of completion; uncertain state stays unknown.
-
-Cancellation applies to this runtime's owned worker, not legacy project Pi processes. No automatic state import, lock stealing, session guessing, cleanup, new phase launch, review or commit acceptance occurs.
-
-The local source is `/Users/jlpeng/plugins/codex-pi`. Changes are made there, not in Codex's managed plugin cache. Each active run keeps its runtime identity/snapshot. Validate updated sources and let existing runs finish before switching future runs. Do not use Codex CLI commands to install or refresh this plugin.
-
-## Commands
-
-Use the installed plugin runtime path (on this computer the canonical source is shown below).
-Write the complete brief to a file, then pass its path; do not interpolate untrusted text into shell code.
+Use an accepted plugin runtime for new operations. Replace the example paths and exact owner UUID before executing; do not interpolate user text into shell commands.
 
 ```sh
-python3 /Users/jlpeng/plugins/codex-pi/runtime/pi_task.py project --repo /absolute/repo
-python3 /Users/jlpeng/plugins/codex-pi/runtime/pi_task.py start --repo /absolute/repo --task TASK-1 --worktree /absolute/worktree --prompt-file /absolute/brief.md
-python3 /Users/jlpeng/plugins/codex-pi/runtime/pi_task.py wait --repo /absolute/repo --task TASK-1 --timeout-ms 60000
-python3 /Users/jlpeng/plugins/codex-pi/runtime/pi_task.py status --repo /absolute/repo --task TASK-1
-python3 /Users/jlpeng/plugins/codex-pi/runtime/pi_task.py result --repo /absolute/repo --task TASK-1
-python3 /Users/jlpeng/plugins/codex-pi/runtime/pi_task.py continue --repo /absolute/repo --task TASK-1 --prompt-file /absolute/repair.md
-python3 /Users/jlpeng/plugins/codex-pi/runtime/pi_task.py cancel --repo /absolute/repo --task TASK-1
+python3 /absolute/plugin/runtime/pi_task.py project --repo /absolute/repo
+python3 /absolute/plugin/runtime/pi_task.py start --repo /absolute/repo --task TASK-1 --worktree /absolute/worktree --prompt-file /absolute/brief.md
+python3 /absolute/plugin/runtime/pi_board.py register --repo /absolute/repo --task TASK-1 --thread OWNER_UUID --transport cli-queue --title 'Task title' --goal 'Reviewable result'
 ```
 
-`start --read-only` limits Pi to read/grep/find/ls. A worktree is reserved for the task lifetime; use a fresh worktree for a new task. `PI_BIN` can select the installed Pi executable when it is absent from PATH. On this machine it is `/Users/jlpeng/.nvm/versions/node/v24.8.0/bin/pi`. Python uses only its standard library.
+Start and immediately register; registration also catches a task that already finished. Registration defaults to `offline` unless `cli-queue` is explicit. The transport requires a local Codex CLI supporting `queue`, the desktop application, and its exact existing task UUID. `--codex-bin /absolute/codex` chooses a specific executable. Never guess an owner, invoke `exec/resume/fork` or launch an app-server to deliver a message. A task started by old helpers must adopt the accepted runtime at a terminal boundary before its supervisor can provide new notifications.
 
-For real acceptance commands, use the task's frozen check helper and the selected round's receipt directory from `result.evidence` (`toolsDir` and `checksDir`). Run from the task worktree:
+Project configuration lives in `.agents/codex-pi.json`: schemaVersion 1, pinned model/thinking, existing constraint paths, acceptance command guidance, maxWorkers and timeoutSeconds. It is not another PLAN or proof of acceptance. Use an isolated worktree; a task reserves its worktree for its lifetime. `start --read-only` limits Pi tools. `PI_BIN` may select the installed Pi executable.
+
+## One read when needed
+
+```sh
+python3 /absolute/plugin/runtime/pi_board.py show --repo /absolute/repo --task TASK-1
+python3 /absolute/plugin/runtime/pi_task.py status --repo /absolute/repo --task TASK-1 --round 1
+python3 /absolute/plugin/runtime/pi_task.py result --repo /absolute/repo --task TASK-1 --round 1
+python3 /absolute/plugin/runtime/pi_task.py continue --repo /absolute/repo --task TASK-1 --prompt-file /absolute/repair.md
+```
+
+Normal supervision stays inside the detached Pi supervisor. Do independent work, then end the main turn when blocked on Pi. Do not build main-model polling loops around `wait`; the low-level bounded wait command is only a diagnostic. Answer a user's progress question from one compact snapshot. Observe actual command/deadline/receipt evidence, not PID or output growth alone.
+
+`result` is collected once per terminal round. It retains raw pointers and bounded summaries, all attempts, model usage and native Pi session evidence below the Git common directory `codex-pi/tasks/`. Open only the relevant receipt/log/diff. Continue the exact saved task for repairs; do not replace a live or unknown worker with a new identity. A reused session does not keep idle Pi processes alive after the round ends.
+
+## Checks and resource protection
+
+The generated brief contains task-specific frozen `toolsDir` and round-specific `checksDir`. Run from the Pi worktree:
 
 ```sh
 python3 /absolute/task/tools/pi_check.py --output-dir /absolute/round/round.checks --id affected-tests --timeout-seconds 600 -- make test
+python3 /absolute/task/tools/pi_check.py --output-dir /absolute/round/round.checks --id evidence-test --timeout-seconds 180 --watch-path /absolute/evidence --max-bytes 104857600 --health-interval-seconds 15 -- python3 real_check.py
+python3 /absolute/task/tools/pi_copy.py /absolute/source /absolute/new-destination --max-bytes 104857600
 ```
 
-Replace `make test` with the project's actual command. Each attempt writes its own receipt and log; rerunning does not erase a failure. The generated Pi brief already includes these exact task-specific helper paths.
+Replace example commands and limits with meaningful project budgets. A running marker reports wrapper start, actual deadline, child identity and optional directory guard. Final immutable receipts bind command, revision, exit and log hash. Failed, skipped, interrupted, unknown or zero-test attempts never become a pass. The command timeout and whole Pi round timeout are separate.
 
-New check attempts expose a running marker before finishing and preserve the final immutable receipt and raw log. A legacy unreceipted log is only a possible current check, not verified activity. Quiet output alone is not a failure. Diagnose the first relevant error and actual check deadline; never keep rerunning an unchanged failure or change acceptance to make it pass. Project prechecks and nested command timeouts remain project-owned.
+Directory guards measure declared regular-file bytes without following symlinks. An observed known breach stops only the owned command group and records the failure; an incomplete measurement stays unknown. The copy helper preserves literal symlinks and refuses existing destinations, recursion, known overages or unknown verification. These rules prevent the 14 MB → 6.5 GB expansion incident without asking the main model to poll.
 
-For quick completion handoff, migration and trust requirements, read [handoff guidance](handoff.md). Canonical `status` and `wait` can inspect old task evidence without replacing a running worker's frozen helpers. The richer check marker starts with new helper snapshots. Existing task evidence and Pi session remain reusable.
+See [handoff and recovery](handoff.md) for event decisions, uncertain delivery, interruption and safe migration.

@@ -6,7 +6,7 @@ There is no MCP server, no Node dependency and no package manifest in this
 plugin. Python owns admission, persistence, evidence, model policy and process
 control; the main session calls the CLI through its shell.
 
-The runtime **never invokes the Codex CLI** and never starts a Codex agent.
+The Pi execution path starts only Pi. The opted-in board transport invokes only `codex --disable daemon_auto_start queue` to notify the existing desktop task; it never starts another Codex model. CLI plugin management is also permitted for installation. Current commands and limits are in [runtime guidance](../skills/collaborate/references/runtime.md) and [handoff guidance](../skills/collaborate/references/handoff.md).
 
 ## Entrypoints
 
@@ -30,7 +30,9 @@ double or explicit path only). Helpers used by the Pi worker are
 | `runtime/pi_task.py` | Admission, config, model policy, brief, detached worker, timeout, cancel, result/wait, CLI |
 | `runtime/pi_summary.py` | Bounded round summary, check-receipt aggregation, usage, reported-model check |
 | `runtime/pi_check.py` | One-check receipt: true exit/signal/timeout, log sha256, HEAD/dirty, counts |
-| `runtime/pi_handoff.py` | Explicit session/round binding, synchronous Stop waiting, receipt acknowledgement, interruption and recovery |
+| `runtime/pi_handoff.py` | Short legacy handoff, board-route recovery and interruption |
+| `runtime/pi_board.py` | Shared evidence board, event decisions, queue claims and deterministic CLI transport |
+| `runtime/pi_copy.py` / `pi_size.py` | Bounded evidence copying and byte scans without following symlinks |
 | `hooks/hooks.json` | Plugin-discovered synchronous Stop, Interrupt and recovery commands; requires host trust |
 | `runtime/VERSION` | Runtime version copied into every task state |
 
@@ -39,14 +41,11 @@ double or explicit path only). Helpers used by the Pi worker are
 
 ## Host continuation
 
-The handoff registers references to an existing task round; it does not alter
-worker snapshots or launch another worker. Durable registration and delivery
-state live outside the immutable task evidence, under the user's Codex home.
-The script waits without calling a model. Only the host interprets the returned
-Stop decision and creates a continuation in the same Codex task. Trust/loading,
-host uptime and the bounded hook lifetime remain prerequisites; these scripts
-do not supply an offline wake service. See the [handoff contract](../skills/collaborate/references/handoff.md)
-and the [validation record](../docs/validation.md) for the tested boundary.
+`pi_board.py` projects bounded execution/check evidence into a shared local board. The existing Pi supervisor refreshes it roughly every 15 seconds and on terminal exit. It enqueues only actionable events to the exact registered desktop task UUID. Idle delivery starts a turn; busy delivery waits for the current turn to end. A local observation does not call a model. A real owner turn still loads its normal context.
+
+Event content and main decisions are distinct from queue claims. Claims use a short file lock, released before the bounded CLI invocation. A confirmed send is not repeatedly sent while review is pending. An ambiguous post-spawn failure is uncertain, requiring explicit recovery; the queue has no caller idempotency key. Pause and uncertain delivery are visible through compact recovery evidence. Short hooks provide interruption/recovery and suppress overlapping legacy Stop notifications for a board route; no synchronous hook waiting or heartbeat is required.
+
+The application must be running/available for a visible desktop continuation. The supervisor cannot detect its own death. Command deadlines and optional no-follow directory guards detect only their declared limits. Tested desktop evidence is in [CLI queue validation](../docs/validation/cli-queue-20260926.md) and the [tiny real Pi fixture](../docs/validation/quick-pi-acceptance-20260926.md). Retained historical lifecycle tests below are not the final event-transport release result.
 
 ## Model policy (hard restriction)
 
@@ -72,7 +71,7 @@ This mechanism may run Pi with **only `deepseek/deepseek-flash`**:
   with the required model. A mismatch stays visible as `model_check:
   "mismatch"` and the result stays `acceptance: "not_verified"`; argv alone is
   not treated as proof that the provider ran the requested model.
-- No Codex CLI and no GPT probes are used anywhere in the runtime or tests;
+- Pi execution never invokes Codex or another model. Offline tests use process doubles; real CLI queue validation is separate;
   disallowed IDs appear only as offline fixture metadata.
 
 ## Repository resolution
@@ -154,8 +153,8 @@ error.
   bounded summary and evidence pointers; no raw logs or command traces by
   default. `supervisorAlive` and `activeWorker` expose lock truth.
 - `wait` — internal bounded wait (default/max 60000 ms); timeout never cancels
-  Pi. There is no automatic wake after the caller's turn ends and repeat waits
-  should not be spun.
+  Pi. This command itself cannot wake a finished main turn; registered board
+  delivery is the separate automatic continuation path. Do not spin repeat waits.
 - `cancel` — writes an explicit request for the live supervisor, which stops its
   Pi process group including descendants that ignore SIGTERM. If the supervisor
   is gone but an orphaned Pi still holds the task lock, it returns
@@ -209,7 +208,7 @@ Exit code 0 always means **completed execution only**. Every result carries
 python3 -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
-Final candidate result on 2026-09-26: **52 tests, OK, exit 0** (37.321 s),
+Historical lifecycle baseline on 2026-09-26: **52 tests, OK, exit 0** (37.321 s),
 full output preserved at
 `/tmp/pi-collab-research-20260926/final-runtime-tests.log`. No live model call,
 no network, no Codex binary or GPT probe; the Pi process is always the offline

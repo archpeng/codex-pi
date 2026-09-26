@@ -1,54 +1,47 @@
-# Responsive waiting and quick handoff (0.3)
+# Event handoff and recovery
 
-The active Codex main task waits through ordinary bounded tool calls. The Stop hook checks once for an already-terminal armed round; it never holds the conversation waiting for Pi. This replaces 0.2's multi-hour synchronous Stop design, which prevented a received user follow-up from being processed in the desktop incident on 2026-09-26.
+The existing Pi supervisor refreshes the shared board about every 15 seconds and dispatches only actionable events. The board describes the goal, phase, round, candidate commit, command/check evidence and pending question. Queue delivery, event handling and code acceptance are separate facts. Ordinary progress does not wake the main model. An idle desktop task resumes automatically; a busy task handles the queued message after its current turn. Already queued messages cannot be treated as permission to override a later pause.
 
-## Wait in the active conversation
+## Handle one event
 
-Use the exact saved repository/task/round. Do independent work first; if blocked on Pi, call:
-
-```sh
-python3 /Users/jlpeng/plugins/codex-pi/runtime/pi_task.py wait --repo /absolute/repo --task TASK-1 --timeout-ms 60000
-```
-
-Each call returns within its bounded window. Process user steering between calls, answer progress questions with `status`, and continue waiting only while authorized. Do not chain an infinite wait loop inside one tool invocation. When Pi finishes, collect `result`, inspect relevant evidence and review. A tool result does not need a fabricated hook acknowledgement.
-
-Normal local status reads do not call a model, but each resumed Codex tool cycle does use model context. This design trades some bounded coordination cost for responsiveness. It does not promise zero-token supervision, idle wake-up or offline continuation.
-
-## Optional quick Stop safety check
-
-An authorized exact round may be armed for the current Codex task (`CODEX_THREAD_ID`):
+Read its exact task, round, event ID and question. Reuse a result already collected for that round. Verify the relevant diff, exact candidate and original check receipts, then decide:
 
 ```sh
-python3 /Users/jlpeng/plugins/codex-pi/runtime/pi_handoff.py arm --repo /absolute/repo --task TASK-1 --round 1
+python3 /absolute/plugin/runtime/pi_board.py decide --repo /absolute/repo --task TASK-1 --event-id EVENT_ID --decision accept --reviewed-head FULL_COMMIT_SHA --note 'Verified checks and review evidence'
 ```
 
-Keep the returned event key. If Stop sees a terminal result with released worker ownership, it returns a fixed continuation prompt once. If Pi is still running, it returns promptly without marking the round completed or fabricating an expiry. The armed record alone cannot wake an idle task later. Do not finish the main turn relying on that record to supervise ongoing work.
+Use `changes_requested` with concrete findings when repairs are needed; `reject` rejects the candidate and `resolve` handles a non-review incident. Acceptance requires the full real immutable candidate commit and project evidence. Decisions on old rounds never accept the current round. If a packet reports overflow, read remaining pending board events and handle them in this same main turn; a terminal supervisor will not supply another periodic tick. A repeated delivered event is a receipt to deduplicate, not a reason to rerun Pi or checks.
 
-Collect and acknowledge only an actually delivered handoff:
+Group material findings and continue the same Pi session. Productive red tests and routine repairs remain with Pi. Investigate the first relevant error before repeating an unchanged failure. A resource breach or deadline should produce a bounded question and evidence, not an infinite retry or automatic acceptance.
+
+## Pause and uncertain delivery
 
 ```sh
-python3 /Users/jlpeng/plugins/codex-pi/runtime/pi_task.py result --repo /absolute/repo --task TASK-1 --round 1
-python3 /Users/jlpeng/plugins/codex-pi/runtime/pi_handoff.py ack --event-key EVENT_KEY
+python3 /absolute/plugin/runtime/pi_board.py pause --repo /absolute/repo --task TASK-1 --note 'User paused handoff'
+python3 /absolute/plugin/runtime/pi_board.py resume --repo /absolute/repo --task TASK-1 --thread OWNER_UUID
+python3 /absolute/plugin/runtime/pi_board.py recover --thread OWNER_UUID
+python3 /absolute/plugin/runtime/pi_board.py rearm --repo /absolute/repo --task TASK-1 --event-id EVENT_ID
 ```
 
-Receipt is not acceptance. Repeated notifications are suppressed; a recorded offer is not proof the host received it. Unknown ownership or a lost supervisor requires diagnosis, not a replacement writer.
+User Interrupt pauses the owner's handoff route; it does not cancel Pi. A progress question does not resume a pause. Resume only when the user authorizes continuation. `pi_task.py cancel` separately cancels the owned worker; verify it has ended before starting repair.
 
-## Upgrade a task waiting inside a 0.2 Stop hook
+Confirmed queue delivery is not retried merely because review is unfinished. A timeout or ambiguous crash may have delivered already: retain the uncertain claim, inspect evidence and use explicit recovery only when needed. `rearm` may duplicate a previously uncertain delivery because CLI queue has no caller idempotency key. Never rearm a live inflight send, steal locks, clear decisions or claim exactly-once delivery. Failures are visible through board/recovery evidence; no second model repairs transport.
 
-Updating plugin files does not change a process already executing the old hook. From the updated canonical runtime, release the exact binding under its owning Codex task identity:
+Hooks stay short and serve pause/recovery. CLI queue tasks suppress overlapping legacy Stop delivery. A supervisor cannot report its own death without another observer: after a process/host failure, recovery occurs on the next normal interaction. There is no universal two-minute discovery guarantee. Declared command deadlines and resource budgets provide bounded detection while their supervisor is alive; desktop response can additionally wait for its active turn to finish.
+
+## Adopt an update safely
+
+Update the canonical plugin and install through the formal plugin mechanism. Never modify managed caches, hook trust or private app IPC/queue databases. If the app requests Hook review/trust, the user does that in the app. A plugin update does not rewrite a running worker's helpers.
+
+At a verified terminal boundary, with no worker/supervisor ownership, run the accepted runtime:
 
 ```sh
-python3 /Users/jlpeng/plugins/codex-pi/runtime/pi_handoff.py release --event-key EVENT_KEY --session-id OWNER_CODEX_TASK_ID
+python3 /absolute/new-plugin/runtime/pi_task.py upgrade --repo /absolute/repo --task TASK-1
+python3 /absolute/new-plugin/runtime/pi_board.py register --repo /absolute/repo --task TASK-1 --thread OWNER_UUID --transport cli-queue --title 'Task title' --goal 'Authorized result'
 ```
 
-The operation changes the binding generation/state so the old hook exits its existing local loop. It does not cancel Pi, delete evidence, steal ownership, acknowledge unseen results or change the model. Use an explicit other task id only when the user authorized migrating that task. Verify the old wait exited and a new main-task response appears; sending a message alone is not verification.
+Verify frozen helper hashes/version and unchanged Pi session/worktree before `continue`. Registering a terminal task can enqueue a review event immediately; respect already-completed review evidence rather than duplicating work. Keep legacy business workers intact until their own safe boundary. For an old 0.2 long Stop hook, the explicit `pi_handoff.py release --event-key EVENT_KEY --session-id OWNER_UUID` invalidates that exact binding without cancelling Pi; verify the old hook exited.
 
-Read the current skill from canonical source in an already-open task, then use canonical `status`/bounded `wait`. Do not replace active frozen helper files or restart an implementation merely for this update. Newly started tasks get the new check markers; old tasks retain partial legacy progress visibility until a later task/helper snapshot.
+## Fast acceptance
 
-## Interruption, installation and validation
-
-A real user Interrupt suspends automatic handoff without cancelling Pi. Resume only when the user requests continued work. A status question never means cancel implementation. Keep fault cleanup scoped to owned processes and confirm exit before dispatching a repair in the same Pi session.
-
-Refresh the plugin in the application and review/trust the changed hook definitions. Do not edit managed caches or trust records, call Codex CLI, or introduce a heartbeat/MCP/extra model as a workaround. Async hooks do not start a turn in an idle task.
-
-Unit tests can prove quick hook return, ownership, waiting limits and duplicate suppression. Desktop acceptance additionally requires a user follow-up during a genuinely running Pi task to reach the main model, a progress response before Pi completion, and eventual single completion handling. Do not label simulated hook invocations as that host test.
+Use one real tiny Pi task: write fixed bytes to one file, run a deterministic check with a ten-second timeout, commit only that file, and exit. Bound the whole round to three minutes. Test completion → own supervisor → same desktop task → visible main reply. A 15-second fixture passed this path on 2026-09-26. Use isolated short child processes for failure, cancellation, timeout and duplicate/race tests; they need no additional model calls. Transport tests and green unit tests do not waive independent code review.
