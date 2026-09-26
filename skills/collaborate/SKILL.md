@@ -5,13 +5,19 @@ description: Delegate an authorized coding task to Pi while the current Codex co
 
 # Codex designs and reviews; Pi implements
 
-Use the existing Codex main task and Pi only. Pi MUST use `deepseek/deepseek-flash`, thinking `max`; no fallback, nested models, extra Codex agent or automatic model review. Codex CLI is permitted as the deterministic `queue` transport and for plugin management; never invoke `exec`, `resume` or `fork` to create another model worker.
+Use the existing Codex main task and Pi only. Pi MUST use `deepseek/deepseek-flash`, thinking `max`; no fallback, nested models, extra Codex agent or automatic model review. Codex CLI is permitted as the deterministic `queue` transport and for plugin management; never invoke `exec`, `resume` or `fork` to create another model worker. The worker runs with Pi extensions, skills and prompt templates disabled; a separate Pi-native handoff extension does not govern this route.
 
 The user's goal and project contracts govern scope and acceptance. Read the project's `.agents/codex-pi.json` through `pi_task.py project`. Its constraints/checks are references, not executable success claims or another plan. Keep required real integration and independent review evidence. Resolve routine implementation choices without extra approval gates.
 
 ## Dispatch and continue
 
-Give Pi a complete reviewable result: goal, material design decisions, allowed scope, baseline, acceptance commands, evidence/resource budgets and genuine escalation conditions. Use a separate Git worktree; capacity is not authorization for parallel business phases. Pi owns implementation, tests, productive repairs and scoped commits. Expected red tests and routine failures stay with Pi; design contradictions or repeated ineffective repairs require a concrete reproduction.
+Before writing the brief, verify the facts Pi would otherwise have to guess: affected interfaces, actual schemas and field meanings, data formats and time boundaries, and relevant existing behavior. Use authorized read-only queries or code evidence where available; distinguish verified facts from assumptions and leave unavailable facts explicitly unknown. Do not pass invented APIs or sample values as facts.
+
+Give Pi a complete reviewable result: goal, material design decisions, allowed scope, baseline, acceptance commands, evidence/resource budgets and genuine escalation conditions. For nontrivial work, describe a few ordered, result-oriented stages in the design or brief. Give each stage a specific observable goal, its prerequisite facts or earlier outputs, permitted scope, completion evidence and stop condition. A small task can have one stage; do not choose a fixed stage count or split testing, coding and review into separate stages merely by activity. Freeze and dispatch one complete authorized phase at a time, then accept its evidence before moving to a dependent phase.
+
+Make the brief precise where mistakes would change behavior: name required files, commands, interfaces, input/output fields and representative edge cases when they are part of the contract. State semantics such as unknown versus zero, time zone conversion, numeric serialization, data-access limits and output sensitivity when relevant. Specify warranted tests with real positive and negative cases and exact expected values where the evidence supports them. For behavioral coding that needs tests, ask Pi to establish the smallest meaningful failing check before implementing when feasible, then run the affected acceptance commands to completion. Leave routine implementation choices to Pi; test order and file/function names are not universal gates.
+
+Use a separate Git worktree; capacity is not authorization for parallel business phases. Pi owns implementation, tests, productive repairs and scoped commits. Expected red tests and routine failures stay with Pi; design contradictions or repeated ineffective repairs require a concrete reproduction.
 
 Run the plugin's `runtime/pi_task.py` with Python. `start` creates a task; `continue` preserves its exact Pi session/worktree in a new immutable round. Use the board to bind the task to the exact owning desktop task UUID and opt into CLI queue delivery. See [runtime commands](references/runtime.md). Never create a duplicate worker to bypass an active or unknown task.
 

@@ -1,6 +1,6 @@
 {
   "name": "codex-pi",
-  "version": "0.5.0+codex.20260926125953",
+  "version": "0.5.0+codex.20260926134123",
   "description": "\u8de8\u9879\u76ee\u7684 Codex \u4e0e Pi \u534f\u4f5c\uff1aDeepSeek Flash \u5b9e\u65bd\u3001\u672c\u5730\u770b\u677f\u6309\u4e8b\u4ef6\u901a\u77e5\u539f\u4e3b\u4efb\u52a1\u3001\u7cbe\u7b80\u8bc1\u636e\u4e0e\u72ec\u7acb\u9a8c\u6536\u3002",
   "author": {
     "name": "Local personal tools"
