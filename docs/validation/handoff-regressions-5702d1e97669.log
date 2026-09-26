@@ -1,0 +1,43 @@
+test_ack_requires_session_and_delivery (test_handoff.HandoffTest.test_ack_requires_session_and_delivery) ... ok
+test_arm_is_idempotent_and_refuses_live_rebind_across_sessions (test_handoff.HandoffTest.test_arm_is_idempotent_and_refuses_live_rebind_across_sessions) ... ok
+test_arm_refuses_unknown_task_round_and_stale_round (test_handoff.HandoffTest.test_arm_refuses_unknown_task_round_and_stale_round) ... ok
+test_concurrent_arms_same_round_have_one_winner (test_handoff.HandoffTest.test_concurrent_arms_same_round_have_one_winner) ... ok
+test_corrupt_and_wrong_repo_bindings_fail_safe (test_handoff.HandoffTest.test_corrupt_and_wrong_repo_bindings_fail_safe) ... ok
+test_delayed_success_blocks_once_after_terminal_with_concurrent_hooks (test_handoff.HandoffTest.test_delayed_success_blocks_once_after_terminal_with_concurrent_hooks) ... ok
+test_expired_wait_requires_explicit_resume (test_handoff.HandoffTest.test_expired_wait_requires_explicit_resume) ... ok
+test_explicit_rearm_resumes_suspended_event (test_handoff.HandoffTest.test_explicit_rearm_resumes_suspended_event) ... ok
+test_failed_pi_returns_failure_event_once (test_handoff.HandoffTest.test_failed_pi_returns_failure_event_once) ... ok
+test_hook_wait_timeout_leaves_pi_alive_with_recovery_evidence (test_handoff.HandoffTest.test_hook_wait_timeout_leaves_pi_alive_with_recovery_evidence) ... ok
+test_hooks_command_executes_through_shell_with_spaces (test_handoff.HandoffTest.test_hooks_command_executes_through_shell_with_spaces) ... ok
+test_hooks_config_and_help_match_the_documented_contract (test_handoff.HandoffTest.test_hooks_config_and_help_match_the_documented_contract) ... ok
+test_inflight_arm_honors_interrupt_during_arm (test_handoff.HandoffTest.test_inflight_arm_honors_interrupt_during_arm) ... ok
+test_interrupt_is_prompt_with_contended_binding_locks (test_handoff.HandoffTest.test_interrupt_is_prompt_with_contended_binding_locks) ... ok
+test_interrupt_while_stop_waits_prevents_continuation_promptly (test_handoff.HandoffTest.test_interrupt_while_stop_waits_prevents_continuation_promptly) ... ERROR
+test_invalid_records_never_deliver (test_handoff.HandoffTest.test_invalid_records_never_deliver) ... ok
+test_new_round_eligible_after_prior_delivery_and_ack (test_handoff.HandoffTest.test_new_round_eligible_after_prior_delivery_and_ack) ... ok
+test_no_codex_and_no_pi_invocation_during_handoff (test_handoff.HandoffTest.test_no_codex_and_no_pi_invocation_during_handoff) ... ok
+test_pending_result_before_arm_delivers_once (test_handoff.HandoffTest.test_pending_result_before_arm_delivers_once) ... ok
+test_ready_second_task_delivered_while_first_hangs (test_handoff.HandoffTest.test_ready_second_task_delivered_while_first_hangs) ... ok
+test_recovery_surface_on_user_prompt_and_no_auto_redelivery (test_handoff.HandoffTest.test_recovery_surface_on_user_prompt_and_no_auto_redelivery) ... ok
+test_resume_generation_race_blocks_stale_hook (test_handoff.HandoffTest.test_resume_generation_race_blocks_stale_hook) ... ok
+test_running_record_without_supervisor_becomes_needs_recovery (test_handoff.HandoffTest.test_running_record_without_supervisor_becomes_needs_recovery) ... ok
+test_stale_expiry_cannot_demote_delivered_or_acked (test_handoff.HandoffTest.test_stale_expiry_cannot_demote_delivered_or_acked) ... ok
+test_status_without_selectors_reports_error (test_handoff.HandoffTest.test_status_without_selectors_reports_error) ... ok
+test_terminal_record_with_lingering_ownership_is_not_delivered (test_handoff.HandoffTest.test_terminal_record_with_lingering_ownership_is_not_delivered) ... ok
+test_wait_zero_inspects_once_then_expires (test_handoff.HandoffTest.test_wait_zero_inspects_once_then_expires) ... ok
+test_worker_timeout_is_delivered_as_terminal_event (test_handoff.HandoffTest.test_worker_timeout_is_delivered_as_terminal_event) ... ok
+test_wrong_session_and_unknown_binding_are_safe_noops (test_handoff.HandoffTest.test_wrong_session_and_unknown_binding_are_safe_noops) ... ok
+
+======================================================================
+ERROR: test_interrupt_while_stop_waits_prevents_continuation_promptly (test_handoff.HandoffTest.test_interrupt_while_stop_waits_prevents_continuation_promptly)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/tmp/codex-pi-hooks-20260926/implementation/tests/test_handoff.py", line 286, in test_interrupt_while_stop_waits_prevents_continuation_promptly
+    os.kill(state["piPid"], 0)  # Pi keeps running after a user interrupt
+            ~~~~~^^^^^^^^^
+KeyError: 'piPid'
+
+----------------------------------------------------------------------
+Ran 29 tests in 60.898s
+
+FAILED (errors=1)

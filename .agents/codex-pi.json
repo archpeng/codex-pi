@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "model": "deepseek/deepseek-flash",
+  "thinking": "max",
+  "constraints": [
+    "skills/collaborate/SKILL.md"
+  ],
+  "checks": [
+    "Run the Python behavioral suite for affected runtime paths."
+  ],
+  "maxWorkers": 1,
+  "timeoutSeconds": 14400
+}

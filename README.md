@@ -11,7 +11,7 @@
 
 > 用 `$collaborate` 按当前 PLAN 委派 Pi 实施；先确认项目约束，集中验收结果。
 
-插件提供 `project`、`start`、`continue`、`result`、`wait`、`cancel` 六个脚本命令。任务使用独立 Git worktree；返修续接同一 Pi 会话。
+任务运行器提供 `project`、`start`、`continue`、`result`、`wait`、`cancel` 六个脚本命令。同步 hook 交接器另行绑定会话和轮次、等待完成并记录收取状态。任务使用独立 Git worktree；返修续接同一 Pi 会话。
 详见 [协作规则](skills/collaborate/SKILL.md) 和 [运行说明](skills/collaborate/references/runtime.md)。
 
 每个新项目增加以下薄配置，并将实际验收要求写入 `checks`：
@@ -40,16 +40,27 @@
 公共脚本依赖 Python 3.10+、Git、Pi（Pi 自身仍使用原安装的 Node）；当前适用于 macOS/Linux（使用 `flock` 和进程组）。
 行为验证：`python3 -m unittest discover -s tests -p 'test_*.py' -v`，无需安装 Python 第三方包。
 
-安装是否成功应以应用能加载 `collaborate` skill，且脚本能够真实启动 Pi为准。仅写入 marketplace
-不证明当前会话已经热加载；应用可能需要刷新插件或重启。全过程不需要 Codex CLI。
+插件原有 `collaborate` skill 已在主会话加载，脚本也已真实运行 DeepSeek Flash。
+更新版本后，仍须由应用刷新插件并审核、信任当前 hook 定义；旧 skill 可用不证明新 hook 已加载。
+全过程不需要 Codex CLI，也不手改安装缓存或 hook 信任记录。
+
+## 同步完成交接
+
+主会话启动 Pi 后，显式绑定当前 Codex 会话与任务轮次。应用准备结束这一轮时，同步 `Stop`
+hook 由本地 Python 等待。任务结束后，它返回固定续行提示；Codex 收取结果、确认收到，然后审查与继续。
+等待不调用模型。绑定、通知和收取状态持久化，重复 hook 不重复通知同一轮。
+用户中断暂停自动交接，但不擅自取消 Pi。配置和恢复步骤见 [交接说明](skills/collaborate/references/handoff.md)。
+
+这不是关闭应用后的唤醒服务。必须在当前应用实测信任与续行后，才能声称桌面端已验证；
+直接运行 hook 的测试，只证明脚本和状态处理。具体证据见 [验证记录](docs/validation.md)。
 
 ## Token 与恢复边界
 
 - 一次交付完整任务段；合并返修意见，减少 Codex 的长上下文回合。
 - 首先读取有上限的结果；按问题读取局部 diff、日志和原证，不反复拉回整段 Pi 日志。
 - `wait` 最长等待 60 秒，软件在内部等待；禁止用密集模型轮询替代。
-- 启动命令退出后，独立 Pi worker 继续运行。主会话已经结束时，插件没有经过验证的
-  自动唤醒通道；需要下一次主会话读取结果，不启动额外 Codex、心跳或轮询任务。
+- 启动命令退出后，独立 Pi worker 继续运行。可信同步 hook 可在停止处理期间等待交接；
+  等待超时、应用退出或用户中断后保留结果，不能保证自动唤醒，不启动额外 Codex、心跳或轮询任务。
 - 每轮日志、失败结果和检查回执保留在 Git common dir 下；未确定状态不能自动重跑或认定成功。
 
 本插件减少可避免的协调输入，不承诺固定的 token 降幅。原始、缓存、输出与等效成本必须

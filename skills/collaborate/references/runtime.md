@@ -1,6 +1,6 @@
 # Local runtime
 
-The plugin provides a skill and deterministic Python scripts; no MCP server or additional Node packages are required. Only Pi calls a model; no Codex executable, API, reviewer or notification process is started. It reuses the user's installed Pi and provider authentication without copying credentials into the plugin.
+The plugin provides a skill and deterministic Python scripts; no MCP server or additional Node packages are required. The worker runner only calls Pi; it starts no Codex executable, API client or reviewer. An opted-in, trusted synchronous host hook can return a continuation reason to the existing Codex task. It reuses the user's installed Pi and provider authentication without copying credentials into the plugin.
 
 The main conversation supplies a Git repository, a task identifier and an isolated worktree. Create worktrees with ordinary Git. `start` is a new task; `continue` is another immutable round using that task's saved session. A pending or unknown task must be inspected, not replayed with a new identity to bypass its lock.
 
@@ -51,3 +51,5 @@ python3 /absolute/task/tools/pi_check.py --output-dir /absolute/round/round.chec
 ```
 
 Replace `make test` with the project's actual command. Each attempt writes its own receipt and log; rerunning does not erase a failure. The generated Pi brief already includes these exact task-specific helper paths.
+
+For synchronous completion handoff, installation/trust requirements and recovery, read [handoff guidance](handoff.md). Existing task evidence is reusable; handoff registration does not restart or migrate a worker.

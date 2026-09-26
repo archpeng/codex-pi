@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "id": "handoff-regressions",
+  "argv": [
+    "python3",
+    "-m",
+    "unittest",
+    "discover",
+    "-s",
+    "tests",
+    "-p",
+    "test_handoff.py",
+    "-v"
+  ],
+  "cwd": "/private/tmp/codex-pi-hooks-20260926/implementation",
+  "head": "1dc628f7da2b521b305322b9e169c1c81d83aecb",
+  "dirty": false,
+  "tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "started_at": 1790387333.583072,
+  "ended_at": 1790387394.616977,
+  "exit_code": 1,
+  "timed_out": false,
+  "error": null,
+  "test_counts": null,
+  "log": "handoff-regressions-5702d1e97669.log",
+  "log_sha256": "d53db0c8d0e4fd344b9d715c05ac0de80ffa273016bf138ce3d85563c7d70896",
+  "acceptance": "not_verified"
+}

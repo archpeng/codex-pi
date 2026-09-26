@@ -1,15 +1,15 @@
 {
   "name": "codex-pi",
-  "version": "0.1.0",
-  "description": "跨项目的 Codex 主会话与 Pi 协作：直接 CLI、持久执行与精简证据，Pi 仅允许 DeepSeek Flash，不调用 Codex CLI。",
+  "version": "0.2.0+codex.20260926015337",
+  "description": "\u8de8\u9879\u76ee\u7684 Codex \u4e3b\u4f1a\u8bdd\u4e0e Pi \u534f\u4f5c\uff1a\u76f4\u63a5 CLI\u3001\u6301\u4e45\u6267\u884c\u4e0e\u7cbe\u7b80\u8bc1\u636e\uff0cPi \u4ec5\u5141\u8bb8 DeepSeek Flash\uff0c\u4e0d\u8c03\u7528 Codex CLI\u3002",
   "author": {
     "name": "Local personal tools"
   },
   "skills": "./skills/",
   "interface": {
     "displayName": "Codex + Pi",
-    "shortDescription": "主会话决策验收，Pi 连续实施，脚本等待并保存证据。",
-    "longDescription": "一套公共 Python 脚本与每个项目少量约束。只使用当前 Codex 主会话和 deepseek/deepseek-flash Pi 子 agent；不需要 MCP，不调用 Codex CLI，不把执行结束当作验收通过。",
+    "shortDescription": "\u4e3b\u4f1a\u8bdd\u51b3\u7b56\u9a8c\u6536\uff0cPi \u5b9e\u65bd\uff0c\u53ef\u4fe1\u540c\u6b65 hook \u5b8c\u6210\u4ea4\u63a5\u3002",
+    "longDescription": "\u4e00\u5957\u516c\u5171 Python \u811a\u672c\u4e0e\u6bcf\u4e2a\u9879\u76ee\u5c11\u91cf\u7ea6\u675f\u3002\u53ea\u4f7f\u7528\u5f53\u524d Codex \u4e3b\u4f1a\u8bdd\u548c deepseek/deepseek-flash Pi \u5b50 agent\uff1b\u4e0d\u9700\u8981 MCP\uff0c\u4e0d\u8c03\u7528 Codex CLI\uff0c\u4e0d\u628a\u6267\u884c\u7ed3\u675f\u5f53\u4f5c\u9a8c\u6536\u901a\u8fc7\u3002",
     "developerName": "Local personal tools",
     "category": "Productivity",
     "capabilities": [
@@ -17,7 +17,7 @@
       "Write"
     ],
     "defaultPrompt": [
-      "使用 $collaborate，将当前项目已授权的完整任务交给 Pi 实施，由当前主会话设计并验收。"
+      "\u4f7f\u7528 $collaborate\uff0c\u5c06\u5f53\u524d\u9879\u76ee\u5df2\u6388\u6743\u7684\u5b8c\u6574\u4efb\u52a1\u4ea4\u7ed9 Pi \u5b9e\u65bd\uff0c\u7531\u5f53\u524d\u4e3b\u4f1a\u8bdd\u8bbe\u8ba1\u5e76\u9a8c\u6536\u3002"
     ]
   }
 }

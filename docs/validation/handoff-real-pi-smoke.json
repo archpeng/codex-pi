@@ -1,0 +1,128 @@
+{
+  "scope": "real Pi CLI + actual configured hook command in a subprocess; not desktop continuation",
+  "date": "2026-09-26",
+  "model": "deepseek/deepseek-flash",
+  "reportedModels": {
+    "deepseek/deepseek-flash": 1
+  },
+  "modelCheck": "matched",
+  "exitCode": 0,
+  "terminalState": "completed",
+  "finalText": "HOOK_DEEPSEEK_READY",
+  "eventKey": "c67c64a88d525d8007e6f61f5655771c8698dfcbb5917e7eb2375f6a24a2ce40",
+  "firstHook": {
+    "decision": "block",
+    "reason": "Codex-Pi handoff is ready for main-session review (execution evidence, not acceptance).\nevent=c67c64a88d525d8007e6f61f5655771c8698dfcbb5917e7eb2375f6a24a2ce40\nrepo=/private/tmp/codex-pi-hooks-20260926/live-smoke/repo\ntask=HOOK-LIVE-SMOKE\nround=1\nterminal_state=completed\nexit_code=0\ntimed_out=False\ncancelled=False\nPi exit 0 means the process completed execution only; this hook never proves acceptance.\nCollect bounded evidence: python3 /private/tmp/codex-pi-hooks-20260926/live-smoke/repo/.git/codex-pi/tasks/HOOK-LIVE-SMOKE/tools/pi_task.py result --repo /private/tmp/codex-pi-hooks-20260926/live-smoke/repo --task HOOK-LIVE-SMOKE --round 1\nAcknowledge this exact event after collecting: python3 /Users/jlpeng/plugins/codex-pi/runtime/pi_handoff.py ack --event-key c67c64a88d525d8007e6f61f5655771c8698dfcbb5917e7eb2375f6a24a2ce40\nThis event was delivered once; do not re-notify and do not change the pinned model."
+  },
+  "duplicateHook": {},
+  "ack": {
+    "ok": true,
+    "alreadyAcked": false,
+    "eventKey": "c67c64a88d525d8007e6f61f5655771c8698dfcbb5917e7eb2375f6a24a2ce40",
+    "ackAt": 1790387586.6183949,
+    "binding": {
+      "eventKey": "c67c64a88d525d8007e6f61f5655771c8698dfcbb5917e7eb2375f6a24a2ce40",
+      "sessionId": "codex-pi-process-smoke-20260926",
+      "repo": "/private/tmp/codex-pi-hooks-20260926/live-smoke/repo",
+      "task": "HOOK-LIVE-SMOKE",
+      "round": 1,
+      "state": "acked",
+      "armedAt": 1790387586.402733,
+      "generation": 1,
+      "observedInterruptGeneration": 0,
+      "waitSeconds": 10.0,
+      "attempts": 1,
+      "deliveredAt": 1790387586.519344,
+      "ackedAt": 1790387586.6183949,
+      "ackedFromState": "delivered",
+      "suspendedAt": null,
+      "lastWaitExpiredAt": null,
+      "lastCheckedAt": 1790387586.519344,
+      "lastError": null,
+      "delivery": {
+        "state": "completed",
+        "exitCode": 0,
+        "timedOut": false,
+        "cancelled": false,
+        "endedAt": 1790387586.5193422
+      },
+      "liveRoundState": {
+        "roundState": "completed",
+        "exitCode": 0,
+        "timedOut": false,
+        "cancelled": false
+      },
+      "evidence": {
+        "taskDir": "/private/tmp/codex-pi-hooks-20260926/live-smoke/repo/.git/codex-pi/tasks/HOOK-LIVE-SMOKE",
+        "roundDir": "/private/tmp/codex-pi-hooks-20260926/live-smoke/repo/.git/codex-pi/tasks/HOOK-LIVE-SMOKE/rounds/1",
+        "state": "/private/tmp/codex-pi-hooks-20260926/live-smoke/repo/.git/codex-pi/tasks/HOOK-LIVE-SMOKE/rounds/1/round.state.json",
+        "summary": "/private/tmp/codex-pi-hooks-20260926/live-smoke/repo/.git/codex-pi/tasks/HOOK-LIVE-SMOKE/rounds/1/round.summary.json",
+        "checksDir": "/private/tmp/codex-pi-hooks-20260926/live-smoke/repo/.git/codex-pi/tasks/HOOK-LIVE-SMOKE/rounds/1/round.checks"
+      },
+      "commands": {
+        "status": "python3 /Users/jlpeng/plugins/codex-pi/runtime/pi_handoff.py status --event-key c67c64a88d525d8007e6f61f5655771c8698dfcbb5917e7eb2375f6a24a2ce40",
+        "ack": "python3 /Users/jlpeng/plugins/codex-pi/runtime/pi_handoff.py ack --event-key c67c64a88d525d8007e6f61f5655771c8698dfcbb5917e7eb2375f6a24a2ce40",
+        "result": "python3 /private/tmp/codex-pi-hooks-20260926/live-smoke/repo/.git/codex-pi/tasks/HOOK-LIVE-SMOKE/tools/pi_task.py result --repo /private/tmp/codex-pi-hooks-20260926/live-smoke/repo --task HOOK-LIVE-SMOKE --round 1"
+      },
+      "acceptance": "not_verified"
+    },
+    "note": "acknowledgement marks result collection only; it is never acceptance"
+  },
+  "ackAgain": {
+    "ok": true,
+    "alreadyAcked": true,
+    "eventKey": "c67c64a88d525d8007e6f61f5655771c8698dfcbb5917e7eb2375f6a24a2ce40",
+    "ackAt": 1790387586.6183949,
+    "binding": {
+      "eventKey": "c67c64a88d525d8007e6f61f5655771c8698dfcbb5917e7eb2375f6a24a2ce40",
+      "sessionId": "codex-pi-process-smoke-20260926",
+      "repo": "/private/tmp/codex-pi-hooks-20260926/live-smoke/repo",
+      "task": "HOOK-LIVE-SMOKE",
+      "round": 1,
+      "state": "acked",
+      "armedAt": 1790387586.402733,
+      "generation": 1,
+      "observedInterruptGeneration": 0,
+      "waitSeconds": 10.0,
+      "attempts": 1,
+      "deliveredAt": 1790387586.519344,
+      "ackedAt": 1790387586.6183949,
+      "ackedFromState": "delivered",
+      "suspendedAt": null,
+      "lastWaitExpiredAt": null,
+      "lastCheckedAt": 1790387586.519344,
+      "lastError": null,
+      "delivery": {
+        "state": "completed",
+        "exitCode": 0,
+        "timedOut": false,
+        "cancelled": false,
+        "endedAt": 1790387586.5193422
+      },
+      "liveRoundState": {
+        "roundState": "completed",
+        "exitCode": 0,
+        "timedOut": false,
+        "cancelled": false
+      },
+      "evidence": {
+        "taskDir": "/private/tmp/codex-pi-hooks-20260926/live-smoke/repo/.git/codex-pi/tasks/HOOK-LIVE-SMOKE",
+        "roundDir": "/private/tmp/codex-pi-hooks-20260926/live-smoke/repo/.git/codex-pi/tasks/HOOK-LIVE-SMOKE/rounds/1",
+        "state": "/private/tmp/codex-pi-hooks-20260926/live-smoke/repo/.git/codex-pi/tasks/HOOK-LIVE-SMOKE/rounds/1/round.state.json",
+        "summary": "/private/tmp/codex-pi-hooks-20260926/live-smoke/repo/.git/codex-pi/tasks/HOOK-LIVE-SMOKE/rounds/1/round.summary.json",
+        "checksDir": "/private/tmp/codex-pi-hooks-20260926/live-smoke/repo/.git/codex-pi/tasks/HOOK-LIVE-SMOKE/rounds/1/round.checks"
+      },
+      "commands": {
+        "status": "python3 /Users/jlpeng/plugins/codex-pi/runtime/pi_handoff.py status --event-key c67c64a88d525d8007e6f61f5655771c8698dfcbb5917e7eb2375f6a24a2ce40",
+        "ack": "python3 /Users/jlpeng/plugins/codex-pi/runtime/pi_handoff.py ack --event-key c67c64a88d525d8007e6f61f5655771c8698dfcbb5917e7eb2375f6a24a2ce40",
+        "result": "python3 /private/tmp/codex-pi-hooks-20260926/live-smoke/repo/.git/codex-pi/tasks/HOOK-LIVE-SMOKE/tools/pi_task.py result --repo /private/tmp/codex-pi-hooks-20260926/live-smoke/repo --task HOOK-LIVE-SMOKE --round 1"
+      },
+      "acceptance": "not_verified"
+    },
+    "note": "acknowledgement marks result collection only; it is never acceptance"
+  },
+  "hookElapsedSeconds": 0.104,
+  "rawEvidence": "/private/tmp/codex-pi-hooks-20260926/live-smoke/repo/.git/codex-pi/tasks/HOOK-LIVE-SMOKE/rounds/1/round.jsonl",
+  "rawEvidenceSha256": "b3fcf5de25bc0129e98fd9fd0623476f59a84abccea96cbe2f3b8d08f541c18d",
+  "desktopContinuation": "pending application refresh and hook trust"
+}

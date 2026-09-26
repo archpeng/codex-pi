@@ -30,10 +30,23 @@ double or explicit path only). Helpers used by the Pi worker are
 | `runtime/pi_task.py` | Admission, config, model policy, brief, detached worker, timeout, cancel, result/wait, CLI |
 | `runtime/pi_summary.py` | Bounded round summary, check-receipt aggregation, usage, reported-model check |
 | `runtime/pi_check.py` | One-check receipt: true exit/signal/timeout, log sha256, HEAD/dirty, counts |
+| `runtime/pi_handoff.py` | Explicit session/round binding, synchronous Stop waiting, receipt acknowledgement, interruption and recovery |
+| `hooks/hooks.json` | Plugin-discovered synchronous Stop, Interrupt and recovery commands; requires host trust |
 | `runtime/VERSION` | Runtime version copied into every task state |
 
 `pi_summary.py` and `pi_check.py` are derived from the already-tested
 `eugl-ds-delegated-execution` local helpers. No community server code is used.
+
+## Host continuation
+
+The handoff registers references to an existing task round; it does not alter
+worker snapshots or launch another worker. Durable registration and delivery
+state live outside the immutable task evidence, under the user's Codex home.
+The script waits without calling a model. Only the host interprets the returned
+Stop decision and creates a continuation in the same Codex task. Trust/loading,
+host uptime and the bounded hook lifetime remain prerequisites; these scripts
+do not supply an offline wake service. See the [handoff contract](../skills/collaborate/references/handoff.md)
+and the [validation record](../docs/validation.md) for the tested boundary.
 
 ## Model policy (hard restriction)
 

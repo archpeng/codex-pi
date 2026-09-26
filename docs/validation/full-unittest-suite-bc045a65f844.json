@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "id": "full-unittest-suite",
+  "argv": [
+    "python3",
+    "-m",
+    "unittest",
+    "discover",
+    "-s",
+    "tests",
+    "-p",
+    "test_*.py",
+    "-v"
+  ],
+  "cwd": "/private/tmp/codex-pi-hooks-20260926/implementation",
+  "head": "bc03a45f6e48d9aabcd6bda1e07e6821cac494b6",
+  "dirty": false,
+  "tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "started_at": 1790387533.6102998,
+  "ended_at": 1790387625.721121,
+  "exit_code": 0,
+  "timed_out": false,
+  "error": null,
+  "test_counts": null,
+  "log": "full-unittest-suite-bc045a65f844.log",
+  "log_sha256": "6f27533958e499d5a42daed8e91081ca46d1ae5eb94f639c3247fa6b52641daa",
+  "acceptance": "not_verified"
+}
