@@ -1016,7 +1016,24 @@ def dispatch_hook(event: dict) -> dict:
         return handle_stop(session)
     if name == "Interrupt":
         return handle_interrupt(session, event)
-    if name in ("SessionStart", "UserPromptSubmit"):
+    if name == "UserPromptSubmit":
+        prompt = event.get("prompt")
+        if isinstance(prompt, str) and prompt.startswith("<heartbeat>"):
+            # Only an exact registered session/id/instructions envelope is
+            # eligible; every other prompt keeps the old recovery behavior.
+            try:
+                from pi_board import evaluate_gate  # lazy: ordinary prompts never load the board
+                output = evaluate_gate(event)
+            except Exception as exc:  # never crash the host hook
+                output = {"hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": bounded(
+                        f"codex-pi board gate failed safely ({exc}); the automatic tick was "
+                        "allowed through", 300)}}
+            if output is not None:
+                return output
+        return handle_recovery(name, session)
+    if name == "SessionStart":
         return handle_recovery(name, session)
     return {}
 

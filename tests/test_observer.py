@@ -268,11 +268,12 @@ class ObserverTest(unittest.TestCase):
         task_dir = repo.task_dir("observer-snapshot")
         tools = task_dir / "tools"
         for name in ("pi_task.py", "pi_check.py", "pi_summary.py", "pi_copy.py", "pi_size.py",
-                     "VERSION"):
+                     "pi_board.py", "VERSION"):
             self.assertTrue((tools / name).is_file(), f"frozen snapshot is missing {name}")
         task_json = json.loads((task_dir / "task.json").read_text(encoding="utf-8"))
         self.assertIn("pi_copy.py", task_json["helperHashes"])
         self.assertIn("pi_size.py", task_json["helperHashes"])
+        self.assertIn("pi_board.py", task_json["helperHashes"])
         check = subprocess.run(
             [sys.executable, str(tools / "pi_check.py"), "--output-dir", str(self.tmp / "snap-checks"),
              "--id", "snapshot-check", "--", sys.executable, "-c", "print('snapshot ok')"],

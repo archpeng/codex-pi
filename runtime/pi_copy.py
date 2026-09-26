@@ -3,8 +3,11 @@
 
 Contract::
 
-    python3 pi_copy.py SOURCE DEST [--max-bytes N]
+    python3 pi_copy.py SOURCE DEST --max-bytes N
 
+- ``--max-bytes`` is required and must be a positive integer: an unknown or
+  incomplete preflight/final measurement never succeeds and never claims a
+  safe copy.
 - ``DEST`` must not exist (any type, including a dangling symlink), and it must
   not be inside ``SOURCE`` (a recursive copy is refused).
 - ``SOURCE`` is copied recursively. Symlinks are recreated literally with
@@ -241,11 +244,11 @@ def main() -> int:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("source")
     parser.add_argument("dest")
-    parser.add_argument("--max-bytes", type=int,
-                        help="positive byte budget for regular files under SOURCE; symlinks do "
-                             "not count and are never followed")
+    parser.add_argument("--max-bytes", type=int, required=True,
+                        help="required positive byte budget for regular files under SOURCE; "
+                             "symlinks do not count and are never followed")
     args = parser.parse_args()
-    if args.max_bytes is not None and args.max_bytes <= 0:
+    if args.max_bytes <= 0:
         parser.error("--max-bytes must be a positive integer")
     payload, code = perform_copy(args.source, args.dest, args.max_bytes)
     return code

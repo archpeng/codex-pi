@@ -76,7 +76,7 @@ class CopyTest(unittest.TestCase):
         (source / "top.txt").write_text("top", encoding="utf-8")
         (source / "nested" / "deep" / "leaf.txt").write_text("leaf", encoding="utf-8")
         dest = self.tmp / "tree-copy"
-        proc = run_copy(source, dest)
+        proc = run_copy(source, dest, "--max-bytes", "1000000")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual((dest / "top.txt").read_text(encoding="utf-8"), "top")
         self.assertEqual((dest / "nested" / "deep" / "leaf.txt").read_text(encoding="utf-8"),
@@ -84,24 +84,25 @@ class CopyTest(unittest.TestCase):
 
         before = {path.relative_to(dest): path.read_bytes() for path in dest.rglob("*")
                   if path.is_file()}
-        overwrite = run_copy(source, dest)
+        overwrite = run_copy(source, dest, "--max-bytes", "1000000")
         self.assertNotEqual(overwrite.returncode, 0)
         self.assertEqual(json.loads(overwrite.stdout)["status"], "refused")
         after = {path.relative_to(dest): path.read_bytes() for path in dest.rglob("*")
                  if path.is_file()}
         self.assertEqual(before, after, "an existing destination must stay byte-identical")
 
-        inside = run_copy(source, source / "nested" / "inside")
+        inside = run_copy(source, source / "nested" / "inside", "--max-bytes", "1000000")
         self.assertNotEqual(inside.returncode, 0)
         self.assertEqual(json.loads(inside.stdout)["status"], "refused")
         self.assertFalse((source / "nested" / "inside").exists())
 
         dangling_dest = self.tmp / "dangling-dest"
         os.symlink(self.tmp / "missing-target", dangling_dest)
-        dangling = run_copy(source, dangling_dest)
+        dangling = run_copy(source, dangling_dest, "--max-bytes", "1000000")
         self.assertNotEqual(dangling.returncode, 0, "a dangling destination symlink still exists")
 
-        missing_parent = run_copy(source, self.tmp / "no-such-parent" / "dest")
+        missing_parent = run_copy(source, self.tmp / "no-such-parent" / "dest",
+                                  "--max-bytes", "1000000")
         self.assertNotEqual(missing_parent.returncode, 0)
 
     def test_over_budget_and_unknown_preflight_refuse_before_write(self):
@@ -125,9 +126,10 @@ class CopyTest(unittest.TestCase):
         self.assertFalse((self.tmp / "unknown-dest").exists())
 
         without_budget = run_copy(link_source, self.tmp / "linked-dest")
-        self.assertEqual(without_budget.returncode, 0, without_budget.stderr)
-        self.assertTrue((self.tmp / "linked-dest").is_symlink())
-        self.assertEqual(os.readlink(self.tmp / "linked-dest"), str(source))
+        self.assertEqual(without_budget.returncode, 2,
+                         "the CLI must require an explicit positive --max-bytes")
+        self.assertIn("--max-bytes", without_budget.stderr)
+        self.assertFalse((self.tmp / "linked-dest").exists())
 
     def test_mid_copy_breach_retains_partial_evidence(self):
         source = self.tmp / "grow-source"
@@ -195,6 +197,9 @@ class CopyTest(unittest.TestCase):
         source = self.tmp / "usage-source"
         source.mkdir()
         (source / "x").write_text("x", encoding="utf-8")
+        missing = run_copy(source, self.tmp / "missing-budget-dest")
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("--max-bytes", missing.stderr)
         zero = run_copy(source, self.tmp / "zero-dest", "--max-bytes", "0")
         self.assertEqual(zero.returncode, 2)
         self.assertIn("positive", zero.stderr)

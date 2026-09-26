@@ -19,6 +19,7 @@ from pathlib import Path
 from runtime_helpers import RUNTIME
 
 sys.path.insert(0, str(RUNTIME))
+import pi_size  # noqa: E402
 from pi_size import measure  # noqa: E402
 
 
@@ -198,6 +199,61 @@ class GuardTest(unittest.TestCase):
         self.assertTrue(timed["unknown"], "a zero time bound cannot be complete")
         invalid = measure(self.watch, max_entries=0)
         self.assertTrue(invalid["unknown"])
+
+    def test_unreadable_and_failing_iteration_are_bounded_unknown(self):
+        if os.geteuid() != 0:
+            parent = self.tmp / "unreadable-tree"
+            (parent / "locked").mkdir(parents=True)
+            (parent / "locked" / "hidden.bin").write_bytes(b"x" * 10)
+            os.chmod(parent / "locked", 0o000)
+            self.addCleanup(os.chmod, parent / "locked", 0o700)
+            result = measure(parent)
+            self.assertTrue(result["unknown"], "an unreadable directory is unknown, not under budget")
+            self.assertFalse(result["complete"])
+            direct = measure(parent / "locked")
+            self.assertTrue(direct["unknown"])
+
+        class BrokenScan:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                raise OSError("simulated readdir failure")
+
+        original = pi_size.os.scandir
+        pi_size.os.scandir = lambda _path: BrokenScan()
+        try:
+            failed = measure(self.watch)
+        finally:
+            pi_size.os.scandir = original
+        self.assertTrue(failed["unknown"])
+        self.assertIn("unreadable directory entry", failed["reason"])
+
+    def test_guard_unreadable_subtree_is_unknown_and_child_survives(self):
+        if os.geteuid() == 0:
+            self.skipTest("root ignores directory permissions")
+        locked = self.watch / "locked"
+        locked.mkdir()
+        (locked / "hidden.bin").write_bytes(b"x" * 5000)
+        os.chmod(locked, 0o000)
+        self.addCleanup(os.chmod, locked, 0o700)
+        proc = self.run_check(
+            "--watch-path", self.watch, "--max-bytes", "10",
+            "--health-interval-seconds", "0.2", "--",
+            sys.executable, "-c", "import sys; sys.exit(6)")
+        self.assertEqual(proc.returncode, 6, proc.stderr)
+        receipt = self.receipt_from(proc)
+        guard = receipt["resource_limit"]
+        self.assertTrue(guard["unknown"])
+        self.assertFalse(guard["breached"])
+        self.assertFalse(receipt["timed_out"])
+        self.assertFalse(receipt["cancelled"])
 
     def test_guard_timeout_and_cancel_stay_distinct(self):
         (self.watch / "small.bin").write_bytes(b"x" * 10)

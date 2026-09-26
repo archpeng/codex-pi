@@ -33,24 +33,8 @@ def _reason(exc) -> str:
     return text[:MAX_REASON_TEXT]
 
 
-def measure(path, max_entries: int = DEFAULT_MAX_ENTRIES,
-            max_seconds: float = DEFAULT_MAX_SECONDS) -> dict:
-    """Measure regular-file bytes beneath ``path`` without following symlinks.
-
-    Result keys:
-
-    ``bytes``
-        Regular-file byte total. For an incomplete measurement this is a lower
-        bound only.
-    ``complete`` / ``unknown``
-        True/False when the whole declared tree was measured; incomplete or
-        unreadable measurements are ``complete=False``, ``unknown=True``.
-    ``boundedBy``
-        ``None``, ``"entries"`` or ``"time"`` when an internal bound stopped
-        the scan.
-    """
-    started = time.monotonic()
-    result = {
+def _base_result(path) -> dict:
+    return {
         "path": _path_text(path),
         "exists": False,
         "type": None,
@@ -66,6 +50,44 @@ def measure(path, max_entries: int = DEFAULT_MAX_ENTRIES,
         "boundedBy": None,
         "elapsedSeconds": 0.0,
     }
+
+
+def measure(path, max_entries: int = DEFAULT_MAX_ENTRIES,
+            max_seconds: float = DEFAULT_MAX_SECONDS) -> dict:
+    """Measure regular-file bytes beneath ``path`` without following symlinks.
+
+    Result keys:
+
+    ``bytes``
+        Regular-file byte total. For an incomplete measurement this is a lower
+        bound only.
+    ``complete`` / ``unknown``
+        True/False when the whole declared tree was measured; incomplete or
+        unreadable measurements are ``complete=False``, ``unknown=True``.
+    ``boundedBy``
+        ``None``, ``"entries"`` or ``"time"`` when an internal bound stopped
+        the scan.
+
+    This wrapper never raises for filesystem/iteration errors: an unexpected
+    failure returns a bounded unknown measurement so a guard cannot strand its
+    owned child on a measurement exception.
+    """
+    try:
+        return _measure(path, max_entries, max_seconds)
+    except Exception as exc:  # noqa: BLE001 - bounded unknown beats an uncaught error
+        result = _base_result(path)
+        try:
+            result["exists"] = os.path.lexists(result["path"])
+        except Exception:  # noqa: BLE001
+            pass
+        result["reason"] = f"measurement failed: {_reason(exc)}"
+        return result
+
+
+def _measure(path, max_entries: int = DEFAULT_MAX_ENTRIES,
+             max_seconds: float = DEFAULT_MAX_SECONDS) -> dict:
+    started = time.monotonic()
+    result = _base_result(path)
     if isinstance(max_entries, bool) or not isinstance(max_entries, int) or max_entries <= 0:
         result["reason"] = "invalid entry bound"
         return result
@@ -126,6 +148,11 @@ def measure(path, max_entries: int = DEFAULT_MAX_ENTRIES,
                 try:
                     entry = next(iterator)
                 except StopIteration:
+                    break
+                except OSError as exc:
+                    complete = False
+                    result["reason"] = f"unreadable directory entry: {_reason(exc)}"
+                    stack.clear()
                     break
                 result["entries"] += 1
                 if result["entries"] > max_entries:

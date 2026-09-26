@@ -63,7 +63,16 @@ class Guard:
         self.last = None
 
     def scan(self, preflight: bool = False) -> dict:
-        measurement = measure(self.path)
+        try:
+            measurement = measure(self.path)
+        except Exception as exc:  # noqa: BLE001 - a guard must never strand its owned child
+            measurement = {
+                "path": str(self.path), "exists": False, "type": None, "bytes": None,
+                "complete": False, "unknown": True,
+                "reason": f"guard measurement failed: {exc}"[:200],
+                "boundedBy": "error", "regularFiles": 0, "symlinksSkipped": 0,
+                "entries": 0, "elapsedSeconds": 0.0,
+            }
         self.scans += 1
         if measurement.get("unknown"):
             self.unknown_scans += 1

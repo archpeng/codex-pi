@@ -47,7 +47,7 @@ ACTIVE_STATES = ("starting", "running")
 CONFIG_KEYS = ("schemaVersion", "model", "thinking", "constraints", "checks",
                "maxWorkers", "timeoutSeconds")
 HELPER_FILES = ("pi_task.py", "pi_summary.py", "pi_check.py", "pi_copy.py", "pi_size.py",
-                "VERSION")
+                "pi_board.py", "VERSION")
 REFERENCE_EXTENSIONS = ("md", "markdown", "txt", "json", "sh", "bash", "zsh", "py",
                         "js", "mjs", "cjs", "ts", "tsx", "yaml", "yml", "toml", "cfg", "ini")
 
@@ -485,7 +485,10 @@ def compose_brief(task: dict, round_number: int, prompt: str, prior: dict | None
         "The guard counts regular-file bytes under PATH without following symlinks; incomplete "
         "measurements stay unknown, and a known breach stops only that owned check process group.",
         "Safe evidence copy (symlinks are preserved literally and never followed; DEST must be new):",
-        f'  python3 "{task_dir / "tools" / "pi_copy.py"}" SOURCE DEST [--max-bytes N]',
+        f'  python3 "{task_dir / "tools" / "pi_copy.py"}" SOURCE DEST --max-bytes N',
+        "Opt-in board projection (only when main registered this task; refresh is read-only over",
+        "existing evidence and never copies logs into the board):",
+        f'  python3 "{task_dir / "tools" / "pi_board.py"}" refresh --repo REPO --task TASK',
         f'Only "{task_dir / "tools"}" and "{checks_dir}" may be written outside the worktree.',
         "",
         "End with a concise report of changes and evidence. Never claim acceptance PASS;",
@@ -516,6 +519,36 @@ def spawn_worker(task_dir: Path, round_number: int, lock_fd_value: int, timeout_
         subprocess.Popen(argv, cwd=str(worktree), stdin=subprocess.DEVNULL,
                          stdout=output, stderr=output, start_new_session=True,
                          pass_fds=(lock_fd_value,), env=worker_env())
+
+
+BOARD_REFRESH_SECONDS = 15.0
+
+
+def board_refresh_seconds() -> float:
+    raw = os.environ.get("CODEX_PI_BOARD_REFRESH_SECONDS")
+    try:
+        value = float(raw) if raw else BOARD_REFRESH_SECONDS
+    except (TypeError, ValueError):
+        value = BOARD_REFRESH_SECONDS
+    return value if 0.05 <= value <= 600 else BOARD_REFRESH_SECONDS
+
+
+def refresh_board_best_effort(task: dict) -> None:
+    """Opt-in board projection refresh inside the existing supervisor loop.
+
+    It reuses bounded status/check evidence, never scans transcripts and never
+    raises: a monitor error becomes bounded local evidence and the run goes on.
+    Unregistered tasks return without touching any board file.
+    """
+    try:
+        from pi_board import refresh_supervisor
+        refresh_supervisor(task)
+    except Exception as exc:  # noqa: BLE001 - monitoring must never kill the worker
+        try:
+            from pi_board import record_monitor_error
+            record_monitor_error(task, f"{type(exc).__name__}: {exc}")
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -625,6 +658,8 @@ def run_worker(args) -> int:
         state["piPid"] = child.pid
         atomic(state_path, state)
         deadline = time.monotonic() + float(args.timeout_seconds)
+        board_interval = board_refresh_seconds()
+        last_board_refresh = time.monotonic() - board_interval
         while True:
             raw = child.poll()
             if raw is not None:
@@ -637,6 +672,10 @@ def run_worker(args) -> int:
             if time.monotonic() >= deadline:
                 timed_out, outcome, code = True, "timed_out", 124
                 break
+            now = time.monotonic()
+            if now - last_board_refresh >= board_interval:
+                last_board_refresh = now
+                refresh_board_best_effort(task)
             time.sleep(0.2)
     except KeyboardInterrupt:
         outcome, code = "interrupted", 128 + (caught["signal"] or signal.SIGINT)
@@ -661,6 +700,9 @@ def run_worker(args) -> int:
         atomic(task_dir / "cancel.observed", {"round": round_number, "at": time.time()})
     finish_round(task_dir, round_number, round_dir, task, state, outcome, code,
                  {"timedOut": timed_out, "cancelled": cancelled, "error": error})
+    # One bounded final projection so terminal outcomes reach a registered card
+    # without any external poller; ordinary progress already refreshed above.
+    refresh_board_best_effort(task)
     return 0
 
 
