@@ -1,0 +1,46 @@
+{
+  "recordedAt": 1790393841.554741,
+  "phase": "before release",
+  "targets": [
+    {
+      "threadId": "01a0d58b-8d1f-7e51-a8ec-8a7559b8661d",
+      "repo": "/Users/jlpeng/bussiness/eugl-harness",
+      "task": "DSH-017-upgrade",
+      "eventKey": "621c47c5e9e4b34d057f4cd2d05033fe6b064ba38e116782a661f805e0d59292",
+      "oldHookPid": 36744,
+      "state": "running",
+      "round": 2,
+      "piPid": 36528,
+      "supervisorPid": 36523,
+      "session": {
+        "sessionId": "DSH-017-upgrade",
+        "sessionDir": "/Users/jlpeng/bussiness/eugl-harness/.git/codex-pi/tasks/DSH-017-upgrade/session"
+      },
+      "taskSha256": "edf6a9b0aa5d17f6986a1d7bc7ac5d80ef4d64461038610a23e3b9157108f7aa",
+      "bindingState": "armed",
+      "bindingGeneration": 1,
+      "statusSeconds": 0.028464749921113253,
+      "statusBytes": 3418
+    },
+    {
+      "threadId": "01a0d70f-d2f9-7083-8748-f3a4b706f21d",
+      "repo": "/Users/jlpeng/works/eugl-bake-pos-recovery-bake03",
+      "task": "BAKE-WH-CLOSE-P2-C2",
+      "eventKey": "48b24271d3bacd3e90aff4e8122f523ad07a22dccf0d0d6c7128d2c6e88280e7",
+      "oldHookPid": 71624,
+      "state": "running",
+      "round": 1,
+      "piPid": 60075,
+      "supervisorPid": 60073,
+      "session": {
+        "sessionId": "BAKE-WH-CLOSE-P2-C2",
+        "sessionDir": "/Users/jlpeng/works/eugl-bake-pos-recovery/.git/codex-pi/tasks/BAKE-WH-CLOSE-P2-C2/session"
+      },
+      "taskSha256": "21d92d37d7de28eadb086937165c589267a634f42f28de65379bf1da900b37bb",
+      "bindingState": "armed",
+      "bindingGeneration": 1,
+      "statusSeconds": 0.027464082930237055,
+      "statusBytes": 5611
+    }
+  ]
+}

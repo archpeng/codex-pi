@@ -1,66 +1,54 @@
-# Synchronous completion handoff
+# Responsive waiting and quick handoff (0.3)
 
-This is an opt-in bridge at the host's stopping boundary. It does not launch a Codex executable or call a model. The existing Codex task is continued by the host after a synchronous `Stop` hook returns `decision: "block"` with a fixed reason. The application must load and trust the current plugin hooks first. Installing the skill alone is insufficient.
+The active Codex main task waits through ordinary bounded tool calls. The Stop hook checks once for an already-terminal armed round; it never holds the conversation waiting for Pi. This replaces 0.2's multi-hour synchronous Stop design, which prevented a received user follow-up from being processed in the desktop incident on 2026-09-26.
 
-## Arm only the current task's authorized work
+## Wait in the active conversation
 
-Start Pi normally, preserving the returned repository, task and exact round. Register that round with `runtime/pi_handoff.py arm`. The current Codex shell's `CODEX_THREAD_ID` supplies the session identity; outside that environment an explicit session id is required. Do not infer a session from a working directory or another task's transcript. A task launched before the hook update can be registered without restarting Pi.
+Use the exact saved repository/task/round. Do independent work first; if blocked on Pi, call:
 
-The plugin's shared continuation state is separate from immutable worker evidence. Projects do not need their own hook scripts or another copy of the project plan. Registrations point to exact results and never change the worker's model, session, worktree or acceptance criteria.
+```sh
+python3 /Users/jlpeng/plugins/codex-pi/runtime/pi_task.py wait --repo /absolute/repo --task TASK-1 --timeout-ms 60000
+```
 
-Use the returned round, not an assumed latest round. In the current Codex shell:
+Each call returns within its bounded window. Process user steering between calls, answer progress questions with `status`, and continue waiting only while authorized. Do not chain an infinite wait loop inside one tool invocation. When Pi finishes, collect `result`, inspect relevant evidence and review. A tool result does not need a fabricated hook acknowledgement.
+
+Normal local status reads do not call a model, but each resumed Codex tool cycle does use model context. This design trades some bounded coordination cost for responsiveness. It does not promise zero-token supervision, idle wake-up or offline continuation.
+
+## Optional quick Stop safety check
+
+An authorized exact round may be armed for the current Codex task (`CODEX_THREAD_ID`):
 
 ```sh
 python3 /Users/jlpeng/plugins/codex-pi/runtime/pi_handoff.py arm --repo /absolute/repo --task TASK-1 --round 1
 ```
 
-Keep the returned `eventKey`. Inspect state without delivering or accepting anything:
+Keep the returned event key. If Stop sees a terminal result with released worker ownership, it returns a fixed continuation prompt once. If Pi is still running, it returns promptly without marking the round completed or fabricating an expiry. The armed record alone cannot wake an idle task later. Do not finish the main turn relying on that record to supervise ongoing work.
 
-```sh
-python3 /Users/jlpeng/plugins/codex-pi/runtime/pi_handoff.py status --event-key EVENT_KEY
-```
-
-The `Stop` handler waits locally for at most the registered window (default and maximum four hours). Its host timeout is slightly longer so it can save a recovery result before the host times it out. This is a configured upper bound, not evidence that the desktop application survives every sleep, restart or connection loss for four hours. The worker's timeout remains an independent limit. No repeated model status requests are needed while the hook is waiting.
-
-When a terminal worker result arrives, the hook emits a compact reason containing validated identifiers and exact result/acknowledgement commands. Pi-generated narrative is not injected into the continuation prompt. Execution success, failure, cancellation and worker timeout require review; none is product acceptance.
-
-## Receipt and another round
-
-The main conversation reads the exact result and original evidence needed for review, then acknowledges the delivered handoff. Acknowledgement is receipt only. Group any repair findings, use `pi_task.py continue`, and arm the newly returned round. Never automatically replay implementation because a notification or acknowledgement is missing.
-
-The continuation includes the exact commands. Their general shape is:
+Collect and acknowledge only an actually delivered handoff:
 
 ```sh
 python3 /Users/jlpeng/plugins/codex-pi/runtime/pi_task.py result --repo /absolute/repo --task TASK-1 --round 1
 python3 /Users/jlpeng/plugins/codex-pi/runtime/pi_handoff.py ack --event-key EVENT_KEY
 ```
 
-Acknowledgement belongs to the bound Codex session; another session must not consume it. A new Pi round gets a new registration. Ordinary repeated registration must not undo a user interruption.
+Receipt is not acceptance. Repeated notifications are suppressed; a recorded offer is not proof the host received it. Unknown ownership or a lost supervisor requires diagnosis, not a replacement writer.
 
-After inspecting an interrupted, expired or uncertain registration and resolving its cause, explicitly resume that exact round:
+## Upgrade a task waiting inside a 0.2 Stop hook
+
+Updating plugin files does not change a process already executing the old hook. From the updated canonical runtime, release the exact binding under its owning Codex task identity:
 
 ```sh
-python3 /Users/jlpeng/plugins/codex-pi/runtime/pi_handoff.py arm --repo /absolute/repo --task TASK-1 --round 1 --resume
+python3 /Users/jlpeng/plugins/codex-pi/runtime/pi_handoff.py release --event-key EVENT_KEY --session-id OWNER_CODEX_TASK_ID
 ```
 
-This still uses the current `CODEX_THREAD_ID`. Resume does not reset a delivered or acknowledged notification. Acknowledgement is allowed only after an offer was recorded, and requires the owning session even when the event key is known.
+The operation changes the binding generation/state so the old hook exits its existing local loop. It does not cancel Pi, delete evidence, steal ownership, acknowledge unseen results or change the model. Use an explicit other task id only when the user authorized migrating that task. Verify the old wait exited and a new main-task response appears; sending a message alone is not verification.
 
-Repeated or concurrent hooks do not offer the same round twice. If the process dies after recording an offer but before the host receives it, the unacknowledged record remains visible for recovery; there is no claim of exactly-once host delivery.
+Read the current skill from canonical source in an already-open task, then use canonical `status`/bounded `wait`. Do not replace active frozen helper files or restart an implementation merely for this update. Newly started tasks get the new check markers; old tasks retain partial legacy progress visibility until a later task/helper snapshot.
 
-## Interruption and recovery
+## Interruption, installation and validation
 
-- A user `Interrupt` suspends this session's outstanding handoffs promptly. It does not cancel Pi, resume the user-stopped conversation, or silently re-arm the wait.
-- Hook waiting expiry leaves Pi running. Preserve the exact task and round, inspect the handoff status and worker result on the next authorized action, and explicitly resume only when intended.
-- A worker's own timeout is a terminal failure to collect; it is distinct from the hook's waiting window expiring. Neither is successful acceptance.
-- An orphaned worker, uncertain ownership, invalid record or unavailable result is not a completed task. Recover from the recorded identity and evidence instead of dispatching a duplicate.
-- An application/session shutdown cannot be followed by an unsolicited wake from these scripts. Recovery hooks can inform the next naturally occurring turn; they do not start that turn.
+A real user Interrupt suspends automatic handoff without cancelling Pi. Resume only when the user requests continued work. A status question never means cancel implementation. Keep fault cleanup scoped to owned processes and confirm exit before dispatching a repair in the same Pi session.
 
-Do not add a heartbeat, Codex CLI process or extra model as an implicit fallback.
+Refresh the plugin in the application and review/trust the changed hook definitions. Do not edit managed caches or trust records, call Codex CLI, or introduce a heartbeat/MCP/extra model as a workaround. Async hooks do not start a turn in an idle task.
 
-## Host trust and validation
-
-Update the personal `codex-pi` plugin from its marketplace entry, review the bundled hook commands, and trust the current definitions in the application's hook review interface. Do not edit managed plugin caches or synthesize trust records. A plugin update may require a fresh review.
-
-Subprocess tests exercise the real handler and worker supervisor with controlled Pi processes. A separate real DeepSeek task checks the worker boundary. Neither proves that the desktop loaded, trusted and continued the conversation. Record a desktop continuation only after an actual armed round has returned through the host, preserving its handoff identity and subsequent acknowledgement.
-
-Official contracts: [Stop continuation](https://learn.chatgpt.com/docs/hooks#stop), [Interrupt](https://learn.chatgpt.com/docs/hooks#interrupt), [plugin hook packaging and trust](https://developers.openai.com/plugins/build/plugins).
+Unit tests can prove quick hook return, ownership, waiting limits and duplicate suppression. Desktop acceptance additionally requires a user follow-up during a genuinely running Pi task to reach the main model, a progress response before Pi completion, and eventual single completion handling. Do not label simulated hook invocations as that host test.

@@ -1,5 +1,24 @@
 # 验证记录（2026-09-26）
 
+## 0.3.0 有界等待与两个真实任务迁移
+
+2026-09-26 的桌面事件暴露 0.2 的缺口：Bake 任务在 11:07:07 收到 `turn/steer`，但执行日志停在 10:02，同步 Stop 持续超过 70 分钟；Pi 的测试仍有推进。0.2 的已完成任务续行验证不能证明等待中可响应追问。0.3 改为有界普通工具等待与快速 Stop，并提供旧等待释放、实时检查标记和低成本状态读取。
+
+Pi `deepseek/deepseek-flash` / max 实施提交 `62a516f`、`e65930d`，由当前 Codex 主会话复核并以 `aaf5984`、`5b9a8bb` 接入 canonical 源码。返修始终续用 `RESPONSIVE-WAIT-20260926` 同一 Pi 会话和工作树。主会话维护文档、版本、集成及迁移，没有调用 Codex CLI 或额外 Codex agent；插件未引入 MCP server 或 heartbeat。
+
+验证范围：
+
+- [初版完整 94 项测试](validation/responsive-initial-94-tests.log)通过，覆盖快速 Stop、完成、失败、取消、超时、重复通知、owner 校验、旧 generation 释放与有界等待。该日志来自返修前的工作树，不冒充最终 revision 的全量回执。随后仅状态读取和相应测试发生返修，复用未受影响的生命周期覆盖；插件实施第 1 轮由主会话主动收束重复全套验证，取消记录保留，不计为验收成功。
+- [状态及检查回执 19 项](validation/status-suite-r2-b7c226ab3baa.log)通过；[原始回执](validation/status-suite-r2-b7c226ab3baa.json)的真实退出码和日志 hash 已核对。
+- [最终状态读取 14 项](validation/status-suite-r3-715982a03953.log)通过；[原始回执](validation/status-suite-r3-715982a03953.json)的真实退出码和日志 hash 已核对。覆盖未知退出不冒充成功、超大/损坏元数据、输出上限、陈旧运行标记、旧日志不确定性、活动时间及有界 wait 不取消 Pi。
+- [实际已安装 0.2 hook 兼容释放](validation/old-installed-hook-release-20260926.json)：先确认旧进程正在等待，再调用新版 release，约 0.07 秒退出，离线 Pi 替身仍存活。该项证明旧代码兼容，不当作桌面任务回复证明。
+- 两个真实桌面任务已收到迁移指令。旧 hook PID 36744、71624 均退出；[释放前](validation/live-migration-before-20260926.json)、[释放动作](validation/live-migration-release-20260926.json)和[释放后](validation/live-migration-after-20260926.json)证明两个业务 Pi 的 PID、session、round 与 frozen task hash 保持不变。新 status 读取各约 0.03 秒、输出约 3–6 KB；这是两次观测，不是普遍性能保证。
+- [真实任务回复与调用记录](validation/live-migration-responses-20260926.json)：北京时间 11:39，两任务均重新回复并实际读取 canonical skill、调用 canonical `status`。Harness 报告 Room 对话测试仍超时；Bake 报告 PG 分片待核验。证明本次旧等待释放恢复响应，不证明业务验收通过，也不代替新安装 hook 的终态续行宿主验证。
+- 插件 manifest、collaborate skill、diff whitespace 校验通过。Bake 的项目约束与生成镜像提交 `96e06c3b2`，`make skills`、`make preflight` 通过；Harness 薄约束提交 `af47fef`，skill 与 diff 校验通过，其他工作区改动保留。
+
+发布候选为 `0.3.0+codex.20260926032910`，`runtime/VERSION` 为 `0.3.0`。截至本次验证，应用安装缓存仍为 `0.2.0+codex.20260926015337`。两个现有主任务已直接采用 canonical 0.3 命令；现有 Pi 的冻结 helper 保持 0.2，新的运行标记随新任务快照生效。应用刷新插件及重新审核/信任 hook 仍待用户在 UI 完成；没有手改托管缓存、信任记录或绕过工具限制。新定义的 Stop 上限为 10 秒，正常路径只检查一次；它不能在主任务闲置后独立唤醒模型。可信定义变更需要重新审核，见 [官方 hooks 说明](https://learn.chatgpt.com/docs/hooks)。
+
+
 最终结构为 skill → Python 标准库脚本 → 本机 Pi CLI。没有 MCP server、Node 依赖包或 Codex CLI 调用。
 
 ## 0.2.0 同步 hook

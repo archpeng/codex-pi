@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "id": "status-suite-r3",
+  "argv": [
+    "python3",
+    "-m",
+    "unittest",
+    "test_status",
+    "-v"
+  ],
+  "cwd": "/private/tmp/codex-pi-responsive-20260926/tests",
+  "head": "e65930dbc9bf4e2a1618bda49b3566afe2570b5f",
+  "dirty": false,
+  "tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "started_at": 1790393853.557237,
+  "ended_at": 1790393867.6269062,
+  "exit_code": 0,
+  "timed_out": false,
+  "error": null,
+  "test_counts": null,
+  "log": "status-suite-r3-715982a03953.log",
+  "log_sha256": "4fd7f31354f33d3af92ebe541d3fe908f7a5aed234b0480e735347e766fe62ea",
+  "acceptance": "not_verified"
+}

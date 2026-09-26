@@ -1,0 +1,24 @@
+test_quiet_running_task_is_uncertain_not_failed (test_status.StatusTest.test_quiet_running_task_is_uncertain_not_failed) ... ok
+test_status_bounds_corrupt_and_large_receipt_metadata (test_status.StatusTest.test_status_bounds_corrupt_and_large_receipt_metadata) ... ok
+test_status_counts_failed_attempts_and_never_leaks_argv (test_status.StatusTest.test_status_counts_failed_attempts_and_never_leaks_argv) ... ok
+test_status_ignores_stale_summary_and_never_mutates_evidence (test_status.StatusTest.test_status_ignores_stale_summary_and_never_mutates_evidence) ... ok
+test_status_legacy_unreceipted_log_is_uncertain_and_bounded (test_status.StatusTest.test_status_legacy_unreceipted_log_is_uncertain_and_bounded) ... ok
+test_status_partial_directory_scan_is_truthful (test_status.StatusTest.test_status_partial_directory_scan_is_truthful) ... ok
+test_status_receipt_precedence_and_uncertain_log_candidate (test_status.StatusTest.test_status_receipt_precedence_and_uncertain_log_candidate) ... ok
+test_status_rejects_unknown_task_and_round (test_status.StatusTest.test_status_rejects_unknown_task_and_round) ... ok
+test_status_reports_execution_activity_and_process_identities (test_status.StatusTest.test_status_reports_execution_activity_and_process_identities) ... ok
+test_status_reports_running_check_marker_and_bounded_tail (test_status.StatusTest.test_status_reports_running_check_marker_and_bounded_tail) ... ok
+test_wait_is_bounded_and_returns_compact_status_without_cancelling (test_status.StatusTest.test_wait_is_bounded_and_returns_compact_status_without_cancelling) ... ok
+test_wait_terminal_exact_round_returns_full_result (test_status.StatusTest.test_wait_terminal_exact_round_returns_full_result) ... ok
+test_inner_failure_stays_nonzero_without_wrapper_timeout (test_receipts.ReceiptTest.test_inner_failure_stays_nonzero_without_wrapper_timeout) ... ok
+test_missing_receipts_are_reported_as_absence (test_receipts.ReceiptTest.test_missing_receipts_are_reported_as_absence) ... ok
+test_pi_check_records_true_exit_hash_and_counts (test_receipts.ReceiptTest.test_pi_check_records_true_exit_hash_and_counts) ... ok
+test_reasoning_usage_is_not_added_twice (test_receipts.ReceiptTest.test_reasoning_usage_is_not_added_twice) ... ok
+test_running_marker_is_visible_before_finish_and_removed_after_success (test_receipts.ReceiptTest.test_running_marker_is_visible_before_finish_and_removed_after_success) ... ok
+test_running_marker_removed_after_failure_timeout_and_cancel (test_receipts.ReceiptTest.test_running_marker_removed_after_failure_timeout_and_cancel) ... ok
+test_summary_counts_every_failed_attempt_beyond_display_cap (test_receipts.ReceiptTest.test_summary_counts_every_failed_attempt_beyond_display_cap) ... ok
+
+----------------------------------------------------------------------
+Ran 19 tests in 14.521s
+
+OK

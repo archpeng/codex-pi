@@ -1,0 +1,8 @@
+{
+  "actualOldInstalledHook": "/Users/jlpeng/.codex/plugins/cache/personal/codex-pi/0.2.0+codex.20260926015337/runtime/pi_handoff.py",
+  "oldHookInitiallyWaiting": true,
+  "releaseToExitSeconds": 0.07043574983254075,
+  "piStillAlive": true,
+  "releaseState": "suspended",
+  "acceptance": "migration-mechanism-only"
+}

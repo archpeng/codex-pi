@@ -1,0 +1,19 @@
+test_quiet_running_task_is_uncertain_not_failed (test_status.StatusTest.test_quiet_running_task_is_uncertain_not_failed) ... ok
+test_status_bounds_corrupt_and_large_receipt_metadata (test_status.StatusTest.test_status_bounds_corrupt_and_large_receipt_metadata) ... ok
+test_status_counts_failed_attempts_and_never_leaks_argv (test_status.StatusTest.test_status_counts_failed_attempts_and_never_leaks_argv) ... ok
+test_status_ignores_stale_summary_and_never_mutates_evidence (test_status.StatusTest.test_status_ignores_stale_summary_and_never_mutates_evidence) ... ok
+test_status_legacy_unreceipted_log_is_uncertain_and_bounded (test_status.StatusTest.test_status_legacy_unreceipted_log_is_uncertain_and_bounded) ... ok
+test_status_overflow_metadata_stays_bounded (test_status.StatusTest.test_status_overflow_metadata_stays_bounded) ... ok
+test_status_partial_directory_scan_is_truthful (test_status.StatusTest.test_status_partial_directory_scan_is_truthful) ... ok
+test_status_receipt_precedence_and_uncertain_log_candidate (test_status.StatusTest.test_status_receipt_precedence_and_uncertain_log_candidate) ... ok
+test_status_rejects_unknown_task_and_round (test_status.StatusTest.test_status_rejects_unknown_task_and_round) ... ok
+test_status_reports_execution_activity_and_process_identities (test_status.StatusTest.test_status_reports_execution_activity_and_process_identities) ... ok
+test_status_reports_running_check_marker_and_bounded_tail (test_status.StatusTest.test_status_reports_running_check_marker_and_bounded_tail) ... ok
+test_status_unknown_exit_is_never_latest_successful (test_status.StatusTest.test_status_unknown_exit_is_never_latest_successful) ... ok
+test_wait_is_bounded_and_returns_compact_status_without_cancelling (test_status.StatusTest.test_wait_is_bounded_and_returns_compact_status_without_cancelling) ... ok
+test_wait_terminal_exact_round_returns_full_result (test_status.StatusTest.test_wait_terminal_exact_round_returns_full_result) ... ok
+
+----------------------------------------------------------------------
+Ran 14 tests in 13.916s
+
+OK

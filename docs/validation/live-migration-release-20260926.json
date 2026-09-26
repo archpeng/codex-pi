@@ -1,0 +1,110 @@
+[
+  {
+    "threadId": "01a0d58b-8d1f-7e51-a8ec-8a7559b8661d",
+    "eventKey": "621c47c5e9e4b34d057f4cd2d05033fe6b064ba38e116782a661f805e0d59292",
+    "releaseAt": 1790393952.3568718,
+    "durationSeconds": 0.08818608289584517,
+    "result": {
+      "ok": true,
+      "alreadyReleased": false,
+      "eventKey": "621c47c5e9e4b34d057f4cd2d05033fe6b064ba38e116782a661f805e0d59292",
+      "binding": {
+        "eventKey": "621c47c5e9e4b34d057f4cd2d05033fe6b064ba38e116782a661f805e0d59292",
+        "sessionId": "01a0d58b-8d1f-7e51-a8ec-8a7559b8661d",
+        "repo": "/Users/jlpeng/bussiness/eugl-harness",
+        "task": "DSH-017-upgrade",
+        "round": 2,
+        "state": "suspended",
+        "armedAt": 1790391871.595994,
+        "generation": 2,
+        "observedInterruptGeneration": 1,
+        "waitSeconds": 14400.0,
+        "attempts": 0,
+        "deliveredAt": null,
+        "ackedAt": null,
+        "ackedFromState": null,
+        "suspendedAt": 1790393952.321822,
+        "releaseReason": "released for bounded tool waiting",
+        "releasedAt": 1790393952.321822,
+        "lastWaitExpiredAt": null,
+        "lastCheckedAt": 1790393952.321822,
+        "lastError": "released for bounded tool waiting",
+        "delivery": null,
+        "liveRoundState": {
+          "roundState": "running",
+          "exitCode": null,
+          "timedOut": false,
+          "cancelled": false
+        },
+        "evidence": {
+          "taskDir": "/Users/jlpeng/bussiness/eugl-harness/.git/codex-pi/tasks/DSH-017-upgrade",
+          "roundDir": "/Users/jlpeng/bussiness/eugl-harness/.git/codex-pi/tasks/DSH-017-upgrade/rounds/2",
+          "state": "/Users/jlpeng/bussiness/eugl-harness/.git/codex-pi/tasks/DSH-017-upgrade/rounds/2/round.state.json",
+          "summary": "/Users/jlpeng/bussiness/eugl-harness/.git/codex-pi/tasks/DSH-017-upgrade/rounds/2/round.summary.json",
+          "checksDir": "/Users/jlpeng/bussiness/eugl-harness/.git/codex-pi/tasks/DSH-017-upgrade/rounds/2/round.checks"
+        },
+        "commands": {
+          "status": "python3 /Users/jlpeng/plugins/codex-pi/runtime/pi_handoff.py status --event-key 621c47c5e9e4b34d057f4cd2d05033fe6b064ba38e116782a661f805e0d59292",
+          "ack": "python3 /Users/jlpeng/plugins/codex-pi/runtime/pi_handoff.py ack --event-key 621c47c5e9e4b34d057f4cd2d05033fe6b064ba38e116782a661f805e0d59292",
+          "result": "python3 /Users/jlpeng/bussiness/eugl-harness/.git/codex-pi/tasks/DSH-017-upgrade/tools/pi_task.py result --repo /Users/jlpeng/bussiness/eugl-harness --task DSH-017-upgrade --round 2"
+        },
+        "acceptance": "not_verified"
+      },
+      "note": "released for bounded tool waiting; Pi keeps running, a 0.2 hook sees the generation/state change and exits its wait, and explicit --resume is required to re-arm"
+    }
+  },
+  {
+    "threadId": "01a0d70f-d2f9-7083-8748-f3a4b706f21d",
+    "eventKey": "48b24271d3bacd3e90aff4e8122f523ad07a22dccf0d0d6c7128d2c6e88280e7",
+    "releaseAt": 1790393952.421767,
+    "durationSeconds": 0.06487229187041521,
+    "result": {
+      "ok": true,
+      "alreadyReleased": false,
+      "eventKey": "48b24271d3bacd3e90aff4e8122f523ad07a22dccf0d0d6c7128d2c6e88280e7",
+      "binding": {
+        "eventKey": "48b24271d3bacd3e90aff4e8122f523ad07a22dccf0d0d6c7128d2c6e88280e7",
+        "sessionId": "01a0d70f-d2f9-7083-8748-f3a4b706f21d",
+        "repo": "/Users/jlpeng/works/eugl-bake-pos-recovery-bake03",
+        "task": "BAKE-WH-CLOSE-P2-C2",
+        "round": 1,
+        "state": "suspended",
+        "armedAt": 1790388111.1548932,
+        "generation": 2,
+        "observedInterruptGeneration": 0,
+        "waitSeconds": 14400.0,
+        "attempts": 0,
+        "deliveredAt": null,
+        "ackedAt": null,
+        "ackedFromState": null,
+        "suspendedAt": 1790393952.389976,
+        "releaseReason": "released for bounded tool waiting",
+        "releasedAt": 1790393952.389976,
+        "lastWaitExpiredAt": null,
+        "lastCheckedAt": 1790393952.389976,
+        "lastError": "released for bounded tool waiting",
+        "delivery": null,
+        "liveRoundState": {
+          "roundState": "running",
+          "exitCode": null,
+          "timedOut": false,
+          "cancelled": false
+        },
+        "evidence": {
+          "taskDir": "/Users/jlpeng/works/eugl-bake-pos-recovery/.git/codex-pi/tasks/BAKE-WH-CLOSE-P2-C2",
+          "roundDir": "/Users/jlpeng/works/eugl-bake-pos-recovery/.git/codex-pi/tasks/BAKE-WH-CLOSE-P2-C2/rounds/1",
+          "state": "/Users/jlpeng/works/eugl-bake-pos-recovery/.git/codex-pi/tasks/BAKE-WH-CLOSE-P2-C2/rounds/1/round.state.json",
+          "summary": "/Users/jlpeng/works/eugl-bake-pos-recovery/.git/codex-pi/tasks/BAKE-WH-CLOSE-P2-C2/rounds/1/round.summary.json",
+          "checksDir": "/Users/jlpeng/works/eugl-bake-pos-recovery/.git/codex-pi/tasks/BAKE-WH-CLOSE-P2-C2/rounds/1/round.checks"
+        },
+        "commands": {
+          "status": "python3 /Users/jlpeng/plugins/codex-pi/runtime/pi_handoff.py status --event-key 48b24271d3bacd3e90aff4e8122f523ad07a22dccf0d0d6c7128d2c6e88280e7",
+          "ack": "python3 /Users/jlpeng/plugins/codex-pi/runtime/pi_handoff.py ack --event-key 48b24271d3bacd3e90aff4e8122f523ad07a22dccf0d0d6c7128d2c6e88280e7",
+          "result": "python3 /Users/jlpeng/works/eugl-bake-pos-recovery/.git/codex-pi/tasks/BAKE-WH-CLOSE-P2-C2/tools/pi_task.py result --repo /Users/jlpeng/works/eugl-bake-pos-recovery-bake03 --task BAKE-WH-CLOSE-P2-C2 --round 1"
+        },
+        "acceptance": "not_verified"
+      },
+      "note": "released for bounded tool waiting; Pi keeps running, a 0.2 hook sees the generation/state change and exits its wait, and explicit --resume is required to re-arm"
+    }
+  }
+]

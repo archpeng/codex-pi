@@ -1,0 +1,35 @@
+{
+  "recordedAt": 1790393970.640171,
+  "targets": [
+    {
+      "threadId": "01a0d58b-8d1f-7e51-a8ec-8a7559b8661d",
+      "oldHookGone": true,
+      "state": "running",
+      "round": 2,
+      "piPid": 36528,
+      "samePiPid": true,
+      "supervisorPid": 36523,
+      "sameSession": true,
+      "sameFrozenTask": true,
+      "ownership": {
+        "activeWorker": true,
+        "supervisorAlive": true
+      }
+    },
+    {
+      "threadId": "01a0d70f-d2f9-7083-8748-f3a4b706f21d",
+      "oldHookGone": true,
+      "state": "running",
+      "round": 1,
+      "piPid": 60075,
+      "samePiPid": true,
+      "supervisorPid": 60073,
+      "sameSession": true,
+      "sameFrozenTask": true,
+      "ownership": {
+        "activeWorker": true,
+        "supervisorAlive": true
+      }
+    }
+  ]
+}
