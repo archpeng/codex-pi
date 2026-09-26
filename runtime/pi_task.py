@@ -37,7 +37,7 @@ sys.dont_write_bytecode = True
 
 import pi_phase
 from pi_phase import contract_hash, contract_view, load_contract, validate_contract
-from pi_size import sanitize_snapshot
+from pi_size import measure, sanitize_snapshot
 from pi_summary import bounded, compact, read_meta, summarize
 
 SCHEMA_VERSION = 1
@@ -69,6 +69,9 @@ MAX_VERIFY_LOG_BYTES = 33_554_432
 MAX_VERIFY_TOTAL_BYTES = 67_108_864
 MAX_SCOPE_DIFF_FILES = 600
 MIN_AUTO_CONTINUE_SECONDS = 60.0
+RESOURCE_STATE_FILE = "resource.state.json"
+RESOURCE_SCAN_SECONDS = 15.0
+RESOURCE_UNKNOWN_SECONDS = 120.0
 FULL_OID_RE = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\Z")
 PHASE_TERMINAL_STATES = ("completed", "failed", "timed_out", "cancelled", "interrupted")
 CONFIG_KEYS = ("schemaVersion", "model", "thinking", "constraints", "checks",
@@ -503,6 +506,245 @@ def _resolve_baseline(worktree: Path, baseline: str) -> str:
     return resolved.lower()
 
 
+def _limit_target(worktree: Path, declared: str):
+    """Resolve one declared resource path inside the worktree without symlinks.
+
+    Returns ``(absolute_path, None)`` or ``(None, problem)``. Traversal and any
+    symlink component are rejected so a later no-follow measurement cannot be
+    redirected outside the task worktree.
+    """
+    if not isinstance(declared, str) or not declared.strip():
+        return None, "resource limit path is empty"
+    base = Path(os.path.normpath(str(Path(worktree).resolve())))
+    candidate = Path(os.path.expanduser(declared.strip()))
+    if not candidate.is_absolute():
+        candidate = base / candidate
+    candidate = Path(os.path.normpath(str(candidate)))
+    try:
+        relative = candidate.relative_to(base)
+    except ValueError:
+        return None, f"resource limit path {declared!r} is outside the task worktree"
+    if ".." in relative.parts:
+        return None, f"resource limit path {declared!r} escapes the task worktree"
+    current = base
+    for part in relative.parts:
+        current = current / part
+        if os.path.islink(current):
+            return None, f"resource limit path {declared!r} uses a symlink component"
+    return candidate, None
+
+
+def validate_resource_limits(contract: dict, worktree: Path) -> None:
+    """Reject a phase contract whose declared resource paths can leave the worktree."""
+    for index, limit in enumerate(contract.get("resourceLimits") or []):
+        _target, problem = _limit_target(worktree, limit.get("path"))
+        if problem is not None:
+            raise ValueError(f"phase contract resourceLimits[{index}]: {problem}")
+
+
+def _resource_scan_seconds() -> float:
+    raw = os.environ.get("CODEX_PI_RESOURCE_SCAN_SECONDS")
+    try:
+        value = float(raw) if raw else RESOURCE_SCAN_SECONDS
+    except (TypeError, ValueError):
+        value = RESOURCE_SCAN_SECONDS
+    return value if 0.05 <= value <= 60.0 else RESOURCE_SCAN_SECONDS
+
+
+def _resource_unknown_seconds() -> float:
+    raw = os.environ.get("CODEX_PI_RESOURCE_UNKNOWN_SECONDS")
+    try:
+        value = float(raw) if raw else RESOURCE_UNKNOWN_SECONDS
+    except (TypeError, ValueError):
+        value = RESOURCE_UNKNOWN_SECONDS
+    return value if 0.1 <= value <= 1800.0 else RESOURCE_UNKNOWN_SECONDS
+
+
+def _sanitize_resource_state(value, path_limit: int = 400):
+    """Bound one persisted resource observation for status/readiness consumers."""
+    if not isinstance(value, dict):
+        return None
+    allowed_status = ("none", "ok", "unknown", "breached", "escalated")
+    status = value.get("status")
+    if not isinstance(status, str) or status not in allowed_status:
+        status = "unknown"
+    reason = value.get("reason")
+    out = {"schemaVersion": 1, "status": status,
+           "reason": reason[:300] if isinstance(reason, str) else None,
+           "updatedAt": _number(value.get("updatedAt")),
+           "finalScannedAt": _number(value.get("finalScannedAt")), "limits": []}
+    limits = value.get("limits")
+    if isinstance(limits, list):
+        for entry in limits[:20]:
+            if not isinstance(entry, dict):
+                continue
+            observed = entry.get("observedBytes")
+            max_bytes = entry.get("maxBytes")
+            scans = entry.get("scans")
+            out["limits"].append({
+                "declared": entry.get("declared")[:path_limit]
+                if isinstance(entry.get("declared"), str) else None,
+                "path": entry.get("path")[:path_limit]
+                if isinstance(entry.get("path"), str) else None,
+                "maxBytes": max_bytes if isinstance(max_bytes, int)
+                and not isinstance(max_bytes, bool) and max_bytes > 0 else None,
+                "observedBytes": observed if isinstance(observed, int)
+                and not isinstance(observed, bool) and observed >= 0 else None,
+                "breached": bool(entry.get("breached")),
+                "breachBasis": entry.get("breachBasis")
+                if entry.get("breachBasis") in ("complete", "partial lower bound") else None,
+                "unknown": bool(entry.get("unknown")),
+                "escalated": bool(entry.get("escalated")),
+                "scans": scans if isinstance(scans, int) and not isinstance(scans, bool)
+                and 0 <= scans <= 10 ** 9 else None,
+                "reason": entry.get("reason")[:300]
+                if isinstance(entry.get("reason"), str) else None,
+            })
+    return out
+
+
+def read_resource_state(round_dir: Path):
+    path = round_dir / RESOURCE_STATE_FILE
+    if not path.is_file():
+        return None
+    return _sanitize_resource_state(read_json(path, None))
+
+
+class PhaseResourceMonitor:
+    """Durable per-round observer for the contract's declared resource limits.
+
+    Measurements are bounded and never follow symlinks. A known overage,
+    including a partial lower bound already over the cap, or an unknown
+    measurement that persists past the escalation window returns a stop reason;
+    the supervisor then stops only its own Pi process group. Incomplete or
+    unreadable evidence stays unknown and is never treated as under budget.
+    """
+
+    def __init__(self, round_dir: Path, worktree: Path, limits: list,
+                 phase_id=None, unknown_seconds: float = RESOURCE_UNKNOWN_SECONDS):
+        self.worktree = Path(worktree)
+        self.unknown_seconds = float(unknown_seconds)
+        self.path = round_dir / RESOURCE_STATE_FILE
+        self._stop_reason = None
+        entries = []
+        for limit in limits:
+            declared = limit.get("path") if isinstance(limit, dict) else None
+            max_bytes = limit.get("maxBytes") if isinstance(limit, dict) else None
+            target, problem = _limit_target(self.worktree, declared)
+            entries.append({
+                "declared": declared,
+                "path": str(target) if target is not None else None,
+                "maxBytes": max_bytes, "observedBytes": None, "breached": False,
+                "breachBasis": None, "unknown": False, "unknownSince": None,
+                "escalated": False, "scans": 0, "unknownScans": 0,
+                "complete": None, "reason": problem,
+            })
+        self._state = {"schemaVersion": 1, "phaseId": phase_id,
+                       "status": "ok" if entries else "none", "reason": None,
+                       "updatedAt": time.time(), "finalScannedAt": None, "limits": entries}
+        self._write()
+
+    def _write(self) -> None:
+        try:
+            atomic(self.path, self._state)
+        except OSError:
+            pass
+
+    def scan(self, final: bool = False):
+        now = time.time()
+        for entry in self._state["limits"]:
+            entry["scans"] += 1
+            target, problem = _limit_target(self.worktree, entry.get("declared"))
+            if problem is not None:
+                entry.update(path=None, unknown=True, complete=False, reason=problem)
+                entry["unknownScans"] += 1
+                if entry.get("unknownSince") is None:
+                    entry["unknownSince"] = now
+                if now - entry["unknownSince"] >= self.unknown_seconds:
+                    entry["escalated"] = True
+                    entry["reason"] = (
+                        f"resource measurement stayed unknown for "
+                        f"{now - entry['unknownSince']:.1f}s; the declared cap cannot be verified")
+                continue
+            entry["path"] = str(target)
+            try:
+                measurement = measure(target)
+            except Exception as exc:  # noqa: BLE001 - unknown must never strand the round
+                entry.update(unknown=True, complete=False,
+                             reason=f"measurement failed: {type(exc).__name__}: {exc}"[:300])
+                continue
+            observed = measurement.get("bytes")
+            if isinstance(observed, int) and not isinstance(observed, bool):
+                if entry.get("observedBytes") is None or observed > entry["observedBytes"]:
+                    entry["observedBytes"] = observed
+                if observed > entry["maxBytes"]:
+                    entry["breached"] = True
+                    entry["breachBasis"] = ("complete" if measurement.get("complete")
+                                            else "partial lower bound")
+                    entry["reason"] = (
+                        f"observed at least {observed} bytes under {entry['declared']} exceed "
+                        f"the declared max_bytes {entry['maxBytes']}"
+                        + ("" if measurement.get("complete") else " (partial lower bound)"))
+            missing = (not measurement.get("exists")
+                       and measurement.get("reason") == "path does not exist")
+            unknown = bool(measurement.get("unknown")) and not missing
+            entry["complete"] = bool(measurement.get("complete")) or missing
+            if unknown:
+                entry["unknown"] = True
+                entry["unknownScans"] += 1
+                if entry.get("unknownSince") is None:
+                    entry["unknownSince"] = now
+                if not entry.get("breached"):
+                    entry["reason"] = measurement.get("reason") or "measurement is incomplete"
+                if now - entry["unknownSince"] >= self.unknown_seconds:
+                    entry["escalated"] = True
+                    entry["reason"] = (
+                        f"resource measurement stayed unknown for "
+                        f"{now - entry['unknownSince']:.1f}s; the declared cap cannot be verified")
+            else:
+                entry["unknown"] = False
+                entry["unknownSince"] = None
+                if not entry.get("breached") and not entry.get("escalated"):
+                    entry["reason"] = None
+        self._summarize(now)
+        if final:
+            self._state["finalScannedAt"] = now
+        self._write()
+        return self._stop_reason
+
+    def _summarize(self, now: float) -> None:
+        limits = self._state["limits"]
+        if not limits:
+            self._state.update(status="none", reason=None)
+        elif any(entry.get("breached") for entry in limits):
+            self._state["status"] = "breached"
+        elif any(entry.get("escalated") for entry in limits):
+            self._state["status"] = "escalated"
+        elif any(entry.get("unknown") for entry in limits):
+            self._state["status"] = "unknown"
+        else:
+            self._state["status"] = "ok"
+        self._state["updatedAt"] = now
+        reasons = [entry.get("reason") for entry in limits if entry.get("reason")]
+        self._state["reason"] = reasons[0] if reasons else None
+        if self._stop_reason is None:
+            if self._state["status"] == "breached":
+                self._stop_reason = (self._state["reason"]
+                                     or "declared phase resource limit exceeded")
+            elif self._state["status"] == "escalated":
+                self._stop_reason = (self._state["reason"]
+                                     or "declared phase resource measurement is unknown")
+
+    def state(self) -> dict:
+        return self._state
+
+    def final_scan(self):
+        return self.scan(final=True)
+
+    def snapshot(self) -> dict:
+        return _sanitize_resource_state(self._state) or {}
+
+
 def install_phase_contract(task_dir: Path, raw, root: Path, worktree: Path,
                            prior: dict | None = None) -> dict:
     """Validate, freeze and record one phase contract plus its budget anchor.
@@ -512,6 +754,7 @@ def install_phase_contract(task_dir: Path, raw, root: Path, worktree: Path,
     original start time (the total phase budget is never silently reset).
     """
     contract = validate_contract(raw, root)
+    validate_resource_limits(contract, worktree)
     digest = contract_hash(contract)
     record = {"schemaVersion": 1, "contract": contract, "contractSha256": digest,
               "baselineCommit": _resolve_baseline(worktree, contract["baseline"]),
@@ -1195,6 +1438,8 @@ def build_phase_snapshot(task_dir: Path, task: dict, round_number: int, *, state
     writer_free = (not lock_is_held(task_dir / ".task.lock")
                    and not lock_is_held(task_dir / ".supervisor.lock"))
     progress_record = read_progress(round_dir)
+    resource = read_resource_state(round_dir)
+    resource_status = (resource or {}).get("status")
     receipts = checks.get("receipts") or {}
     scan_partial = bool(checks.get("partial") or receipts.get("truncated")
                         or receipts.get("partial"))
@@ -1203,6 +1448,10 @@ def build_phase_snapshot(task_dir: Path, task: dict, round_number: int, *, state
     status, reason = "unknown", None
     if candidate.get("status") != "known":
         status, reason = "unknown", candidate.get("reason")
+    elif resource_status in ("breached", "escalated"):
+        status = "not_ready"
+        reason = (f"declared phase resource limit is {resource_status}: "
+                  f"{(resource or {}).get('reason') or 'resource evidence is not under budget'}")
     elif execution_status != "ok":
         status = "not_ready" if execution_status in ("failed", "not_terminal") else "unknown"
         reason = execution_reason
@@ -1212,10 +1461,17 @@ def build_phase_snapshot(task_dir: Path, task: dict, round_number: int, *, state
         status, reason = "not_ready", "required acceptance evidence is not fully covered"
     elif scope.get("status") == "unknown":
         status, reason = "unknown", scope.get("reason") or "scope check is unknown"
+    elif resource_status == "unknown":
+        status = "not_ready"
+        reason = ("declared phase resource measurement is unknown: "
+                  f"{(resource or {}).get('reason') or 'an incomplete measurement is never under budget'}")
     elif scan_partial:
         status, reason = "unknown", "the bounded check scan was partial or truncated"
     else:
         status, reason = "ready", "all required evidence is covered for the candidate"
+    if resource_status in ("breached", "escalated", "unknown"):
+        notes.append(f"phase resource evidence is {resource_status}: "
+                     f"{(resource or {}).get('reason') or 'not verified under budget'}")
     if execution_status != "ok":
         notes.append(f"execution gate: {execution_reason}")
     if scope.get("status") == "violation":
@@ -1230,6 +1486,8 @@ def build_phase_snapshot(task_dir: Path, task: dict, round_number: int, *, state
                  "scope": scope.get("status"), "writerFree": writer_free,
                  "readyForReview": ready_for_review, "generatedAt": time.time(),
                  "checkedItems": len(items),
+                 "resource": {"status": resource_status,
+                              "reason": (resource or {}).get("reason")},
                  "execution": {"ok": execution_ok, "status": execution_status,
                                "reason": execution_reason}}
     return {
@@ -1249,6 +1507,7 @@ def build_phase_snapshot(task_dir: Path, task: dict, round_number: int, *, state
                                "reason": execution_reason}},
         "checksDir": str(checks_dir),
         "scanPartial": scan_partial,
+        "resource": resource,
         "verificationBudget": budget,
         "items": items,
         "coverage": coverage,
@@ -1327,6 +1586,7 @@ def build_readiness(task_dir: Path, task: dict, round_number: int) -> dict:
         "execution": snapshot["execution"],
         "items": snapshot["items"], "gaps": snapshot["gaps"], "coverage": snapshot["coverage"],
         "scope": snapshot["scope"], "budget": phase_budget(task_dir),
+        "resource": snapshot.get("resource"),
         "writerFree": snapshot["readiness"]["writerFree"],
         "checksDir": snapshot["checksDir"], "acceptance": "not_verified",
         "generatedAt": snapshot["readiness"]["generatedAt"],
@@ -1388,6 +1648,13 @@ def evaluate_auto_continue(task: dict, task_dir: Path, round_number: int,
                 "autoContinue": None, "detail": None}
     if readiness.get("status") == "ready":
         return {**decision, "action": "review", "reason": "ready"}
+    resource = readiness.get("resource") or {}
+    if resource.get("status") == "breached":
+        return {**decision, "action": "escalate", "reason": "resource_breached",
+                "detail": resource}
+    if resource.get("status") in ("unknown", "escalated"):
+        return {**decision, "action": "escalate", "reason": "resource_unknown",
+                "detail": resource}
     scope = readiness.get("scope") or {}
     if scope.get("status") == "violation":
         return {**decision, "action": "escalate", "reason": "scope_violation",
@@ -1905,10 +2172,21 @@ def run_worker(args) -> int:
                 "--no-extensions", "--no-skills", "--no-prompt-templates",
                 "@" + str(round_dir / "brief.md")]
 
+        resource_monitor = None
+        phase_record, _phase_problem = read_phase_record(task_dir)
+        if isinstance(phase_record, dict):
+            resource_contract = phase_record.get("contract") or {}
+            declared_limits = resource_contract.get("resourceLimits") or []
+            if declared_limits:
+                resource_monitor = PhaseResourceMonitor(
+                    round_dir, worktree, declared_limits,
+                    resource_contract.get("phaseId"), _resource_unknown_seconds())
+
         child = None
         outcome, code = "failed", 1
         timed_out = cancelled = False
         error = None
+        resource_stop_reason = None
         caught = {"signal": None}
 
         def interrupted(sig, _frame):
@@ -1929,6 +2207,8 @@ def run_worker(args) -> int:
             deadline = time.monotonic() + timeout_seconds
             board_interval = board_refresh_seconds()
             last_board_refresh = time.monotonic() - board_interval
+            resource_interval = _resource_scan_seconds()
+            last_resource_scan = time.monotonic() - resource_interval
             while True:
                 raw = child.poll()
                 if raw is not None:
@@ -1942,6 +2222,16 @@ def run_worker(args) -> int:
                     timed_out, outcome, code = True, "timed_out", 124
                     break
                 now = time.monotonic()
+                if resource_monitor is not None \
+                        and now - last_resource_scan >= resource_interval:
+                    last_resource_scan = now
+                    stop_reason = resource_monitor.scan()
+                    if stop_reason:
+                        resource_stop_reason = stop_reason
+                        error = error or stop_reason
+                        terminate(child)
+                        outcome, code = "failed", 75
+                        break
                 if now - last_board_refresh >= board_interval:
                     last_board_refresh = now
                     refresh_board_best_effort(task)
@@ -1967,8 +2257,20 @@ def run_worker(args) -> int:
 
         if cancelled:
             atomic(task_dir / "cancel.observed", {"round": round_number, "at": time.time()})
+        resource_flags = {}
+        if resource_monitor is not None:
+            final_stop = resource_monitor.final_scan()
+            resource_state = resource_monitor.state()
+            if resource_state.get("status") == "breached":
+                resource_flags["resourceBreached"] = True
+            if resource_state.get("status") in ("unknown", "escalated"):
+                resource_flags["resourceUnknown"] = True
+            if resource_stop_reason or final_stop:
+                resource_flags["resourceReason"] = resource_stop_reason or final_stop
+                error = error or resource_flags["resourceReason"]
         finish_round(task_dir, round_number, round_dir, task, state, outcome, code,
-                     {"timedOut": timed_out, "cancelled": cancelled, "error": error})
+                     {"timedOut": timed_out, "cancelled": cancelled, "error": error,
+                      **resource_flags})
         next_round = None
         try:
             next_round = post_round_phase(task, task_dir, round_number, round_dir, state, outcome)
@@ -2042,6 +2344,7 @@ def cmd_start(args) -> dict:
         # Validate fully before any task directory or evidence is created.
         if isinstance(contract_raw, dict):
             contract_raw = validate_contract(contract_raw, root)
+            validate_resource_limits(contract_raw, worktree)
             _resolve_baseline(worktree, contract_raw["baseline"])
     state = state_root(common)
     tasks_dir = state / "tasks"
@@ -2140,6 +2443,7 @@ def cmd_continue(args) -> dict:
         contract_raw = load_contract(args.contract_file)
         if isinstance(contract_raw, dict):
             contract_raw = validate_contract(contract_raw, root)
+            validate_resource_limits(contract_raw, worktree)
     state = state_root(common)
 
     admission = lock_fd(state / ".admission.lock", blocking=True, timeout=30)
@@ -2343,7 +2647,7 @@ STATUS_MAX_LINE = 400
 CHECK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,99}\Z")
 LOG_DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
 VALID_COUNT_KEYS = ("run", "pass", "fail", "skip")
-VALID_COUNT_FORMATS = ("go_verbose_top_level",)
+VALID_COUNT_FORMATS = ("go_verbose_top_level", "python_unittest_summary")
 MAX_COUNT_VALUE = 10 ** 12
 
 

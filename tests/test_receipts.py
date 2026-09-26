@@ -225,6 +225,49 @@ class ReceiptTest(unittest.TestCase):
         self.assertFalse(receipt["timed_out"])
         self.assertIsNone(receipt["error"])
 
+    def test_python_unittest_counts_positive_failure_and_skip(self):
+        (self.tmp / "sample_ok.py").write_text(
+            "import unittest\n\nclass Sample(unittest.TestCase):\n"
+            "    def test_one(self):\n        self.assertTrue(True)\n"
+            "    def test_two(self):\n        self.assertEqual(2, 2)\n",
+            encoding="utf-8")
+        ok = self.run_pi_check("py-ok", sys.executable, "-m", "unittest", "-v", "sample_ok")
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        receipt = json.loads(Path(json.loads(ok.stdout)["receipt"]).read_text(encoding="utf-8"))
+        self.assertEqual(receipt["test_counts"],
+                         {"run": 2, "pass": 2, "fail": 0, "skip": 0,
+                          "format": "python_unittest_summary"})
+
+        (self.tmp / "sample_bad.py").write_text(
+            "import unittest\n\nclass Sample(unittest.TestCase):\n"
+            "    def test_fail(self):\n        self.assertEqual(1, 2)\n"
+            "    def test_skip(self):\n        self.skipTest('later')\n",
+            encoding="utf-8")
+        bad = self.run_pi_check("py-bad", sys.executable, "-m", "unittest", "-v", "sample_bad")
+        self.assertNotEqual(bad.returncode, 0)
+        receipt = json.loads(Path(json.loads(bad.stdout)["receipt"]).read_text(encoding="utf-8"))
+        self.assertEqual(receipt["test_counts"]["run"], 2)
+        self.assertEqual(receipt["test_counts"]["fail"], 1)
+        self.assertEqual(receipt["test_counts"]["skip"], 1)
+        self.assertEqual(receipt["test_counts"]["format"], "python_unittest_summary")
+
+    def test_python_unittest_zero_and_ambiguous_summaries_stay_explicit(self):
+        zero = self.run_pi_check(
+            "py-zero", sys.executable, "-c",
+            "print('Ran 0 tests in 0.000s'); print(); print('OK')")
+        self.assertEqual(zero.returncode, 0, zero.stderr)
+        receipt = json.loads(Path(json.loads(zero.stdout)["receipt"]).read_text(encoding="utf-8"))
+        self.assertEqual(receipt["test_counts"]["run"], 0)
+        self.assertEqual(receipt["test_counts"]["fail"], 0)
+        self.assertEqual(receipt["test_counts"]["skip"], 0)
+
+        ambiguous = self.run_pi_check(
+            "py-ambiguous", sys.executable, "-c",
+            "print('Ran 2 tests in 0.010s')")
+        self.assertEqual(ambiguous.returncode, 0, ambiguous.stderr)
+        receipt = json.loads(Path(json.loads(ambiguous.stdout)["receipt"]).read_text(encoding="utf-8"))
+        self.assertIsNone(receipt["test_counts"])
+
 
 if __name__ == "__main__":
     unittest.main()

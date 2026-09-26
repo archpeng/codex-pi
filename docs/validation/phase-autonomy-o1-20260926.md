@@ -6,8 +6,10 @@
 
 阶段状态（2026-09-26 发布准备时点）：O1 已由 GPT 主会话按候选 `7331da9` 接受；O2 已在独立
 受控夹具中完成真实两轮任务并由 GPT 接受（结果与限制见
-[o2-eventfold-20260926.md](o2-eventfold-20260926.md)）；O3 正式安装、托管缓存与业务任务迁移
-仍未进行，属于发布准备之后的宿主动作。
+[o2-eventfold-20260926.md](o2-eventfold-20260926.md)）；O3 候选 `e65ca30` 已被接受；O4 已在
+同一候选之上完成同候选 review 续发、阶段资源上限与 Python 计数加固并有测试证据（见
+[o4-release-hardening-20260926.md](o4-release-hardening-20260926.md)），等待主会话审查；正式
+安装、托管缓存与业务任务迁移仍未进行，属于发布准备之后的宿主动作。
 
 ## 已实现（本阶段源码）
 
@@ -91,6 +93,19 @@ python3 runtime/pi_task.py continue --repo REPO --task TASK \
   `round.checks/`，不因后续成功而删除。
 - board、事件、`readiness` 与 `decide accept` 继续消费同一个规范化判定；`accept` 重读实时快照，
   因此已生成的旧 review 事件在回执失效后会被拒绝。
+
+### O4 增补：同候选续发、资源上限与 Python 计数
+
+- ready review 事件带持久 `reviewEpisode`；仅当同一候选的 pending review 被失效时递增，恢复后
+  最多续发一条新 review，重复刷新幂等，旧事件保持 superseded，`decide accept` 只能绑定新事件。
+- 契约 `resourceLimits` 的每个路径在 `start`/`continue` 时校验位于 worktree 内且无 symlink 中间
+  组件；执行期由 supervisor 独立于 board 刷新周期每 ≤60 秒 no-follow 测量并持久高水位，终态再测
+  一次。已知超限（含部分扫描下界）只终止所属 Pi 进程组并产生 `resource_breached` 阻塞事实；
+  持续 ≥2 分钟的测量未知升级为 `resource_unknown`；不确定性绝不当作预算内。边界：只覆盖声明路径
+  和持续可观测的写入，不保证任意外部写入或 supervisor 死亡。
+- `pi_check` 同时解析 unittest 最终摘要（run/pass/fail/skip，`python_unittest_summary`），Go
+  解析不变；`minRun`/`forbidSkip` 对缺失/零/跳过/失败保持 unknown/failed/skipped 语义，不假通过。
+- 详细证据与边界见 [o4-release-hardening-20260926.md](o4-release-hardening-20260926.md)。
 
 ### 兼容与边界
 

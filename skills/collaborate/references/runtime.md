@@ -63,13 +63,20 @@ the item's declared command and a wrapper deadline within the contract's `comman
 a known command or timeout mismatch can never cover the item, missing or contradictory
 identity/timing stays unknown, and every consumer uses that one verdict. The generated phase brief
 uses that per-command cap while a legacy task keeps the project round-timeout example; the
-whole-round supervisor timeout is a separate limit. `accept` re-reads the live status and
+whole-round supervisor timeout is a separate limit. A ready review event carries a durable episode
+id: invalidating and recovering the same round/candidate publishes exactly one new review event,
+unchanged refreshes stay idempotent, the old event stays superseded, and `accept` binds only the
+new event. `pi_check` also reports run/pass/fail/skip for a final `unittest` summary (Go verbose
+counts unchanged); `minRun`/`forbidSkip` stay unknown/skipped/failed when that summary is missing,
+zero, skipped or failing. `accept` re-reads the live status and
 refuses when the round, contract revision, candidate, readiness, worktree HEAD or writer-free state
 no longer match the stored event. Tasks without a
 contract keep the legacy review path. O1 is accepted at candidate `7331da9`; O2 ran a real two-round
 fixture (R1 `changes_requested`, same-session R2 accepted) documented in
-[o2-eventfold-20260926.md](../../docs/validation/o2-eventfold-20260926.md); formal O3 installation and
-business-task migration are still pending. See
+[o2-eventfold-20260926.md](../../docs/validation/o2-eventfold-20260926.md); O3 is accepted at
+`e65ca30`; O4 hardening is documented in
+[o4-release-hardening-20260926.md](../../docs/validation/o4-release-hardening-20260926.md) and
+awaits review; formal installation and business-task migration are still pending. See
 [docs/validation/phase-autonomy-o1-20260926.md](../../docs/validation/phase-autonomy-o1-20260926.md)
 for operations and the current verification boundary.
 
@@ -84,6 +91,8 @@ python3 /absolute/task/tools/pi_copy.py /absolute/source /absolute/new-destinati
 ```
 
 Replace example commands and limits with meaningful project budgets. A running marker reports wrapper start, actual deadline, child identity and optional directory guard. Final immutable receipts bind command, revision, exit and log hash. Failed, skipped, interrupted, unknown or zero-test attempts never become a pass. The command timeout and whole Pi round timeout are separate. For a phase task the per-command `--timeout-seconds` must not exceed the contract's `commandTimeoutSeconds`; a receipt outside that bound or with a different command can never cover its acceptance item.
+
+For a phase task with `resourceLimits`, the supervisor additionally measures every declared in-worktree path at most every 60 seconds while Pi runs and once at termination, using the no-follow high-water state under the round directory; it validates the path cannot escape the worktree through `..` or symlink components. A known overage (even a partial lower bound already over the cap) stops only the owned Pi process group and makes the phase not ready; a measurement unknown for two minutes escalates the same way. Incomplete or unreadable evidence is never under budget. This covers declared paths and persistently observable writes, not arbitrary external writes or a dead supervisor.
 
 Directory guards measure declared regular-file bytes without following symlinks. An observed known breach stops only the owned command group and records the failure; an incomplete measurement stays unknown. The copy helper preserves literal symlinks and refuses existing destinations, recursion, known overages or unknown verification. These rules prevent the 14 MB → 6.5 GB expansion incident without asking the main model to poll.
 

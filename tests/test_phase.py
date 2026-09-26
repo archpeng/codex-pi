@@ -1490,6 +1490,258 @@ class PhaseTest(unittest.TestCase):
         self.assertAlmostEqual(state["budgetSeconds"], 1800, delta=1)
         self.assertAlmostEqual(state["deadlineAt"] - state["startedAt"], 1800, delta=1)
 
+    # ------------------------------------------------------------------
+    # O4 review-episode liveness, resource limits and Python counts
+    # ------------------------------------------------------------------
+    def test_review_event_renews_after_invalidation_with_a_fresh_receipt(self):
+        fixture = self.ready_accept_fixture("renew-receipt", "P-RENEW1")
+        repo, env = fixture["repo"], fixture["env"]
+        task, candidate = "renew-receipt", fixture["candidate"]
+        checks = repo.task_dir(task) / "rounds" / "1" / "round.checks"
+        first = fixture["review"]
+
+        def readiness():
+            return cli_json("readiness", "--repo", str(repo.root), "--task", task,
+                            "--round", "1", env=env)
+
+        # Invalidate: a newer receipt with a different argv fails the item, so
+        # the pending review event is superseded and the ready episode closes.
+        self.synth_receipt(checks, "A1", 0, candidate, argv=["python3", "-c", "other"])
+        self.assertEqual(readiness()["items"][0]["status"], "failed")
+        self.refresh(repo, task, env)
+        self.assertEqual(self.pending(repo, task, "review_required"), [])
+        self.assertTrue(self.pending(repo, task, "phase_blocked"))
+
+        # A fresh valid receipt on the SAME round/candidate renews one episode.
+        self.synth_receipt(checks, "A1", 0, candidate, command=fixture["command"])
+        self.assertEqual(readiness()["status"], "ready")
+        self.refresh(repo, task, env)
+        renewed = self.pending(repo, task, "review_required")
+        self.assertEqual(len(renewed), 1)
+        self.assertNotEqual(renewed[0]["id"], first["id"])
+        self.assertEqual(self.card(repo, task)["handled"][first["id"]]["decision"],
+                         "superseded")
+
+        # Unchanged repeated refreshes stay idempotent.
+        revision = json.loads((repo.state_dir / "board.json").read_text(encoding="utf-8"))["revision"]
+        self.refresh(repo, task, env)
+        self.assertEqual(len(self.pending(repo, task, "review_required")), 1)
+        self.assertEqual(json.loads((repo.state_dir / "board.json").read_text(
+            encoding="utf-8"))["revision"], revision)
+
+        # The superseded event can never bind an accept; the renewed one can.
+        run_board("decide", "--repo", str(repo.root), "--task", task,
+                  "--event-id", first["id"], "--decision", "accept",
+                  "--reviewed-head", candidate, "--phase", "P-RENEW1",
+                  "--contract-hash", fixture["contractSha256"], env=env, expect=2)
+        decided = board_json("decide", "--repo", str(repo.root), "--task", task,
+                             "--event-id", renewed[0]["id"], "--decision", "accept",
+                             "--reviewed-head", candidate, "--phase", "P-RENEW1",
+                             "--contract-hash", fixture["contractSha256"], env=env)
+        self.assertEqual(decided["decision"], "accepted")
+
+    def test_review_event_renews_after_transient_unknown_log_recovers(self):
+        fixture = self.ready_accept_fixture("renew-log", "P-RENEW2")
+        repo, env = fixture["repo"], fixture["env"]
+        task, candidate = "renew-log", fixture["candidate"]
+        checks = repo.task_dir(task) / "rounds" / "1" / "round.checks"
+        first = fixture["review"]
+        receipts = sorted(checks.glob("A1-*.json"),
+                          key=lambda path: path.stat().st_mtime, reverse=True)
+        receipt = json.loads(receipts[0].read_text(encoding="utf-8"))
+        log = checks / receipt["log"]
+        original = log.read_bytes()
+
+        def readiness():
+            return cli_json("readiness", "--repo", str(repo.root), "--task", task,
+                            "--round", "1", env=env)
+
+        # The receipt bytes are unchanged; only log readability is transient.
+        log.unlink()
+        self.assertEqual(readiness()["items"][0]["status"], "unknown")
+        self.refresh(repo, task, env)
+        self.assertEqual(self.pending(repo, task, "review_required"), [])
+        self.assertTrue(self.pending(repo, task, "phase_blocked"))
+
+        log.write_bytes(original)  # exact same bytes -> same verified hash
+        self.assertEqual(readiness()["status"], "ready")
+        self.refresh(repo, task, env)
+        renewed = self.pending(repo, task, "review_required")
+        self.assertEqual(len(renewed), 1)
+        self.assertNotEqual(renewed[0]["id"], first["id"])
+        decided = board_json("decide", "--repo", str(repo.root), "--task", task,
+                             "--event-id", renewed[0]["id"], "--decision", "accept",
+                             "--reviewed-head", candidate, "--phase", "P-RENEW2",
+                             "--contract-hash", fixture["contractSha256"], env=env)
+        self.assertEqual(decided["decision"], "accepted")
+
+    def test_phase_contract_rejects_escaping_resource_limit(self):
+        repo, worktree = self.make(name="bad-res")
+        env = self.h_env(PI_DOUBLE_MODE="ok")
+        sha = self.write_design(repo)
+        outside = self.tmp / "outside-res"
+        outside.mkdir(exist_ok=True)
+        (worktree / "link").symlink_to(outside)
+        for label, declared in (("traversal", "../outside-res"),
+                                ("symlink-parent", "link/inside")):
+            contract = self.contract(
+                repo, f"P-BADRES-{label}", design_sha=sha,
+                extra={"resourceLimits": [{"path": declared, "maxBytes": 10}]})
+            path = self.write_contract(f"badres-{label}.json", contract)
+            proc = self.start(repo, worktree, f"bad-res-{label}", path, env, expect=2)
+            self.assertIn("resourceLimits", proc.stderr)
+            self.assertFalse(repo.task_dir(f"bad-res-{label}").exists())
+
+    def test_declared_phase_resource_breach_stops_pi_and_blocks(self):
+        repo, worktree = self.make(name="res-breach")
+        sha = self.write_design(repo)
+        baseline = pi_task.measure(worktree)
+        self.assertTrue(baseline["complete"])
+        cap = int(baseline["bytes"]) + 8
+        env = self.h_env(PI_DOUBLE_MODE="hang",
+                         CODEX_PI_RESOURCE_SCAN_SECONDS="0.1",
+                         CODEX_PI_RESOURCE_UNKNOWN_SECONDS="5")
+        contract = self.contract(
+            repo, "P-RESBREACH", design_sha=sha,
+            extra={"resourceLimits": [{"path": ".", "maxBytes": cap}]})
+        path = self.write_contract("res-breach.json", contract)
+        self.start(repo, worktree, "res-breach", path, env)
+        repo.wait_round_state("res-breach", "running")
+        self.register(repo, "res-breach", env)
+        (worktree / "bloat.bin").write_bytes(b"x" * (cap + 64))
+        result = repo.wait_terminal("res-breach", env=env, timeout=30)
+        self.assertEqual(result["state"], "failed")
+        state = json.loads((repo.task_dir("res-breach") / "rounds" / "1" / "round.state.json")
+                           .read_text(encoding="utf-8"))
+        self.assertTrue(state.get("resourceBreached"))
+        readiness = cli_json("readiness", "--repo", str(repo.root), "--task", "res-breach",
+                             "--round", "1", env=env)
+        self.assertEqual(readiness["status"], "not_ready")
+        self.assertEqual(readiness["resource"]["status"], "breached")
+        self.assertIn("resource", readiness["readinessReason"])
+        self.refresh(repo, "res-breach", env)
+        blocked = self.pending(repo, "res-breach", "phase_blocked")
+        self.assertEqual(len(blocked), 1)
+        self.assertEqual(blocked[0]["evidence"]["reason"], "resource_breached")
+        limit = blocked[0]["evidence"]["resource"]["limits"][0]
+        self.assertGreater(limit["observedBytes"], cap)
+
+    def test_declared_phase_resource_unknown_escalates_and_blocks(self):
+        repo, worktree = self.make(name="res-unknown")
+        guarded = worktree / "guarded"
+        guarded.mkdir()
+        sha = self.write_design(repo)
+        env = self.h_env(PI_DOUBLE_MODE="hang",
+                         CODEX_PI_RESOURCE_SCAN_SECONDS="0.05",
+                         CODEX_PI_RESOURCE_UNKNOWN_SECONDS="0.2")
+        contract = self.contract(
+            repo, "P-RESUNKNOWN", design_sha=sha,
+            extra={"resourceLimits": [{"path": "guarded", "maxBytes": 10 ** 7}]})
+        path = self.write_contract("res-unknown.json", contract)
+        result = None
+        try:
+            self.start(repo, worktree, "res-unknown", path, env)
+            repo.wait_round_state("res-unknown", "running")
+            self.register(repo, "res-unknown", env)
+            os.chmod(guarded, 0)
+            result = repo.wait_terminal("res-unknown", env=env, timeout=30)
+        finally:
+            os.chmod(guarded, 0o755)
+        self.assertEqual(result["state"], "failed")
+        state = json.loads((repo.task_dir("res-unknown") / "rounds" / "1" / "round.state.json")
+                           .read_text(encoding="utf-8"))
+        self.assertTrue(state.get("resourceUnknown"))
+        readiness = cli_json("readiness", "--repo", str(repo.root), "--task", "res-unknown",
+                             "--round", "1", env=env)
+        self.assertEqual(readiness["status"], "not_ready")
+        self.assertEqual(readiness["resource"]["status"], "escalated")
+        self.refresh(repo, "res-unknown", env)
+        blocked = self.pending(repo, "res-unknown", "phase_blocked")
+        self.assertEqual(len(blocked), 1)
+        self.assertEqual(blocked[0]["evidence"]["reason"], "resource_unknown")
+
+    def test_python_count_rules_follow_board_readiness_and_accept(self):
+        repo, worktree = self.make(name="counts-gate")
+        sha = self.write_design(repo)
+        (worktree / "sample_gate.py").write_text(
+            "import unittest\n\nclass Sample(unittest.TestCase):\n"
+            "    def test_one(self):\n        self.assertTrue(True)\n"
+            "    def test_two(self):\n        self.assertEqual(2, 2)\n",
+            encoding="utf-8")
+        subprocess.run(["git", "-C", str(worktree), "add", "-A"], check=True,
+                       capture_output=True)
+        subprocess.run(["git", "-C", str(worktree), "-c", "user.email=t@e.invalid",
+                        "-c", "user.name=T", "commit", "-qm", "sample tests"], check=True,
+                       capture_output=True)
+        command = self.python_command("-m", "unittest", "-v", "sample_gate")
+        item = {"id": "A1", "description": "python tests", "command": command,
+                "passCondition": "exit 0, run>=2, no skips", "evidence": "receipt",
+                "minRun": 2, "forbidSkip": True}
+        path = self.write_contract("counts-gate.json",
+                                   self.contract(repo, "P-PYCOUNT", design_sha=sha, items=[item]))
+        env = self.h_env(PI_DOUBLE_MODE="delay-ok", PI_DOUBLE_DELAY="6")
+        self.start(repo, worktree, "counts-gate", path, env)
+        repo.wait_round_state("counts-gate", "running")
+        checks = repo.task_dir("counts-gate") / "rounds" / "1" / "round.checks"
+        run = subprocess.run(
+            [sys.executable, str(RUNTIME / "pi_check.py"), "--output-dir", str(checks),
+             "--id", "A1", "--timeout-seconds", "900", "--", *shlex.split(command)],
+            cwd=str(worktree), capture_output=True, text=True, env=env, timeout=120)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        real = json.loads(Path(json.loads(run.stdout)["receipt"]).read_text(encoding="utf-8"))
+        self.assertEqual(real["test_counts"], {"run": 2, "pass": 2, "fail": 0, "skip": 0,
+                                                "format": "python_unittest_summary"})
+        self.register(repo, "counts-gate", env)
+        repo.wait_terminal("counts-gate", env=env)
+
+        def readiness():
+            return cli_json("readiness", "--repo", str(repo.root), "--task", "counts-gate",
+                            "--round", "1", env=env)
+
+        self.assertEqual(readiness()["items"][0]["status"], "covered")
+        self.assertEqual(readiness()["status"], "ready")
+        self.refresh(repo, "counts-gate", env)
+        review = self.pending(repo, "counts-gate", "review_required")
+        self.assertEqual(len(review), 1)
+
+        # forbidSkip refuses a skipped run even when minRun passes.
+        skipped = {"run": 2, "pass": 1, "fail": 0, "skip": 1,
+                   "format": "python_unittest_summary"}
+        self.synth_receipt(checks, "A1", 0, self.head(worktree), command=command,
+                           counts=dict(skipped))
+        self.assertEqual(readiness()["items"][0]["status"], "skipped")
+        proc = run_board("decide", "--repo", str(repo.root), "--task", "counts-gate",
+                         "--event-id", review[0]["id"], "--decision", "accept",
+                         "--reviewed-head", self.head(worktree), "--phase", "P-PYCOUNT",
+                         "--contract-hash", json.loads((repo.task_dir("counts-gate") / "phase.json")
+                                                       .read_text())["contractSha256"],
+                         env=env, expect=2)
+        self.assertIn("readiness", proc.stderr)
+        self.refresh(repo, "counts-gate", env)
+        self.assertEqual(self.pending(repo, "counts-gate", "review_required"), [])
+        blocked = self.pending(repo, "counts-gate", "phase_blocked")
+        self.assertEqual(blocked[0]["evidence"]["reason"], "required_check_failed")
+
+        # Missing counts stay unknown under declared rules; never a pass.
+        self.synth_receipt(checks, "A1", 0, self.head(worktree), command=command)
+        self.assertEqual(readiness()["items"][0]["status"], "unknown")
+
+        # Restored counts cover again and the renewed event binds acceptance.
+        self.synth_receipt(checks, "A1", 0, self.head(worktree), command=command,
+                           counts={"run": 2, "pass": 2, "fail": 0, "skip": 0,
+                                   "format": "python_unittest_summary"})
+        self.assertEqual(readiness()["status"], "ready")
+        self.refresh(repo, "counts-gate", env)
+        renewed = self.pending(repo, "counts-gate", "review_required")
+        self.assertEqual(len(renewed), 1)
+        decided = board_json("decide", "--repo", str(repo.root), "--task", "counts-gate",
+                             "--event-id", renewed[0]["id"], "--decision", "accept",
+                             "--reviewed-head", self.head(worktree), "--phase", "P-PYCOUNT",
+                             "--contract-hash", json.loads((repo.task_dir("counts-gate") / "phase.json")
+                                                           .read_text())["contractSha256"],
+                             env=env)
+        self.assertEqual(decided["decision"], "accepted")
+
 
 if __name__ == "__main__":
     unittest.main()

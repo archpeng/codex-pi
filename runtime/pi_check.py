@@ -48,6 +48,36 @@ RUNNING_SUFFIX = ".running"
 GUARD_EXIT_CODE = 75
 MIN_HEALTH_INTERVAL = 0.05
 MAX_HEALTH_INTERVAL = 3600.0
+UNITTEST_SUMMARY_RE = re.compile(
+    r'^Ran (?P<run>\d+) tests? in [\d.]+s\s*\n'
+    r'(?P<result>OK|FAILED)(?:\s*\((?P<detail>[^)]*)\))?\s*$', re.M)
+
+
+def unittest_counts(text: str):
+    """Recognizable final unittest summary from the same log bytes; None if ambiguous.
+
+    Only fixed counters survive. A missing or malformed summary returns ``None``
+    so declared ``minRun``/``forbidSkip`` rules stay unknown instead of passing.
+    """
+    matches = list(UNITTEST_SUMMARY_RE.finditer(text))
+    if not matches:
+        return None
+    match = matches[-1]
+    detail = match.group('detail') or ''
+    failures = errors = skipped = 0
+    for part in detail.split(','):
+        key, _sep, value = part.strip().partition('=')
+        if value.isdigit() and key in ('failures', 'errors', 'skipped'):
+            if key == 'failures':
+                failures = int(value)
+            elif key == 'errors':
+                errors = int(value)
+            else:
+                skipped = int(value)
+    run = int(match.group('run'))
+    fail = failures + errors
+    return {'run': run, 'pass': max(0, run - fail - skipped), 'fail': fail,
+            'skip': skipped, 'format': 'python_unittest_summary'}
 
 
 class Guard:
@@ -262,11 +292,14 @@ def main():
                         code = GUARD_EXIT_CODE
         raw = log.read_bytes() if log.exists() else b''
         text = raw.decode(errors='replace')
-        counts = {'run': len(re.findall(r'^=== RUN\s', text, re.M)),
-                  'pass': len(re.findall(r'^--- PASS:', text, re.M)),
-                  'fail': len(re.findall(r'^--- FAIL:', text, re.M)),
-                  'skip': len(re.findall(r'^--- SKIP:', text, re.M))}
-        counts = dict(counts, format='go_verbose_top_level') if any(counts.values()) else None
+        counters = {'run': len(re.findall(r'^=== RUN\s', text, re.M)),
+                    'pass': len(re.findall(r'^--- PASS:', text, re.M)),
+                    'fail': len(re.findall(r'^--- FAIL:', text, re.M)),
+                    'skip': len(re.findall(r'^--- SKIP:', text, re.M))}
+        if any(counters.values()):
+            counts = dict(counters, format='go_verbose_top_level')
+        else:
+            counts = unittest_counts(text)
         try:
             head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True,
                                            stderr=subprocess.DEVNULL).strip()

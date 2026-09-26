@@ -714,6 +714,19 @@ def add_event(card: dict, kind: str, round_number, fingerprint: str, summary: st
     return event
 
 
+def _review_episode(card: dict) -> int:
+    """Durable ready-episode number for review-event identities.
+
+    The counter only advances when a pending review event is invalidated. It is
+    stored on the card so a recovered ready state on the SAME round/candidate
+    publishes exactly one new event while unchanged refreshes stay idempotent.
+    """
+    value = card.get("reviewEpisode")
+    if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 10 ** 9:
+        return value
+    return 0
+
+
 def derive_stage(state, running) -> str:
     if state == "starting":
         return "starting"
@@ -752,6 +765,8 @@ def _phase_projection(card: dict, status: dict, now: float):
     if isinstance(scope_value, dict):
         scope_value = scope_value.get("status")
     existing = card.get("phase") if isinstance(card.get("phase"), dict) else {}
+    phase_evidence = phase.get("evidence") if isinstance(phase.get("evidence"), dict) else {}
+    resource_evidence = phase_evidence.get("resource")
     same_identity = (existing.get("phaseId") == phase.get("phaseId")
                      and existing.get("contractHash") == phase.get("contractSha256"))
     if same_identity and existing.get("status") == "accepted" \
@@ -784,6 +799,7 @@ def _phase_projection(card: dict, status: dict, now: float):
                       "coverage": readiness.get("coverage"),
                       "writerFree": readiness.get("writerFree"),
                       "execution": (readiness.get("execution") or {}).get("status"),
+                      "resource": resource_evidence,
                       "gaps": [{"id": item.get("id"), "status": item.get("status"),
                                 "reason": item.get("reason")}
                                for item in (readiness.get("gaps") or [])[:10]],
@@ -800,9 +816,10 @@ def _phase_projection(card: dict, status: dict, now: float):
         old_readiness = existing.get("readiness") or {}
         new_readiness = new_phase.get("readiness") or {}
         if (old_readiness.get("status"), old_readiness.get("coverage"), old_readiness.get("scope"),
-                (old_readiness.get("execution") or {})) \
+                (old_readiness.get("execution") or {}), (old_readiness.get("resource") or {}).get("status")) \
                 != (new_readiness.get("status"), new_readiness.get("coverage"),
-                    new_readiness.get("scope"), (new_readiness.get("execution") or {})):
+                    new_readiness.get("scope"), (new_readiness.get("execution") or {}),
+                    (new_readiness.get("resource") or {}).get("status")):
             changed = True
         old_auto = existing.get("autoContinue") or {}
         new_auto = new_phase.get("autoContinue") or {}
@@ -935,6 +952,12 @@ def _supersede_phase_kinds(card: dict, now: float, kinds, keep_event_id=None,
 
 
 def _phase_blocked_reason(readiness: dict, auto: dict, status: dict) -> str:
+    resource = readiness.get("resource") or {}
+    resource_status = resource.get("status")
+    if resource_status == "breached":
+        return "resource_breached"
+    if resource_status == "escalated":
+        return "resource_unknown"
     auto_status = (auto or {}).get("status")
     if auto_status == "exhausted":
         return "auto_continue_used"
@@ -961,6 +984,8 @@ def _phase_blocked_reason(readiness: dict, auto: dict, status: dict) -> str:
         scope = scope.get("status")
     if scope == "violation":
         return "scope_violation"
+    if resource_status == "unknown":
+        return "resource_unknown"
     items = readiness.get("items")
     if not isinstance(items, list):
         evidence = (status.get("phase") or {}).get("evidence")
@@ -989,6 +1014,8 @@ def _project_phase_events(card: dict, status: dict, now: float) -> list:
     evidence_dir = status.get("evidence") or {}
     phase = status.get("phase") or {}
     readiness = phase.get("readiness") or {}
+    phase_evidence = phase.get("evidence") if isinstance(phase.get("evidence"), dict) else {}
+    resource_evidence = phase_evidence.get("resource")
     auto = phase.get("autoContinue") or {}
     phase_id = phase.get("phaseId")
     contract_hash = phase.get("contractHash") or phase.get("contractSha256")
@@ -1022,7 +1049,8 @@ def _project_phase_events(card: dict, status: dict, now: float) -> list:
             _supersede_phase_kinds(card, now, ("phase_blocked",))
             event = add(
                 "review_required",
-                f"phase:{phase_id}:contract:{contract_hash}:candidate:{candidate}:ready",
+                f"phase:{phase_id}:contract:{contract_hash}:candidate:{candidate}:"
+                f"ready:{_review_episode(card)}",
                 f"phase {phase_id} round {status.get('round')} is delivery-ready: "
                 f"{readiness.get('coverage', {}).get('covered')}/"
                 f"{readiness.get('coverage', {}).get('required')} acceptance items covered",
@@ -1041,8 +1069,13 @@ def _project_phase_events(card: dict, status: dict, now: float) -> list:
             fingerprint = (f"phase:{phase_id}:contract:{contract_hash}:candidate:{candidate}:"
                            f"blocked:{reason}:{auto.get('status') or 'none'}")
             # A review event from a previous, now-invalid state must not remain
-            # current: the same snapshot gate owns both sides.
-            _supersede_phase_kinds(card, now, ("review_required",))
+            # current: the same snapshot gate owns both sides. Superseding a
+            # pending review advances the durable ready episode so a later
+            # recovery on this same round/candidate can publish exactly one new
+            # review event instead of being rejected by the old identity.
+            superseded_reviews = _supersede_phase_kinds(card, now, ("review_required",))
+            if superseded_reviews:
+                card["reviewEpisode"] = _review_episode(card) + 1
             _supersede_phase_kinds(card, now, ("phase_blocked",), keep_fingerprint=fingerprint)
             add("phase_blocked", fingerprint,
                 f"phase {phase_id} round {status.get('round')} is not delivery-ready ({reason})",
@@ -1051,6 +1084,7 @@ def _project_phase_events(card: dict, status: dict, now: float) -> list:
                 "Missing, failed, skipped or unknown evidence is never ready.",
                 {"candidateHead": candidate, "reason": reason,
                  "coverage": readiness.get("coverage"), "gaps": readiness.get("gaps"),
+                 "resource": resource_evidence or None,
                  "autoContinue": auto or None})
     ownership = status.get("ownership") or {}
     if state == "unknown" and recorded in ACTIVE_STATES:
