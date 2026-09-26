@@ -15,6 +15,8 @@ Give Pi a complete reviewable result: goal, material design decisions, allowed s
 
 Run the plugin's `runtime/pi_task.py` with Python. `start` creates a task; `continue` preserves its exact Pi session/worktree in a new immutable round. Use the board to bind the task to the exact owning desktop task UUID and opt into CLI queue delivery. See [runtime commands](references/runtime.md). Never create a duplicate worker to bypass an active or unknown task.
 
+For a complete phase, pass `--contract-file` with the machine-readable contract (goal, complete result, baseline/scope, design ref+hash, acceptance IDs with real check commands, budget, repair/escalation boundary). Pi reports short structured progress and can check mechanical delivery readiness; a normally completed round with only missing receipts may be continued once in the same session/worktree/budget. Accept a phase with `decide ... --phase ... --contract-hash ... --reviewed-head ...`; only an accepted phase, an authorized next contract and no conflicting worker permit the next phase. Tasks without a contract keep the legacy path. Details: [phase operations](../docs/validation/phase-autonomy-o1-20260926.md).
+
 ## Wait without repeated model turns
 
 The existing Pi supervisor refreshes a small board locally. Unchanged state and ordinary progress do not call Codex. Actionable completion, deadline/resource failure or unavailable ownership enqueue one bounded handoff through `codex --disable daemon_auto_start queue`. An idle desktop task can resume; a busy task processes it after the current turn. Do independent work, then finish the turn when no main work remains. Do not loop over `wait`, create a heartbeat or hold a Stop hook open to simulate progress.

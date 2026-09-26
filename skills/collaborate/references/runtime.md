@@ -27,6 +27,34 @@ Normal supervision stays inside the detached Pi supervisor. Do independent work,
 
 `result` is collected once per terminal round. It retains raw pointers and bounded summaries, all attempts, model usage and native Pi session evidence below the Git common directory `codex-pi/tasks/`. Open only the relevant receipt/log/diff. Continue the exact saved task for repairs; do not replace a live or unknown worker with a new identity. A reused session does not keep idle Pi processes alive after the round ends.
 
+## Phase contracts (0.5, O1)
+
+An authorized complete phase may be dispatched with a frozen contract: give `start`/`continue` a
+`--contract-file` JSON (schema in `docs/validation/phase-autonomy-o1-20260926.md`). The contract
+freezes goal, complete result, baseline, scope, design ref/hash, acceptance item IDs with real check
+commands, the phase budget and the autonomous-repair/escalation boundary. The brief references the
+contract; the project PLAN/design remains authoritative and no parallel plan is created.
+
+```sh
+python3 /absolute/plugin/runtime/pi_task.py progress --repo WT --task TASK --round N \
+    --activity implementing --step '...' --completed-criteria ITEM --next '...' --evidence-ref PATH
+python3 /absolute/plugin/runtime/pi_task.py readiness --repo REPO --task TASK --round N
+python3 /absolute/plugin/runtime/pi_task.py phase-status --repo REPO --task TASK
+python3 /absolute/plugin/runtime/pi_board.py decide --repo REPO --task TASK --event-id EVENT \
+    --decision accept --reviewed-head FULL_SHA --phase PHASE --contract-hash HASH
+```
+
+Ordinary progress is self-report only, never a check receipt and never a queue message. Readiness
+compares the exact contract with real `pi_check` receipts bound to the candidate; missing, failed,
+skipped or unknown evidence is never ready. Running self-repairable check failures/timeouts stay
+local. A normally completed round with only mechanically missing evidence may be continued once in
+the same session/worktree/budget (quota persisted per phase); the second shortfall, a real design
+question or an unknown start escalates. `accept` binds phase, contract and candidate; a different
+phase requires the previous one accepted on the board and no conflicting worker. Tasks without a
+contract keep the legacy review path. See
+[docs/validation/phase-autonomy-o1-20260926.md](../../docs/validation/phase-autonomy-o1-20260926.md)
+for operations and the O2/O3 unverified boundary.
+
 ## Checks and resource protection
 
 The generated brief contains task-specific frozen `toolsDir` and round-specific `checksDir`. Run from the Pi worktree:

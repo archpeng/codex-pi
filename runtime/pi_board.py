@@ -51,8 +51,8 @@ if str(RUNTIME_DIR) not in sys.path:
     sys.path.insert(0, str(RUNTIME_DIR))
 
 from pi_task import (ACTIVE_STATES, TERMINAL_STATES, TASK_RE, LockHeld, atomic,  # noqa: E402
-                     build_status, canonical_root, git_common_dir, lock_fd, read_json,
-                     require_allowed_model, require_task_arg, task_dir_for, terminate)
+                     build_status, canonical_root, git_common_dir, lock_fd, lock_is_held,
+                     read_json, require_allowed_model, require_task_arg, task_dir_for, terminate)
 
 SCHEMA_VERSION = 1
 BOARD_DIR = "codex-pi"
@@ -733,8 +733,75 @@ def _receipt_ref(checks: dict, latest):
     return None
 
 
+def _phase_projection(card: dict, status: dict, now: float):
+    """Stable phase card projection; returns (phase_dict_or_None, changed)."""
+    phase = status.get("phase")
+    if not isinstance(phase, dict) or not phase.get("phaseId"):
+        return None, bool(card.get("phase"))
+    readiness = phase.get("readiness") or {}
+    auto = phase.get("autoContinue") or {}
+    candidate = status.get("endHead") or status.get("startHead")
+    existing = card.get("phase") if isinstance(card.get("phase"), dict) else {}
+    same_identity = (existing.get("phaseId") == phase.get("phaseId")
+                     and existing.get("contractHash") == phase.get("contractSha256"))
+    if same_identity and existing.get("status") == "accepted" \
+            and existing.get("acceptedHead") == candidate:
+        state = "accepted"
+    elif same_identity and existing.get("status") == "changes_requested" \
+            and existing.get("candidate") == candidate:
+        state = "changes_requested"
+    elif same_identity and existing.get("status") == "rejected" \
+            and existing.get("candidate") == candidate:
+        state = "rejected"
+    elif readiness.get("status") == "ready" and status.get("state") == "completed":
+        state = "review_ready"
+    elif auto.get("status") == "started":
+        state = "continuing"
+    elif status.get("state") in ACTIVE_STATES:
+        state = "executing"
+    else:
+        state = "blocked"
+    new_phase = {
+        "phaseId": phase.get("phaseId"), "contractHash": phase.get("contractSha256"),
+        "contractRef": phase.get("contractRef"), "baselineCommit": phase.get("baselineCommit"),
+        "candidate": candidate, "status": state,
+        "acceptedHead": existing.get("acceptedHead") if same_identity else None,
+        "acceptedAt": existing.get("acceptedAt") if same_identity else None,
+        "reviewEventId": existing.get("reviewEventId") if same_identity else None,
+        "decidedEventId": existing.get("decidedEventId") if same_identity else None,
+        "lastDecision": existing.get("lastDecision") if same_identity else None,
+        "readiness": {"status": readiness.get("status"),
+                      "coverage": readiness.get("coverage"),
+                      "writerFree": readiness.get("writerFree"),
+                      "gaps": [{"id": item.get("id"), "status": item.get("status"),
+                                "reason": item.get("reason")}
+                               for item in (readiness.get("gaps") or [])[:10]],
+                      "scope": (readiness.get("scope") or {}).get("status"),
+                      "generatedAt": readiness.get("generatedAt")},
+        "budget": phase.get("budget") or {},
+        "autoContinue": auto or None,
+        "updatedAt": now,
+    }
+    stable_keys = ("phaseId", "contractHash", "contractRef", "baselineCommit", "candidate",
+                   "status", "acceptedHead", "acceptedAt", "reviewEventId", "decidedEventId")
+    changed = any(existing.get(key) != new_phase.get(key) for key in stable_keys)
+    if not changed:
+        old_readiness = existing.get("readiness") or {}
+        new_readiness = new_phase.get("readiness") or {}
+        if (old_readiness.get("status"), old_readiness.get("coverage"), old_readiness.get("scope")) \
+                != (new_readiness.get("status"), new_readiness.get("coverage"),
+                    new_readiness.get("scope")):
+            changed = True
+        old_auto = existing.get("autoContinue") or {}
+        new_auto = new_phase.get("autoContinue") or {}
+        if (old_auto.get("status"), old_auto.get("reason"), old_auto.get("round")) \
+                != (new_auto.get("status"), new_auto.get("reason"), new_auto.get("round")):
+            changed = True
+    return new_phase, changed
+
+
 def project_status(card: dict, status: dict, now: float) -> bool:
-    """Projection only (round/state/stage/evidence/check); never an event."""
+    """Projection only (round/state/stage/evidence/check/progress/phase); never an event."""
     changed = False
     pi = card.setdefault("pi", {})
     new_pi = {
@@ -775,12 +842,211 @@ def project_status(card: dict, status: dict, now: float) -> bool:
     if card.get("check") != new_check:
         changed = True
     card["check"] = new_check
+
+    progress = status.get("progress")
+    new_progress = None if not isinstance(progress, dict) else {
+        "activity": progress.get("activity"), "step": progress.get("step"),
+        "completedCriteria": progress.get("completedCriteria") or [],
+        "next": progress.get("next"), "blocker": progress.get("blocker"),
+        "updatedAt": progress.get("updatedAt"),
+        "reportedBy": progress.get("reportedBy", "pi"), "verified": False,
+    }
+    if card.get("progress") != new_progress:
+        changed = True
+    card["progress"] = new_progress
+
+    new_phase, phase_changed = _phase_projection(card, status, now)
+    if phase_changed:
+        changed = True
+    if new_phase is None:
+        card.pop("phase", None)
+    else:
+        card["phase"] = new_phase
     card["updatedAt"] = now
     return changed
 
 
+def _phase_event_stale(card: dict, event: dict) -> bool:
+    """Mechanical staleness for phase-bound events (never an acceptance decision)."""
+    if not event.get("phaseId"):
+        return False
+    phase = card.get("phase") if isinstance(card.get("phase"), dict) else {}
+    if event.get("phaseId") != phase.get("phaseId"):
+        return True
+    if event.get("contractHash") != phase.get("contractHash"):
+        return True
+    if event.get("round") != (card.get("pi") or {}).get("round"):
+        return True
+    candidate = (event.get("candidate") or {}).get("head")
+    if candidate is not None and candidate != phase.get("candidate"):
+        return True
+    return False
+
+
+def _mark_superseded(card: dict, event: dict, now: float) -> None:
+    event.update(handled=True, handledAt=now, decision="superseded",
+                 note="mechanical supersession: the phase candidate/contract advanced or newer "
+                      "facts arrived; this is not an acceptance decision")
+    card.setdefault("handled", {})[event["id"]] = {
+        "at": now, "decision": "superseded", "reviewedHead": None,
+        "round": event.get("round"), "superseded": True}
+
+
+def _supersede_stale_phase_events(card: dict, now: float) -> int:
+    count = 0
+    for event in pending_events(card):
+        if event.get("phaseId") and _phase_event_stale(card, event):
+            _mark_superseded(card, event, now)
+            count += 1
+    if count:
+        _prune_events(card)
+        _update_overflow(card, now)
+    return count
+
+
+def _supersede_phase_kinds(card: dict, now: float, kinds, keep_event_id=None,
+                           keep_fingerprint=None) -> int:
+    count = 0
+    for event in pending_events(card):
+        if not event.get("phaseId") or event.get("kind") not in kinds:
+            continue
+        if keep_event_id and event.get("id") == keep_event_id:
+            continue
+        if keep_fingerprint and event.get("fingerprint") == keep_fingerprint:
+            continue
+        _mark_superseded(card, event, now)
+        count += 1
+    if count:
+        _prune_events(card)
+        _update_overflow(card, now)
+    return count
+
+
+def _phase_blocked_reason(readiness: dict, auto: dict, status: dict) -> str:
+    auto_status = (auto or {}).get("status")
+    if auto_status == "exhausted":
+        return "auto_continue_used"
+    if auto_status in ("unknown", "claimed"):
+        return "auto_continue_unknown"
+    if auto_status == "blocked":
+        return (auto or {}).get("reason") or "auto_continue_unknown"
+    last = (status.get("phase") or {}).get("lastDecision") or {}
+    if last.get("reason"):
+        # The script's post-round classification (for example a pause or a
+        # budget stop) is authoritative for that round's delivery gap.
+        return str(last["reason"])
+    scope = (readiness.get("scope") or {}).get("status")
+    if scope == "violation":
+        return "scope_violation"
+    statuses = {item.get("status") for item in readiness.get("items") or []}
+    if statuses & {"failed", "skipped", "unknown"}:
+        return "required_check_failed"
+    budget = readiness.get("budget") or {}
+    if budget.get("exhausted"):
+        return "budget_exhausted"
+    if status.get("state") != "completed":
+        return f"round_{status.get('state')}"
+    if readiness.get("status") == "unknown":
+        return "readiness_unknown"
+    return "delivery_gap"
+
+
+def _project_phase_events(card: dict, status: dict, now: float) -> list:
+    """Phase-aware classification: local failures stay local; only real decisions escalate."""
+    added = []
+    state = status.get("state")
+    recorded = status.get("recordedState")
+    checks = status.get("checks") or {}
+    receipts = checks.get("receipts") or {}
+    latest = receipts.get("latest")
+    evidence_dir = status.get("evidence") or {}
+    phase = status.get("phase") or {}
+    readiness = phase.get("readiness") or {}
+    auto = phase.get("autoContinue") or {}
+    phase_id = phase.get("phaseId")
+    contract_hash = phase.get("contractHash") or phase.get("contractSha256")
+    candidate = status.get("endHead") or status.get("startHead")
+    base_evidence = {"briefRef": evidence_dir.get("brief"), "checksRef": checks.get("dir"),
+                     "stateRef": evidence_dir.get("state"), "phaseRef": phase.get("contractRef")}
+
+    def add(kind, fingerprint, summary, question, extra=None):
+        evidence = dict(base_evidence)
+        if extra:
+            evidence.update(extra)
+        event = add_event(card, kind, status.get("round"), fingerprint, summary,
+                          {"round": status.get("round"), "head": candidate, "state": state},
+                          evidence, question, now)
+        if event is not None:
+            event["phaseId"] = phase_id
+            event["contractHash"] = contract_hash
+            event["coverage"] = readiness.get("coverage")
+            added.append(event)
+        return event
+
+    if status.get("timedOut"):
+        add("task_timeout",
+            f"phase:{phase_id}:contract:{contract_hash}:timeout:{status.get('exitCode')}",
+            f"round {status.get('round')} wrapper timed out (exit {status.get('exitCode')})",
+            "Decide whether to repair, cancel or extend the deadline; the round state is exact "
+            "evidence.",
+            {"receiptRef": _receipt_ref(checks, latest)})
+    if state in TERMINAL_STATES:
+        if readiness.get("status") == "ready" and state == "completed":
+            _supersede_phase_kinds(card, now, ("phase_blocked",))
+            event = add(
+                "review_required",
+                f"phase:{phase_id}:contract:{contract_hash}:candidate:{candidate}:ready",
+                f"phase {phase_id} round {status.get('round')} is delivery-ready: "
+                f"{readiness.get('coverage', {}).get('covered')}/"
+                f"{readiness.get('coverage', {}).get('required')} acceptance items covered",
+                "Review the exact candidate and receipts, then decide accept or changes_requested with "
+                "the phase identity bound. Exit 0 and readiness are execution evidence only, never "
+                "acceptance.",
+                {"candidateHead": candidate, "coverage": readiness.get("coverage"),
+                 "phaseId": phase_id, "contractHash": contract_hash})
+            if event is not None:
+                card["phase"] = dict(card.get("phase") or {}, reviewEventId=event["id"])
+        elif auto.get("status") == "started":
+            # Local same-phase continuation owns the terminal round; no GPT wake-up.
+            pass
+        else:
+            reason = _phase_blocked_reason(readiness, auto, status)
+            fingerprint = (f"phase:{phase_id}:contract:{contract_hash}:candidate:{candidate}:"
+                           f"blocked:{reason}:{auto.get('status') or 'none'}")
+            _supersede_phase_kinds(card, now, ("phase_blocked",), keep_fingerprint=fingerprint)
+            add("phase_blocked", fingerprint,
+                f"phase {phase_id} round {status.get('round')} is not delivery-ready ({reason})",
+                "Decide whether to continue repairs in the same Pi session (changes_requested), "
+                "escalate for main design help, or explicitly accept a partial result. "
+                "Missing, failed, skipped or unknown evidence is never ready.",
+                {"candidateHead": candidate, "reason": reason,
+                 "coverage": readiness.get("coverage"), "gaps": readiness.get("gaps"),
+                 "autoContinue": auto or None})
+    ownership = status.get("ownership") or {}
+    if state == "unknown" and recorded in ACTIVE_STATES:
+        add("ownership_unknown", f"phase:{phase_id}:{recorded}",
+            f"recorded active state {recorded} without a live supervisor lease",
+            "Inspect ownership and decide cleanup; do not assume progress.",
+            {"recordedState": recorded})
+    if recorded in TERMINAL_STATES and ownership.get("activeWorker") \
+            and not ownership.get("supervisorAlive"):
+        add("ownership_lingering", f"phase:{phase_id}:{recorded}",
+            "terminal record but a worker lock is still held",
+            "Inspect the lingering owned worker before reuse.",
+            {"recordedState": recorded})
+    return added
+
+
 def project_events(card: dict, status: dict, now: float) -> list:
-    """Actionable facts only: terminal, verified timeout/resource, unknown ownership."""
+    """Actionable facts only; phase contracts suppress local/self-repairable check events."""
+    phase = status.get("phase")
+    if isinstance(phase, dict) and phase.get("phaseId"):
+        return _project_phase_events(card, status, now)
+    return _project_legacy_events(card, status, now)
+
+
+def _project_legacy_events(card: dict, status: dict, now: float) -> list:
+    """Legacy (no phase contract) actionable facts, unchanged from 0.4."""
     added = []
     state = status.get("state")
     recorded = status.get("recordedState")
@@ -872,6 +1138,8 @@ def refresh_with_status(board_file, task_id: str, status: dict, now=None, block:
         if not isinstance(card, dict):
             return {"ok": True, "refreshed": False, "reason": "task is not registered"}
         changed = project_status(card, status, now)
+        if isinstance(card.get("phase"), dict) and _supersede_stale_phase_events(card, now):
+            changed = True
         added = project_events(card, status, now)
         _update_overflow(card, now)
         changed = changed or bool(added)
@@ -1118,6 +1386,13 @@ def build_packet(card: dict, events, limit: int = MAX_PACKET_EVENTS):
             f"question={event.get('question')}",
             f"candidate_head={(event.get('candidate') or {}).get('head') or 'unknown'}",
         ]
+        if event.get("phaseId"):
+            block.append(f"phase={event.get('phaseId')} contract={event.get('contractHash')}")
+        coverage = event.get("coverage")
+        if isinstance(coverage, dict):
+            block.append("coverage=" + ",".join(f"{key}:{coverage.get(key)}" for key in
+                                                  ("required", "covered", "failed", "missing",
+                                                   "unknown", "skipped") if coverage.get(key) is not None))
         evidence = event.get("evidence") or {}
         for label, key in (("brief", "briefRef"), ("checks", "checksRef"),
                            ("receipt", "receiptRef"), ("state", "stateRef")):
@@ -1194,6 +1469,9 @@ def dispatch_task(board_file, task_id: str, now=None, timeout=None, cli_runner=N
     claims = _normalize_claims(entry, now)
     eligible = []
     for event in pending_events(card):
+        if event.get("phaseId") and _phase_event_stale(card, event):
+            # Mechanical staleness: never dispatch evidence for an older phase/candidate.
+            continue
         claim = claims.get(event.get("id"))
         if not isinstance(claim, dict):
             eligible.append(event)
@@ -1339,6 +1617,8 @@ def compact_event(event: dict) -> dict:
     return {"id": event.get("id"), "seq": event.get("seq"), "round": event.get("round"),
             "kind": event.get("kind"), "summary": event.get("summary"),
             "question": event.get("question"), "candidate": event.get("candidate"),
+            "phaseId": event.get("phaseId"), "contractHash": event.get("contractHash"),
+            "coverage": event.get("coverage"),
             "evidence": event.get("evidence"), "createdAt": event.get("createdAt"),
             "handled": bool(event.get("handled")), "decision": event.get("decision"),
             "reviewedHead": event.get("reviewedHead")}
@@ -1356,6 +1636,7 @@ def compact_card(card: dict, max_events: int = 5) -> dict:
         "transport": card.get("transport"), "codexBin": card.get("codexBin"),
         "paused": bool(card.get("paused")), "pausedAt": card.get("pausedAt"),
         "pauseNote": card.get("pauseNote"), "pi": card.get("pi"),
+        "phase": card.get("phase"), "progress": card.get("progress"),
         "evidence": card.get("evidence"), "check": card.get("check"),
         "attention": card.get("attention"), "codex": card.get("codex"),
         "pendingEvents": [compact_event(event) for event in pending[:max_events]],
@@ -1408,12 +1689,14 @@ def _monitor_view(board_file, task_ids) -> dict:
 
 def _decide_hint(repo, task_id, event: dict) -> str:
     head = (event.get("candidate") or {}).get("head")
+    phase = f" --phase {event.get('phaseId')} --contract-hash {event.get('contractHash')}" \
+        if event.get("phaseId") else ""
     if event.get("kind") in REVIEW_KINDS and isinstance(head, str) and FULL_OID_RE.fullmatch(head):
         decision = "accept|reject|changes_requested"
-        suffix = f" --reviewed-head {head}"
+        suffix = f" --reviewed-head {head}{phase}"
     else:
-        decision = "resolve|reject"
-        suffix = ""
+        decision = "resolve|reject|changes_requested"
+        suffix = phase
     return (f'python3 {shlex.quote(str(Path(__file__).resolve()))} decide '
             f'--repo {shlex.quote(str(repo))} --task {shlex.quote(str(task_id))} '
             f'--event-id {event.get("id")} --decision {decision}{suffix}')
@@ -1543,7 +1826,8 @@ def _resolve_commit(worktree, object_id):
     return resolved, None
 
 
-def decide(repo, task, event_id, decision, reviewed_head=None, note=None, now=None) -> dict:
+def decide(repo, task, event_id, decision, reviewed_head=None, note=None, phase=None,
+           contract_hash=None, now=None) -> dict:
     now = time.time() if now is None else now
     event_id = str(event_id)
     if not EVENT_ID_RE.fullmatch(event_id):
@@ -1561,11 +1845,17 @@ def decide(repo, task, event_id, decision, reviewed_head=None, note=None, now=No
         card = board["cards"].get(task_id)
         if not isinstance(card, dict):
             raise ValueError(f"task {task_id!r} is not registered on this board")
+        phase_info = card.get("phase") if isinstance(card.get("phase"), dict) else {}
         event = find_event(card, event_id)
         history = (card.get("handled") or {}).get(event_id) if event is None else None
         if event is None and not isinstance(history, dict):
             raise ValueError(f"unknown event {event_id} for task {task_id!r}")
         if event is None:
+            if history.get("phaseId") and mapped == "accepted" \
+                    and (phase != history.get("phaseId")
+                         or contract_hash != history.get("contractHash")):
+                raise ValueError("accept replay for a phase event must bind --phase and "
+                                 "--contract-hash to the exact contract revision")
             same = history.get("decision") == mapped and (
                 mapped != "accepted" or history.get("reviewedHead") == reviewed_head)
             if same:
@@ -1575,7 +1865,12 @@ def decide(repo, task, event_id, decision, reviewed_head=None, note=None, now=No
                              f"{history.get('decision')!r}; refusing to overwrite or replay it "
                              "with a different decision/reviewed head")
         kind = event.get("kind")
+        event_phase = event.get("phaseId")
         if event.get("handled"):
+            if event_phase and mapped == "accepted" and (phase != event_phase
+                                                         or contract_hash != event.get("contractHash")):
+                raise ValueError("accept replay for a phase event must bind --phase and "
+                                 "--contract-hash to the exact contract revision")
             same = event.get("decision") == mapped and (
                 mapped != "accepted" or event.get("reviewedHead") == reviewed_head)
             if same:
@@ -1586,10 +1881,42 @@ def decide(repo, task, event_id, decision, reviewed_head=None, note=None, now=No
                                  "different reviewed head")
             raise ValueError(f"event {event_id} is already handled as "
                              f"{event.get('decision')!r}; refusing to overwrite a decision")
+        if event_phase or event.get("contractHash"):
+            # Phase events are only meaningful for the exact installed contract and
+            # current candidate/round. Stale evidence can never be accepted or sent
+            # back as if it were the current delivery.
+            if mapped == "accepted" and (phase != event_phase
+                                         or contract_hash != event.get("contractHash")):
+                raise ValueError("accept for a phase event must bind --phase and --contract-hash "
+                                 "to the exact contract revision")
+            if event_phase != phase_info.get("phaseId") \
+                    or event.get("contractHash") != phase_info.get("contractHash"):
+                raise ValueError(f"stale phase event: the current phase is "
+                                 f"{phase_info.get('phaseId')!r}/"
+                                 f"{phase_info.get('contractHash')!r}; refresh the board and use "
+                                 "the current review event")
+            card_round = (card.get("pi") or {}).get("round")
+            if event.get("round") != card_round:
+                raise ValueError(f"stale phase event: round {event.get('round')} is not the current "
+                                 f"round {card_round}")
+            if (event.get("candidate") or {}).get("head") != phase_info.get("candidate"):
+                raise ValueError("stale phase event: its candidate is no longer the current phase "
+                                 "candidate")
         if mapped == "accepted":
             if kind not in REVIEW_KINDS:
                 raise ValueError(f"event kind {kind!r} is a fault/observation; "
                                  "use --decision resolve, not accept")
+            if event_phase:
+                readiness = phase_info.get("readiness") or {}
+                if readiness.get("status") != "ready":
+                    raise ValueError("the phase readiness projection is not 'ready'; refresh the "
+                                     "board after the required checks exist instead of accepting "
+                                     "missing/failed/unknown evidence")
+                evidence_dir = task_dir_for(_common, task_id)
+                if lock_is_held(evidence_dir / ".task.lock") \
+                        or lock_is_held(evidence_dir / ".supervisor.lock"):
+                    raise ValueError("a worker or supervisor lock is still held; the round must be "
+                                     "terminal and writer-free before a phase can be accepted")
             event_head = (event.get("candidate") or {}).get("head")
             worktree = card.get("worktree") or _root
             resolved_reviewed, problem = _resolve_commit(worktree, reviewed_head)
@@ -1619,7 +1946,23 @@ def decide(repo, task, event_id, decision, reviewed_head=None, note=None, now=No
         card.setdefault("handled", {})[event_id] = {
             "at": now, "decision": mapped,
             "reviewedHead": str(reviewed_head) if reviewed_head else None,
-            "round": event.get("round")}
+            "round": event.get("round"), "phaseId": event.get("phaseId"),
+            "contractHash": event.get("contractHash")}
+        if event_phase:
+            phase_card = card.setdefault("phase", {})
+            phase_card["decidedEventId"] = event_id
+            phase_card["lastDecision"] = mapped
+            phase_card["lastDecisionAt"] = now
+            if mapped == "accepted":
+                phase_card["status"] = "accepted"
+                phase_card["acceptedHead"] = str(reviewed_head) if reviewed_head else None
+                phase_card["acceptedAt"] = now
+                phase_card["reviewEventId"] = event_id
+            elif mapped == "changes_requested":
+                phase_card["status"] = "changes_requested"
+            elif mapped == "rejected":
+                phase_card["status"] = "rejected"
+            phase_card["updatedAt"] = now
         _prune_events(card)
         _update_overflow(card, now)
         codex = card.setdefault("codex", _default_codex())
@@ -1634,13 +1977,16 @@ def decide(repo, task, event_id, decision, reviewed_head=None, note=None, now=No
         else:
             history_entry = {"eventId": event_id, "decision": mapped, "at": now,
                              "round": event.get("round"),
-                             "reviewedHead": str(reviewed_head) if reviewed_head else None}
+                             "reviewedHead": str(reviewed_head) if reviewed_head else None,
+                             "phaseId": event.get("phaseId"),
+                             "contractHash": event.get("contractHash")}
             codex["history"] = (codex.get("history") or [])[-19:] + [history_entry]
         board["revision"] = int(board.get("revision") or 0) + 1
         board["updatedAt"] = now
         _write_board(board_file, board)
         return {"ok": True, "idempotent": False, "taskId": task_id, "eventId": event_id,
                 "decision": mapped, "reviewedHead": reviewed_head, "aggregate": is_current,
+                "phaseId": event_phase, "contractHash": event.get("contractHash"),
                 "revision": board["revision"], "pendingCount": len(pending_events(card)),
                 "note": "decision binds this exact event/candidate/round; accepted is explicit "
                         "main review of the current review event, never exit 0"}
@@ -1754,7 +2100,8 @@ def cmd_packet(args) -> dict:
 
 def cmd_decide(args) -> dict:
     return decide(args.repo, args.task, args.event_id, args.decision,
-                  reviewed_head=args.reviewed_head, note=args.note)
+                  reviewed_head=args.reviewed_head, note=args.note,
+                  phase=args.phase, contract_hash=args.contract_hash)
 
 
 def cmd_pause(args) -> dict:
@@ -1833,6 +2180,10 @@ def build_parser() -> argparse.ArgumentParser:
     decide.add_argument("--event-id", required=True)
     decide.add_argument("--decision", required=True, choices=sorted(DECISIONS))
     decide.add_argument("--reviewed-head")
+    decide.add_argument("--phase", help="required with accept for a phase-bound event; the exact "
+                                          "phase id")
+    decide.add_argument("--contract-hash", help="required with accept for a phase-bound event; the "
+                                                 "exact contract revision hash")
     decide.add_argument("--note")
     decide.set_defaults(func=cmd_decide)
 
