@@ -826,7 +826,7 @@ def project_status(card: dict, status: dict, now: float) -> bool:
     latest = receipts.get("latest")
     evidence_dir = status.get("evidence") or {}
     new_evidence = {
-        "candidateHead": status.get("endHead") or status.get("startHead"),
+        "candidateHead": _phase_candidate_head(status),
         "worktree": status.get("worktree"),
         "taskDir": evidence_dir.get("taskDir"),
         "roundDir": evidence_dir.get("roundDir"),
@@ -1063,11 +1063,22 @@ def _phase_anomaly_seconds() -> float:
 
 
 def _phase_candidate_head(status: dict):
-    """Current candidate identity: terminal endHead, active verified HEAD, then
-    the recorded round-start head. Active rounds expose ``currentHead`` from a
-    bounded read-only worktree probe so a mid-round commit is the candidate."""
-    head = status.get("endHead") or status.get("currentHead") or status.get("startHead")
-    return head if isinstance(head, str) else None
+    """Single candidate-identity source for the board and progress engine.
+
+    Terminal rounds use the exact ``endHead``. Active rounds require the bounded
+    ``currentHead`` probe: if it is missing (probe failed) the candidate is
+    unknown and must never fall back to the round-start commit, because that
+    would present an old receipt/self-report as current. Unknown ownership has
+    no verified candidate either.
+    """
+    state = status.get("state")
+    if state in TERMINAL_STATES:
+        head = status.get("endHead")
+    elif state in ACTIVE_STATES:
+        head = status.get("currentHead")
+    else:
+        head = None
+    return head if isinstance(head, str) and head else None
 
 
 def _applicable_successful_receipt(status: dict):
@@ -1369,7 +1380,7 @@ def _project_legacy_events(card: dict, status: dict, now: float) -> list:
     latest = receipts.get("latest")
     guard = checks.get("resourceGuard") or {}
     evidence_dir = status.get("evidence") or {}
-    head = status.get("endHead") or status.get("startHead")
+    head = _phase_candidate_head(status)
     candidate = {"round": status.get("round"), "head": head, "state": state}
     base_evidence = {"briefRef": evidence_dir.get("brief"), "checksRef": checks.get("dir"),
                      "stateRef": evidence_dir.get("state")}

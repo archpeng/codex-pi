@@ -55,7 +55,7 @@ python3 runtime/pi_task.py continue --repo REPO --task TASK \
 ### 进度回音与异常可见性（同阶段增补）
 
 - 里程碑只取自真实事实：候选绑定的通过回执（`verified_receipt`，必须同时通过 exit/timeout/cancel、候选 head/dirty、log 内容哈希核对，缺失或篡改日志不得触发）、带证据引用的 `checking/repairing` 进度（`pi_self_report_unverified`），或持续超过异常阈值且没有可验证修复进展的失败事实（`observed_receipt`，低优先级“修复中”）。普通 `implementing` 叙述、重复写入、日志增长都不是里程碑，不排队。
-- active round 的当前候选由有界只读 `git rev-parse HEAD` 核对并投影为 `currentHead`；阶段内提交后，新 HEAD 的回执/进度才被视为当前，旧候选的进度与回执不会被当成当前。
+- active round 的当前候选由有界只读 `git rev-parse HEAD` 核对并投影为 `currentHead`；阶段内提交后，新 HEAD 的回执/进度才被视为当前。若 active HEAD 探测失败，候选身份为未知（不回退 startHead），不发证据进度回音也不把旧回执/旧事件表述为当前；终态以 exact `endHead` 为准。短看板 `evidence.candidateHead` 与 `phase.candidate` 同源。
 - 每个阶段最多两次进度回音；两次之间默认至少 10 分钟（可用 `CODEX_PI_PROGRESS_NOTIFY_SECONDS` 调整，仅运维/测试）。额度与 `lastAt` 持久在 board card、按 `phaseId` 计数，不随 round、supervisor 重启或重复刷新重置；忙时新里程碑合入尚未投递的同阶段进度事件，不追发。
 - 用户 pause（card 或 Interrupt route）同时阻止进度回音、自动续接和显式 `continue`；普通对话不解除 pause。pause 在决策与启动之间到达时 fail closed：不启动补齐轮，配额保守保留并升级为 `phase_blocked`。
 - 需要决策或可最终验收的 `review_required`/`phase_blocked` 事件不占进度额度，也不受 10 分钟间隔压制；进度事件仍走既有 queue `uncertain` 语义，失败不自动重发。

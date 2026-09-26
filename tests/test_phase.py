@@ -808,6 +808,9 @@ class PhaseTest(unittest.TestCase):
         board_json("refresh", "--repo", str(repo.root), "--task", "mid-head", env=env)
         card = self.card(repo, "mid-head")
         self.assertEqual(card["phase"]["candidate"], new_head)
+        self.assertEqual(card["evidence"]["candidateHead"], new_head,
+                         "the short board candidate and the phase candidate share one source")
+        self.assertNotEqual(card["evidence"]["candidateHead"], start_head)
         milestones = self.pending(repo, "mid-head", "progress_update")
         self.assertEqual(len(milestones), 1)
         event = milestones[0]
@@ -817,6 +820,66 @@ class PhaseTest(unittest.TestCase):
         self.assertEqual(Path(event["evidence"]["receiptRef"]).name, new_receipt)
         self.assertNotIn(old_receipt, event["evidence"]["receiptRef"])
         repo.wait_terminal("mid-head", env=env, timeout=30)
+
+    def test_active_head_probe_failure_keeps_old_evidence_out_of_board_and_queue(self):
+        repo, worktree = self.make()
+        env = self.h_env(PI_DOUBLE_MODE="delay-ok", PI_DOUBLE_DELAY="12")
+        sha = self.write_design(repo)
+        path = self.write_contract("p.json", self.contract(repo, "P-HEADFAIL", design_sha=sha))
+        self.start(repo, worktree, "head-fail", path, env)
+        repo.wait_round_state("head-fail", "running")
+        start_head = self.head(worktree)
+        checks = repo.task_dir("head-fail") / "rounds" / "1" / "round.checks"
+        old = subprocess.run(
+            [sys.executable, str(CHECK), "--output-dir", str(checks), "--id", "A1",
+             "--", sys.executable, "-c", "print('old')"], cwd=str(worktree),
+            capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(old.returncode, 0, old.stderr)
+        old_receipt = Path(json.loads(old.stdout)["receipt"]).name
+        self.assertEqual(json.loads((checks / old_receipt).read_text())["head"], start_head)
+        (worktree / "new.txt").write_text("new\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(worktree), "add", "-A"], check=True,
+                       capture_output=True)
+        subprocess.run(["git", "-C", str(worktree), "-c", "user.email=t@e.invalid",
+                        "-c", "user.name=T", "commit", "-qm", "new head"], check=True,
+                       capture_output=True)
+        new_head = self.head(worktree)
+        self.assertNotEqual(new_head, start_head)
+        self.register(repo, "head-fail", env, transport="cli-queue", thread=THREAD_A)
+        board_path = repo.state_dir / "board.json"
+        with mock.patch.object(pi_task, "_head_probe",
+                               return_value=(None, "simulated probe failure")):
+            status = pi_task.build_status(str(repo.root), "head-fail")
+        self.assertIsNone(status["currentHead"])
+        self.assertIsNone(status["endHead"])
+        self.assertTrue(any("current HEAD could not be read" in note
+                            for note in status["notes"]))
+        refresh = pi_board.refresh_with_status(board_path, "head-fail", status, now=100,
+                                               block=False)
+        card = self.card(repo, "head-fail")
+        self.assertIsNone(card["phase"]["candidate"],
+                          "a failed active HEAD probe must not fall back to startHead")
+        self.assertIsNone(card["evidence"]["candidateHead"],
+                          "the short board must report the unknown candidate honestly")
+        self.assertEqual([event for event in card["events"]
+                          if event.get("kind") == "progress_update"], [])
+        self.assertEqual(refresh["newEvents"], [])
+        calls = []
+
+        def runner(argv, timeout):
+            calls.append(argv)
+            return {"status": "queued", "exitCode": 0, "timedOut": False,
+                    "outputSha256": "0" * 64, "outputExcerpt": "", "argv0": argv[0]}
+
+        with mock.patch.object(pi_board, "_resolve_codex_bin", return_value="/bin/true"):
+            dispatched = pi_board.dispatch_task(board_path, "head-fail", cli_runner=runner)
+        self.assertFalse(dispatched["dispatched"])
+        self.assertEqual(calls, [], "an unknown active candidate must never emit a queue message")
+        self.assertEqual(card["events"], [])
+        self.assertIsNone(card["phase"]["candidate"])
+        self.assertIsNone(card["evidence"]["candidateHead"])
+        repo.cancel("head-fail", env=env)
+        repo.wait_terminal("head-fail", env=env, timeout=25)
 
     def test_forbid_skip_requires_parseable_counts(self):
         repo, worktree = self.make()

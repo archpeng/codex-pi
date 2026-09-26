@@ -44,6 +44,7 @@ def base_status(checks_dir: Path, card: dict, *, phase_id: str = "P1", contract:
     return {
         "task": card["taskId"], "round": round_number, "state": state,
         "recordedState": state, "startHead": candidate, "endHead": end_head,
+        "currentHead": None if state in pi_board.TERMINAL_STATES else candidate,
         "ownership": {"activeWorker": True, "supervisorAlive": True},
         "timedOut": False, "cancelled": False,
         "evidence": {"brief": "/evidence/brief.md", "state": "/evidence/state.json",
@@ -326,6 +327,17 @@ class ProgressEchoTest(unittest.TestCase):
         self.assertIn("review_required", kinds,
                       "final acceptance must not be suppressed by the progress quota")
         self.assertEqual(card["notify"]["phases"]["P1"]["count"], 2)
+
+    def test_candidate_identity_has_one_fail_closed_source(self):
+        running = {"state": "running", "currentHead": None, "startHead": "a" * 40,
+                   "endHead": None}
+        self.assertIsNone(pi_board._phase_candidate_head(running))
+        terminal = {"state": "completed", "currentHead": "b" * 40, "endHead": "c" * 40,
+                    "startHead": "a" * 40}
+        self.assertEqual(pi_board._phase_candidate_head(terminal), "c" * 40)
+        unknown = {"state": "unknown", "currentHead": "b" * 40, "startHead": "a" * 40,
+                   "endHead": None}
+        self.assertIsNone(pi_board._phase_candidate_head(unknown))
 
     def test_verified_milestone_requires_a_matching_log(self):
         repo = Repo(self.tmp, name="echo-real")
