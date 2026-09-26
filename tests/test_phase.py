@@ -575,11 +575,16 @@ class PhaseTest(unittest.TestCase):
         repo.wait_terminal("fail-task")
         self.assertEqual(self.rounds(repo, "fail-task"), [1])
         self.assertEqual(self.phase_auto(repo, "fail-task"), {})
+        readiness = cli_json("readiness", "--repo", str(repo.root), "--task", "fail-task",
+                             "--round", "1", env=env)
+        self.assertEqual(readiness["status"], "not_ready")
+        self.assertEqual(readiness["evidenceLevels"]["deliveryReadiness"], "not_ready")
         self.register(repo, "fail-task", env)
         self.refresh(repo, "fail-task", env)
+        self.assertEqual(self.pending(repo, "fail-task", "review_required"), [])
         blocked = self.pending(repo, "fail-task", "phase_blocked")
         self.assertEqual(len(blocked), 1)
-        self.assertEqual(blocked[0]["evidence"]["reason"], "round_failed")
+        self.assertEqual(blocked[0]["evidence"]["reason"], "round_execution_failed")
 
     def test_out_of_scope_change_escalates_instead_of_auto_continuing(self):
         repo, worktree = self.make()
@@ -1058,6 +1063,84 @@ class PhaseTest(unittest.TestCase):
         self.assertEqual(card["phase"]["status"], "accepted")
         self.assertEqual(card["phase"]["acceptedHead"], head)
         self.assertEqual(self.pending(repo, "gate-task"), [])
+
+    def ready_accept_fixture(self, name: str, phase_id: str) -> dict:
+        """Real passing receipt, pending review event and writer-free terminal state."""
+        repo, worktree = self.make(name=f"repo-{name}")
+        env = self.h_env(PI_DOUBLE_MODE="delay-ok", PI_DOUBLE_DELAY="6")
+        sha = self.write_design(repo)
+        path = self.write_contract(f"{name}.json", self.contract(repo, phase_id, design_sha=sha))
+        self.start(repo, worktree, name, path, env)
+        repo.wait_round_state(name, "running")
+        candidate = self.head(worktree)
+        checks = repo.task_dir(name) / "rounds" / "1" / "round.checks"
+        check = subprocess.run(
+            [sys.executable, str(CHECK), "--output-dir", str(checks), "--id", "A1",
+             "--", sys.executable, "-c", "print('ok')"], cwd=str(worktree),
+            capture_output=True, text=True, env=env, timeout=60)
+        if check.returncode != 0:
+            raise AssertionError(check.stderr)
+        self.register(repo, name, env, transport="cli-queue", thread=THREAD_A)
+        board_json("refresh", "--repo", str(repo.root), "--task", name, env=env)
+        repo.wait_terminal(name)
+
+        def writer_free():
+            live = cli_json("status", "--repo", str(repo.root), "--task", name, env=env)
+            if not live["ownership"]["activeWorker"] and not live["ownership"]["supervisorAlive"]:
+                return live
+            return None
+
+        self.wait_for(writer_free, timeout=20, what=f"writer-free status for {name}")
+        board_json("refresh", "--repo", str(repo.root), "--task", name, env=env)
+        review = self.pending(repo, name, "review_required")
+        if len(review) != 1:
+            raise AssertionError(f"expected one review event for {name}, got {len(review)}")
+        frozen = json.loads((repo.task_dir(name) / "phase.json").read_text(encoding="utf-8"))
+        return {"repo": repo, "worktree": worktree, "env": env, "candidate": candidate,
+                "review": review[0], "contractSha256": frozen["contractSha256"]}
+
+    def test_terminal_execution_facts_are_enforced_by_the_gate(self):
+        # Known failure (nonzero exit, cancelled, timed out) is not_ready;
+        # a missing exit code is unknown. None of them may pass the gate.
+        cases = [
+            ("nonzero-exit", {"exitCode": 7}, "not_ready"),
+            ("missing-exit", {"exitCode": None}, "unknown"),
+            ("cancelled", {"cancelled": True}, "not_ready"),
+            ("timed-out", {"timedOut": True}, "not_ready"),
+        ]
+        for label, mutation, expected in cases:
+            with self.subTest(case=label):
+                fixture = self.ready_accept_fixture(f"exec-{label}",
+                                                    "P-EXEC-" + label.upper().replace("-", ""))
+                repo, env = fixture["repo"], fixture["env"]
+                task = f"exec-{label}"
+                candidate = fixture["candidate"]
+                state_path = repo.task_dir(task) / "rounds" / "1" / "round.state.json"
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                state.update(mutation)
+                state_path.write_text(json.dumps(state), encoding="utf-8")
+                status = cli_json("status", "--repo", str(repo.root), "--task", task, env=env)
+                self.assertEqual(status["phase"]["readiness"]["status"], expected, label)
+                self.assertFalse(status["phase"]["readiness"].get("readyForReview"), label)
+                readiness = cli_json("readiness", "--repo", str(repo.root), "--task", task,
+                                     "--round", "1", env=env)
+                self.assertEqual(readiness["status"], expected, label)
+                self.assertFalse(readiness["readyForReview"], label)
+                # The old review event predates the mutation; the live accept
+                # gate must refuse it before any board refresh.
+                proc = run_board("decide", "--repo", str(repo.root), "--task", task,
+                                 "--event-id", fixture["review"]["id"], "--decision", "accept",
+                                 "--reviewed-head", candidate,
+                                 "--phase", fixture["review"]["phaseId"],
+                                 "--contract-hash", fixture["contractSha256"], env=env, expect=2)
+                self.assertIn("stale", proc.stderr, label)
+                # A refresh must not claim ready and must supersede the obsolete
+                # review event instead of leaving it current.
+                board_json("refresh", "--repo", str(repo.root), "--task", task, env=env)
+                card = self.card(repo, task)
+                self.assertNotEqual(card["phase"]["status"], "review_ready", label)
+                self.assertEqual(self.pending(repo, task, "review_required"), [], label)
+                self.assertTrue(self.pending(repo, task, "phase_blocked"), label)
 
     def test_snapshot_identity_and_grades_are_consistent_across_components(self):
         repo, worktree = self.make()

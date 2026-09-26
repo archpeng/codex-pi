@@ -997,6 +997,37 @@ def _scope_check(task_dir: Path, record: dict, candidate: str | None) -> dict:
         close_pipe()
 
 
+def evaluate_execution_gate(state: dict):
+    """Execution facts for one round: ``(ok, status, reason)``.
+
+    Only a normally completed round with ``exitCode == 0``,
+    ``cancelled is False`` and ``timedOut is False`` is ``ok``. Known abnormal
+    outcomes are ``failed``; missing or contradictory values are ``unknown``.
+    This is a single gate consumed by the normalized readiness snapshot.
+    """
+    raw_state = state.get("state")
+    exit_code = state.get("exitCode")
+    cancelled = state.get("cancelled")
+    timed_out = state.get("timedOut")
+    if raw_state != "completed":
+        if raw_state in TERMINAL_STATES:
+            return (False, "failed",
+                    f"round ended as {raw_state}; only a normally completed round can be "
+                    "delivery-ready")
+        return False, "not_terminal", f"round state {raw_state!r} is not terminal"
+    if timed_out is True:
+        return False, "failed", "round wrapper timed out"
+    if cancelled is True:
+        return False, "failed", "round was cancelled"
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+        return False, "unknown", "round exit code is missing or contradictory"
+    if exit_code != 0:
+        return False, "failed", f"round exited {exit_code}"
+    if timed_out is not False or cancelled is not False:
+        return False, "unknown", "round cancelled/timed_out flags are missing or contradictory"
+    return True, "ok", None
+
+
 def evaluate_acceptance_items(contract: dict, candidate_head, checks: dict, checks_dir: Path):
     """The single receipt-validity evaluation shared by every consumer.
 
@@ -1113,11 +1144,13 @@ def build_phase_snapshot(task_dir: Path, task: dict, round_number: int, *, state
     scan_partial = bool(checks.get("partial") or receipts.get("truncated")
                         or receipts.get("partial"))
     notes = []
+    execution_ok, execution_status, execution_reason = evaluate_execution_gate(state)
     status, reason = "unknown", None
     if candidate.get("status") != "known":
         status, reason = "unknown", candidate.get("reason")
-    elif raw_state not in TERMINAL_STATES:
-        status, reason = "not_ready", f"round state {raw_state!r} is not terminal"
+    elif execution_status != "ok":
+        status = "not_ready" if execution_status in ("failed", "not_terminal") else "unknown"
+        reason = execution_reason
     elif scope.get("status") == "violation":
         status, reason = "not_ready", "files outside the declared phase scope"
     elif any(item["status"] in ("failed", "skipped", "unknown", "missing") for item in items):
@@ -1128,11 +1161,8 @@ def build_phase_snapshot(task_dir: Path, task: dict, round_number: int, *, state
         status, reason = "unknown", "the bounded check scan was partial or truncated"
     else:
         status, reason = "ready", "all required evidence is covered for the candidate"
-    if raw_state is not None and raw_state != "completed":
-        notes.append(f"round state {raw_state!r} is terminal but not a normal completion; "
-                     "delivery readiness is false")
-        if status == "ready":
-            status, reason = "not_ready", f"round did not complete normally ({raw_state})"
+    if execution_status != "ok":
+        notes.append(f"execution gate: {execution_reason}")
     if scope.get("status") == "violation":
         gaps.append({"id": "scope", "checkId": None, "status": "violation",
                      "reason": "files outside the declared phase scope: "
@@ -1144,7 +1174,9 @@ def build_phase_snapshot(task_dir: Path, task: dict, round_number: int, *, state
     readiness = {"status": status, "reason": reason, "coverage": coverage, "gaps": gaps,
                  "scope": scope.get("status"), "writerFree": writer_free,
                  "readyForReview": ready_for_review, "generatedAt": time.time(),
-                 "checkedItems": len(items)}
+                 "checkedItems": len(items),
+                 "execution": {"ok": execution_ok, "status": execution_status,
+                               "reason": execution_reason}}
     return {
         "schemaVersion": 1,
         "round": round_number,
@@ -1152,10 +1184,14 @@ def build_phase_snapshot(task_dir: Path, task: dict, round_number: int, *, state
         "contractSha256": record.get("contractSha256"),
         "candidate": candidate,
         "execution": {"state": raw_state, "exitCode": state.get("exitCode"),
-                      "timedOut": bool(state.get("timedOut")),
-                      "cancelled": bool(state.get("cancelled")),
+                      "cancelled": state.get("cancelled") if isinstance(
+                          state.get("cancelled"), bool) else None,
+                      "timedOut": state.get("timedOut") if isinstance(
+                          state.get("timedOut"), bool) else None,
                       "terminal": raw_state in TERMINAL_STATES,
-                      "completed": raw_state == "completed" and state.get("exitCode") == 0},
+                      "completed": execution_ok,
+                      "gate": {"ok": execution_ok, "status": execution_status,
+                               "reason": execution_reason}},
         "checksDir": str(checks_dir),
         "scanPartial": scan_partial,
         "verificationBudget": budget,

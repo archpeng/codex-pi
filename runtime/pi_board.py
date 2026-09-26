@@ -783,6 +783,7 @@ def _phase_projection(card: dict, status: dict, now: float):
         "readiness": {"status": readiness.get("status"),
                       "coverage": readiness.get("coverage"),
                       "writerFree": readiness.get("writerFree"),
+                      "execution": (readiness.get("execution") or {}).get("status"),
                       "gaps": [{"id": item.get("id"), "status": item.get("status"),
                                 "reason": item.get("reason")}
                                for item in (readiness.get("gaps") or [])[:10]],
@@ -798,9 +799,10 @@ def _phase_projection(card: dict, status: dict, now: float):
     if not changed:
         old_readiness = existing.get("readiness") or {}
         new_readiness = new_phase.get("readiness") or {}
-        if (old_readiness.get("status"), old_readiness.get("coverage"), old_readiness.get("scope")) \
+        if (old_readiness.get("status"), old_readiness.get("coverage"), old_readiness.get("scope"),
+                (old_readiness.get("execution") or {})) \
                 != (new_readiness.get("status"), new_readiness.get("coverage"),
-                    new_readiness.get("scope")):
+                    new_readiness.get("scope"), (new_readiness.get("execution") or {})):
             changed = True
         old_auto = existing.get("autoContinue") or {}
         new_auto = new_phase.get("autoContinue") or {}
@@ -940,6 +942,14 @@ def _phase_blocked_reason(readiness: dict, auto: dict, status: dict) -> str:
         return "auto_continue_unknown"
     if auto_status == "blocked":
         return (auto or {}).get("reason") or "auto_continue_unknown"
+    execution = readiness.get("execution") or {}
+    execution_status = execution.get("status")
+    if execution_status == "failed":
+        return "round_execution_failed"
+    if execution_status == "unknown":
+        return "round_execution_unknown"
+    if execution_status == "not_terminal":
+        return "round_not_terminal"
     last = (status.get("phase") or {}).get("lastDecision") or {}
     if last.get("reason"):
         # The script's post-round classification (for example a pause or a
@@ -1025,6 +1035,9 @@ def _project_phase_events(card: dict, status: dict, now: float) -> list:
             reason = _phase_blocked_reason(readiness, auto, status)
             fingerprint = (f"phase:{phase_id}:contract:{contract_hash}:candidate:{candidate}:"
                            f"blocked:{reason}:{auto.get('status') or 'none'}")
+            # A review event from a previous, now-invalid state must not remain
+            # current: the same snapshot gate owns both sides.
+            _supersede_phase_kinds(card, now, ("review_required",))
             _supersede_phase_kinds(card, now, ("phase_blocked",), keep_fingerprint=fingerprint)
             add("phase_blocked", fingerprint,
                 f"phase {phase_id} round {status.get('round')} is not delivery-ready ({reason})",
