@@ -1027,8 +1027,9 @@ def cmd_wait(args) -> dict:
             break
         time.sleep(min(0.3, max(0.05, deadline - time.monotonic())))
     result["wait"] = {"timeoutMs": timeout_ms, "timedOut": timed_out,
-                      "note": "waiting never cancels the worker, and there is no automatic wake after your turn ends; "
-                              "do not spin repeated waits"}
+                      "note": "waiting never cancels the worker; an explicitly armed trusted Stop handoff "
+                              "may deliver a continuation, but there is no automatic wake otherwise, so do not "
+                              "spin repeated waits"}
     return result
 
 
