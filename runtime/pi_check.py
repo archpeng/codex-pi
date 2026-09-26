@@ -48,33 +48,49 @@ RUNNING_SUFFIX = ".running"
 GUARD_EXIT_CODE = 75
 MIN_HEALTH_INTERVAL = 0.05
 MAX_HEALTH_INTERVAL = 3600.0
-UNITTEST_SUMMARY_RE = re.compile(
-    r'^Ran (?P<run>\d+) tests? in [\d.]+s\s*\n'
-    r'(?P<result>OK|FAILED)(?:\s*\((?P<detail>[^)]*)\))?\s*$', re.M)
+UNITTEST_RAN_RE = re.compile(r'^Ran (?P<run>\d+) tests? in [\d.]+s\s*$')
+UNITTEST_RESULT_RE = re.compile(r'^(?P<result>OK|FAILED)(?:\s*\((?P<detail>[^)]*)\))?\s*$')
 
 
 def unittest_counts(text: str):
-    """Recognizable final unittest summary from the same log bytes; None if ambiguous.
+    """Counts from the unambiguous final unittest summary; None otherwise.
 
-    Only fixed counters survive. A missing or malformed summary returns ``None``
-    so declared ``minRun``/``forbidSkip`` rules stay unknown instead of passing.
+    The last ``Ran N tests ...`` line is the final candidate summary. It must be
+    followed by a recognizable ``OK``/``FAILED`` line, and every detail field
+    must be a well-formed integer ``key=value``. Malformed details (for example
+    ``skipped=oops``) and an incomplete final summary return ``None``, so
+    declared ``minRun``/``forbidSkip`` rules stay unknown instead of passing.
     """
-    matches = list(UNITTEST_SUMMARY_RE.finditer(text))
-    if not matches:
+    lines = text.splitlines()
+    last_ran = None
+    for index, line in enumerate(lines):
+        match = UNITTEST_RAN_RE.match(line.strip())
+        if match:
+            last_ran = (index, int(match.group('run')))
+    if last_ran is None:
         return None
-    match = matches[-1]
-    detail = match.group('detail') or ''
+    result_line = next((line.strip() for line in lines[last_ran[0] + 1:] if line.strip()), None)
+    if result_line is None:
+        return None
+    result = UNITTEST_RESULT_RE.match(result_line)
+    if result is None:
+        return None
     failures = errors = skipped = 0
-    for part in detail.split(','):
-        key, _sep, value = part.strip().partition('=')
-        if value.isdigit() and key in ('failures', 'errors', 'skipped'):
+    detail = result.group('detail')
+    if detail is not None:
+        for part in detail.split(','):
+            key, _sep, value = part.strip().partition('=')
+            if not key or not _sep or not value.isdigit():
+                return None
             if key == 'failures':
                 failures = int(value)
             elif key == 'errors':
                 errors = int(value)
-            else:
+            elif key == 'skipped':
                 skipped = int(value)
-    run = int(match.group('run'))
+            # other well-formed integer fields (for example expected failures)
+            # are forward-compatible and do not change the fixed counters
+    run = last_ran[1]
     fail = failures + errors
     return {'run': run, 'pass': max(0, run - fail - skipped), 'fail': fail,
             'skip': skipped, 'format': 'python_unittest_summary'}

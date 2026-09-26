@@ -24,12 +24,20 @@
 - 契约校验：`resourceLimits` 的每个路径在 `start`/`continue` 冻结前即校验必须位于 task worktree
   内，且 worktree 与目标之间的任何组件都不是 symlink；越界、`..` 或 symlink 中间组件直接拒绝，
   不创建任务证据。扫描时再次校验，若运行中变成 symlink 则按 unknown 处理（绝不放行）。
-- 执行期观测：supervisor 循环独立于 board 刷新周期，每 ≤60 秒对每个声明路径做一次有界的
-  `pi_size.measure` no-follow 测量（测试/运维可用 `CODEX_PI_RESOURCE_SCAN_SECONDS` 覆盖，范围
-  0.05–60 秒）；高水位与状态持久保存在 `rounds/<n>/resource.state.json`，Pi 结束后再做一次最终
-  测量。
-- 已知超限：完整扫描或部分扫描下界超过 `maxBytes` 时设置粘性 `breached` 高水位，只对所属 Pi
-  进程组执行终止（SIGTERM→SIGKILL），记录 `resourceBreached`/`resourceReason`，readiness 为
+- 执行期观测：supervisor 循环独立于 board 刷新周期，每 ≤60 秒巡检（测试/运维可用
+  `CODEX_PI_RESOURCE_SCAN_SECONDS` 覆盖，范围 0.05–60 秒），每轮扫描有**总时间预算**
+  （默认 10 秒，`CODEX_PI_RESOURCE_SCAN_BUDGET_SECONDS` 可覆盖）：每个声明路径的 `pi_size.measure`
+  no-follow 测量被剩余预算限制，未访问的声明保持 unknown；已知超限在所属测量后立即返回，不再
+  扫描其余路径，因此 supervisor 能及时检查子进程、中止、超时并刷新 board。高水位与状态持久保存
+  在 `rounds/<n>/resource.state.json`，Pi 结束后再做一次最终测量。
+- 证据绑定与 fail-closed：持久证据写入当前 round、phaseId、契约 SHA-256 与
+  `limitsSignature`（声明路径+上限的规范摘要）；当 `resourceLimits` 非空时，缺失、损坏、陈旧、
+  与声明不一致、或没有完成最终扫描（`finalScannedAt` 为空）的证据均判为 `unknown`，绝不 ready。
+  ready 还要求每个声明项的最终观测 `complete=true` 且未超限；有效状态由最终逐项观测重新计算，
+  手改的 `status` 与证据矛盾时为 unknown；写入失败不会被当成通过，只会留下缺失/陈旧证据并由上述
+  规则拦截。`resourceLimits=[]` 仍是显式的无上限情形。
+- 已知超限：完整扫描或部分扫描下界超过 `maxBytes` 时立即返回粘性 `breached` 停止原因，只对所属
+  Pi 进程组执行终止（SIGTERM→SIGKILL），记录 `resourceBreached`/`resourceReason`，readiness 为
   `not_ready`，看板产生一条 `phase_blocked`（reason `resource_breached`，evidence 带路径、
   max/observed 与依据）。
 - 测量未知：不完整或不可读的测量保持 `unknown`，绝不当作预算内。连续未知达到两分钟（测试可用
@@ -39,24 +47,30 @@
 - 证据：`::test_declared_phase_resource_breach_stops_pi_and_blocks`（真实写爆 worktree，exit 75
   终止、blocked 事件与高水位）、`::test_declared_phase_resource_unknown_escalates_and_blocks`
   （chmod 0 目录触发持续未知升级）、`::test_phase_contract_rejects_escaping_resource_limit`
-  （traversal 与 symlink 父组件在 start 时被拒且无任务证据）。
+  （traversal 与 symlink 父组件在 start 时被拒且无任务证据）、
+  `::test_resource_evidence_missing_corrupt_stale_and_incomplete_cannot_pass`（真实 task 与
+  live accept：缺失/损坏/陈旧/最终未完成/矛盾摘要均 unknown，旧 review 事件随之失效，恢复后新
+  episode 才能接受），以及 `::test_resource_scan_budget_bounds_many_limits_and_escalates`
+  （measurement double 下 40 个限制的扫描限时、超限快速停止、持续未知升级）。
 - 边界：保护的是**声明的路径**与**持续可观测的常规文件写入**；不保证任意外部进程的写入、不保证
   supervisor 自身死亡后的行为，也不监控未声明的路径或最终测量之后产生的文件。没有新增 daemon、
   heartbeat 或模型调用；用户 pause 语义不变。
 
 ## 3. `unittest` 计数
 
-- `pi_check` 在已经读取用于哈希的同一份日志字节上解析最后一个
-  `Ran N tests in ...s` + `OK|FAILED (...)` 摘要，输出
-  `{run, pass, fail, skip, format: "python_unittest_summary"}`；Go verbose 解析保持不变。
+- `pi_check` 在已经读取用于哈希的同一份日志字节上解析**最终候选 summary**：最后一条
+  `Ran N tests in ...s` 必须紧跟可识别的 `OK`/`FAILED` 行，且括号内每个字段都必须是合法的
+  `key=数字`。输出 `{run, pass, fail, skip, format: "python_unittest_summary"}`；Go verbose
+  解析保持不变。
 - 计数规则沿用既有 fail-closed 语义：零运行在声明 `minRun` 时不通过；`skip>0` 在 `forbidSkip` 下为
-  `skipped`；failure 为 `failed`；缺失/畸形/歧义摘要不产生 counts，声明计数规则时为 `unknown`，
-  绝不假通过。
+  `skipped`；failure 为 `failed`；缺失/畸形/歧义摘要（例如 `skipped=oops`，或先有合法摘要再出现
+  未完成的最终 `Ran` 行）不产生 counts，声明计数规则时为 `unknown`，绝不假通过。未声明计数规则的
+  旧回执不被追溯要求 counts。
 - 证据：`tests/test_receipts.py::test_python_unittest_counts_positive_failure_and_skip`、
-  `::test_python_unittest_zero_and_ambiguous_summaries_stay_explicit`，以及
-  `tests/test_phase.py::test_python_count_rules_follow_board_readiness_and_accept`：真实
-  `unittest` 回执让 readiness `covered`，`skip`/缺失 counts 分别阻塞 `decide accept`，恢复后新的
-  review episode 再被接受。
+  `::test_python_unittest_zero_and_ambiguous_summaries_stay_explicit`（含 malformed detail 与
+  dangling final summary），以及 `tests/test_phase.py::test_python_count_rules_follow_board_readiness_and_accept`：
+  真实 `unittest` 回执让 readiness `covered`，真实 skip/fail 回执分别阻塞 `decide accept`，恢复后
+  新的 review episode 再被接受。
 - 边界：本阶段任务的冻结 helper 不热替换，因此本阶段自身的最终回执可能没有 counts；新解析器由
   使用当前源码的运行测试与独立日志复核证明，而不是替换任务工具目录。
 
@@ -67,4 +81,4 @@
   阶段范围。
 - 证据索引（本仓库）：`runtime/pi_task.py`、`runtime/pi_board.py`、`runtime/pi_check.py`、
   `tests/test_phase.py`、`tests/test_receipts.py`；最终干净候选的三项验收回执见本轮最终报告与
-  `rounds/3/round.checks/`。
+  `rounds/4/round.checks/`。

@@ -268,6 +268,31 @@ class ReceiptTest(unittest.TestCase):
         receipt = json.loads(Path(json.loads(ambiguous.stdout)["receipt"]).read_text(encoding="utf-8"))
         self.assertIsNone(receipt["test_counts"])
 
+        malformed = self.run_pi_check(
+            "py-malformed", sys.executable, "-c",
+            "print('Ran 2 tests in 0.010s'); print(); print('OK (skipped=oops)')")
+        self.assertEqual(malformed.returncode, 0, malformed.stderr)
+        receipt = json.loads(Path(json.loads(malformed.stdout)["receipt"]).read_text(encoding="utf-8"))
+        self.assertIsNone(receipt["test_counts"],
+                          "a malformed detail field must not become skip=0")
+
+        dangling = self.run_pi_check(
+            "py-dangling", sys.executable, "-c",
+            "print('Ran 2 tests in 0.010s'); print(); print('OK'); print(); "
+            "print('Ran 0 tests in 0.010s')")
+        self.assertEqual(dangling.returncode, 0, dangling.stderr)
+        receipt = json.loads(Path(json.loads(dangling.stdout)["receipt"]).read_text(encoding="utf-8"))
+        self.assertIsNone(receipt["test_counts"],
+                          "an incomplete final summary must not reuse an earlier run count")
+
+        forward = self.run_pi_check(
+            "py-forward", sys.executable, "-c",
+            "print('Ran 2 tests in 0.010s'); print(); print('OK (expected failures=1)')")
+        self.assertEqual(forward.returncode, 0, forward.stderr)
+        receipt = json.loads(Path(json.loads(forward.stdout)["receipt"]).read_text(encoding="utf-8"))
+        self.assertEqual(receipt["test_counts"]["run"], 2)
+        self.assertEqual(receipt["test_counts"]["skip"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

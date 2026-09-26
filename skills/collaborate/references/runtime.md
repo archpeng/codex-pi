@@ -66,8 +66,9 @@ uses that per-command cap while a legacy task keeps the project round-timeout ex
 whole-round supervisor timeout is a separate limit. A ready review event carries a durable episode
 id: invalidating and recovering the same round/candidate publishes exactly one new review event,
 unchanged refreshes stay idempotent, the old event stays superseded, and `accept` binds only the
-new event. `pi_check` also reports run/pass/fail/skip for a final `unittest` summary (Go verbose
-counts unchanged); `minRun`/`forbidSkip` stay unknown/skipped/failed when that summary is missing,
+new event. `pi_check` also reports run/pass/fail/skip for the unambiguous final `unittest` summary
+(Go verbose counts unchanged); a malformed or ambiguous final summary yields no counts, and
+`minRun`/`forbidSkip` stay unknown/skipped/failed when that summary is missing,
 zero, skipped or failing. `accept` re-reads the live status and
 refuses when the round, contract revision, candidate, readiness, worktree HEAD or writer-free state
 no longer match the stored event. Tasks without a
@@ -92,7 +93,7 @@ python3 /absolute/task/tools/pi_copy.py /absolute/source /absolute/new-destinati
 
 Replace example commands and limits with meaningful project budgets. A running marker reports wrapper start, actual deadline, child identity and optional directory guard. Final immutable receipts bind command, revision, exit and log hash. Failed, skipped, interrupted, unknown or zero-test attempts never become a pass. The command timeout and whole Pi round timeout are separate. For a phase task the per-command `--timeout-seconds` must not exceed the contract's `commandTimeoutSeconds`; a receipt outside that bound or with a different command can never cover its acceptance item.
 
-For a phase task with `resourceLimits`, the supervisor additionally measures every declared in-worktree path at most every 60 seconds while Pi runs and once at termination, using the no-follow high-water state under the round directory; it validates the path cannot escape the worktree through `..` or symlink components. A known overage (even a partial lower bound already over the cap) stops only the owned Pi process group and makes the phase not ready; a measurement unknown for two minutes escalates the same way. Incomplete or unreadable evidence is never under budget. This covers declared paths and persistently observable writes, not arbitrary external writes or a dead supervisor.
+For a phase task with `resourceLimits`, the supervisor additionally measures every declared in-worktree path at most every 60 seconds while Pi runs and once at termination under a bounded aggregate scan budget, using the no-follow high-water state under the round directory; it validates the path cannot escape the worktree through `..` or symlink components. A known overage (even a partial lower bound already over the cap) stops only the owned Pi process group and makes the phase not ready; a measurement unknown for two minutes escalates the same way. Missing, corrupt, stale, contradictory or final-incomplete resource evidence is unknown when limits are declared, never ready; `resourceLimits=[]` declares no limit. This covers declared paths and persistently observable writes, not arbitrary external writes or a dead supervisor.
 
 Directory guards measure declared regular-file bytes without following symlinks. An observed known breach stops only the owned command group and records the failure; an incomplete measurement stays unknown. The copy helper preserves literal symlinks and refuses existing destinations, recursion, known overages or unknown verification. These rules prevent the 14 MB → 6.5 GB expansion incident without asking the main model to poll.
 

@@ -99,12 +99,14 @@ python3 runtime/pi_task.py continue --repo REPO --task TASK \
 - ready review 事件带持久 `reviewEpisode`；仅当同一候选的 pending review 被失效时递增，恢复后
   最多续发一条新 review，重复刷新幂等，旧事件保持 superseded，`decide accept` 只能绑定新事件。
 - 契约 `resourceLimits` 的每个路径在 `start`/`continue` 时校验位于 worktree 内且无 symlink 中间
-  组件；执行期由 supervisor 独立于 board 刷新周期每 ≤60 秒 no-follow 测量并持久高水位，终态再测
-  一次。已知超限（含部分扫描下界）只终止所属 Pi 进程组并产生 `resource_breached` 阻塞事实；
-  持续 ≥2 分钟的测量未知升级为 `resource_unknown`；不确定性绝不当作预算内。边界：只覆盖声明路径
-  和持续可观测的写入，不保证任意外部写入或 supervisor 死亡。
-- `pi_check` 同时解析 unittest 最终摘要（run/pass/fail/skip，`python_unittest_summary`），Go
-  解析不变；`minRun`/`forbidSkip` 对缺失/零/跳过/失败保持 unknown/failed/skipped 语义，不假通过。
+  组件；执行期由 supervisor 独立于 board 刷新周期每 ≤60 秒 no-follow 测量并持久高水位（每轮扫描
+  有总时间预算，未访问项为 unknown），终态再测一次。已知超限（含部分扫描下界）只终止所属 Pi
+  进程组并产生 `resource_breached` 阻塞事实；持续 ≥2 分钟的测量未知升级为 `resource_unknown`；
+  缺失/损坏/陈旧/与声明不一致/无最终扫描的证据一律 unknown，绝不 ready；`resourceLimits=[]` 是
+  显式无上限。边界：只覆盖声明路径和持续可观测的写入，不保证任意外部写入或 supervisor 死亡。
+- `pi_check` 同时解析 unittest 的最终候选 summary（run/pass/fail/skip，
+  `python_unittest_summary`），Go 解析不变；畸形/歧义最终摘要不产生 counts；`minRun`/`forbidSkip`
+  对缺失/零/跳过/失败保持 unknown/failed/skipped 语义，不假通过。
 - 详细证据与边界见 [o4-release-hardening-20260926.md](o4-release-hardening-20260926.md)。
 
 ### 兼容与边界
