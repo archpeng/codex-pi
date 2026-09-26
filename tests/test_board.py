@@ -79,6 +79,12 @@ def make_cli_double(directory: Path, name: str = "codex-double", behavior: str =
     marker = directory / f"{name}.jsonl"
     if behavior == "ok":
         tail = 'print("Queued message double for thread " + argv[4])\nraise SystemExit(0)\n'
+    elif behavior == "spam":
+        tail = ('import sys\nsys.stdout.write("x" * 2000000)\nsys.stdout.flush()\n'
+                'raise SystemExit(0)\n')
+    elif behavior == "crash":
+        tail = ('print("Queued message double for thread " + argv[4], flush=True)\n'
+                'import os, signal\nos.kill(os.getpid(), signal.SIGKILL)\n')
     elif behavior == "slow":
         tail = (f'import time\n'
                 f"with open({str(marker) + '.pid'!r}, 'w') as handle: "
@@ -365,22 +371,64 @@ class BoardTest(unittest.TestCase):
         self.assertTrue(third["dispatched"], "an explicit rearm enables one more send")
         self.assertGreater(len(self.marker_lines(marker)), attempts)
 
-    def test_known_failure_retries_are_bounded(self):
+    def test_delivery_then_crash_is_uncertain_and_never_auto_resent(self):
+        repo, _worktree = self.make()
+        env = self.h_env(self.tmp)
+        double, marker = make_cli_double(self.tmp, behavior="crash")
+        board = board_only(repo, task_id="crash-task", thread=THREAD_A,
+                           transport=pi_board.TRANSPORT_CLI_QUEUE, codex_bin=str(double))
+        pi_board.add_event(board["cards"]["crash-task"], "resource_breach", 3, "check:p:100",
+                           "breach", {"round": 3, "head": None}, {}, "resolve", 1)
+        write_board(repo, board)
+        first = self.dispatch(repo, "crash-task", env)
+        self.assertEqual(first["status"], "uncertain",
+                         "a delivery side effect followed by a crash is ambiguous")
+        self.assertTrue(first["error"])
+        self.assertEqual(len(self.marker_lines(marker)), 1)
+        for _ in range(3):
+            self.assertFalse(self.dispatch(repo, "crash-task", env)["dispatched"])
+        self.assertEqual(len(self.marker_lines(marker)), 1,
+                         "an ambiguous spawn outcome is never automatically resent")
+        board_json("rearm", "--repo", repo.root, "--task", "crash-task", env=env)
+        self.assertTrue(self.dispatch(repo, "crash-task", env)["dispatched"])
+        self.assertEqual(len(self.marker_lines(marker)), 2,
+                         "explicit recovery may duplicate an uncertain delivery")
+
+    def test_spawned_nonzero_exit_is_uncertain_not_retried(self):
         repo, _worktree = self.make()
         env = self.h_env(self.tmp)
         double, marker = make_cli_double(self.tmp, behavior="fail", code=2)
-        board = board_only(repo, task_id="fail-task", thread=THREAD_A,
+        board = board_only(repo, task_id="nonzero-task", thread=THREAD_A,
                            transport=pi_board.TRANSPORT_CLI_QUEUE, codex_bin=str(double))
-        pi_board.add_event(board["cards"]["fail-task"], "resource_breach", 3, "check:p:100",
+        pi_board.add_event(board["cards"]["nonzero-task"], "resource_breach", 3, "check:p:100",
                            "breach", {"round": 3, "head": None}, {}, "resolve", 1)
         write_board(repo, board)
-        self.assertEqual(self.dispatch(repo, "fail-task", env)["status"], "failed")
-        self.assertEqual(self.dispatch(repo, "fail-task", env)["status"], "failed")
-        third = self.dispatch(repo, "fail-task", env)
+        self.assertEqual(self.dispatch(repo, "nonzero-task", env)["status"], "uncertain")
+        self.assertFalse(self.dispatch(repo, "nonzero-task", env)["dispatched"])
+        self.assertEqual(len(self.marker_lines(marker)), 1)
+        board_json("rearm", "--repo", repo.root, "--task", "nonzero-task", env=env)
+        self.assertTrue(self.dispatch(repo, "nonzero-task", env)["dispatched"])
+
+    def test_not_started_failure_retries_are_bounded(self):
+        repo, _worktree = self.make()
+        env = self.h_env(self.tmp)
+        bad = self.tmp / "bad-exec"
+        bad.write_text("this is not an executable format\n", encoding="utf-8")
+        bad.chmod(0o755)
+        board = board_only(repo, task_id="not-started", thread=THREAD_A,
+                           transport=pi_board.TRANSPORT_CLI_QUEUE, codex_bin=str(bad))
+        pi_board.add_event(board["cards"]["not-started"], "resource_breach", 3, "check:p:100",
+                           "breach", {"round": 3, "head": None}, {}, "resolve", 1)
+        write_board(repo, board)
+        first = self.dispatch(repo, "not-started", env)
+        self.assertEqual(first["status"], "failed")
+        self.assertIn("could not start", first["error"])
+        second = self.dispatch(repo, "not-started", env)
+        self.assertEqual(second["status"], "failed")
+        third = self.dispatch(repo, "not-started", env)
         self.assertFalse(third["dispatched"], "bounded retries stop after the limit")
-        self.assertEqual(len(self.marker_lines(marker)), 2)
-        board_json("rearm", "--repo", repo.root, "--task", "fail-task", env=env)
-        self.assertTrue(self.dispatch(repo, "fail-task", env)["dispatched"])
+        board_json("rearm", "--repo", repo.root, "--task", "not-started", env=env)
+        self.assertTrue(self.dispatch(repo, "not-started", env)["dispatched"])
 
     def test_dispatch_corrupt_or_locked_queue_is_visible_and_silent(self):
         repo, _worktree = self.make()
@@ -866,7 +914,15 @@ class BoardTest(unittest.TestCase):
         def dispatched_once():
             return self.marker_lines(marker)
 
-        lines = self.wait_for(dispatched_once, timeout=10, what="supervisor final dispatch")
+        self.wait_for(dispatched_once, timeout=10, what="supervisor final dispatch")
+
+        def finalized():
+            queue = self.read_queue(repo).get("tasks", {}).get("board-final", {})
+            claims = queue.get("claims", {})
+            return claims and all(claim.get("status") == "queued" for claim in claims.values())
+
+        self.wait_for(finalized, timeout=10, what="queue finalize")
+        lines = self.marker_lines(marker)
         self.assertEqual(len(lines), 1, "the supervisor publishes terminal state and dispatches once")
         card = self.card(repo, "board-final")
         event = card["events"][0]
@@ -914,6 +970,259 @@ class BoardTest(unittest.TestCase):
         for event in omitted:
             self.assertNotIn(event["id"], text)
 
+    def test_rearm_refuses_live_inflight_and_late_result_cannot_overwrite(self):
+        repo, _worktree = self.make()
+        env = self.h_env(self.tmp)
+        board = board_only(repo, task_id="claim-task", thread=THREAD_A,
+                           transport=pi_board.TRANSPORT_CLI_QUEUE)
+        event = pi_board.add_event(board["cards"]["claim-task"], "review_required", 3,
+                                   "completed:abc:0", "terminal",
+                                   {"round": 3, "head": "a" * 40}, {}, "review", 1)
+        board_file = write_board(repo, board)
+        now = time.time()
+        self.assertEqual(pi_board._claim_queue(board_file, "claim-task", [event["id"]], now,
+                                               "packet-live"), [event["id"]])
+        targeted = run_board("rearm", "--repo", repo.root, "--task", "claim-task",
+                             "--event-id", event["id"], env=env, expect=2)
+        self.assertIn("live inflight", targeted.stderr)
+        bulk = board_json("rearm", "--repo", repo.root, "--task", "claim-task", env=env)
+        self.assertEqual(bulk["clearedClaims"], 0)
+        self.assertEqual(bulk["refusedInflight"], [event["id"]])
+        calls = []
+        blocked = pi_board.dispatch_task(board_file, "claim-task",
+                                         cli_runner=captured_runner(calls))
+        self.assertFalse(blocked["dispatched"])
+        self.assertEqual(calls, [], "a live inflight claim must never be claimed twice")
+        # Pause/resume must not clear or duplicate the live claim.
+        board_json("pause", "--repo", repo.root, "--task", "claim-task", env=env)
+        board_json("resume", "--repo", repo.root, "--task", "claim-task", env=env)
+        queue, _ = pi_board.read_queue(board_file)
+        self.assertEqual(queue["tasks"]["claim-task"]["claims"][event["id"]]["status"], "inflight")
+        # Age it: rearm marks uncertain, then explicit recovery clears it.
+        claims = queue["tasks"]["claim-task"]["claims"]
+        claims[event["id"]]["at"] = now - 10_000
+        pi_board._write_queue(board_file, queue)
+        marked = board_json("rearm", "--repo", repo.root, "--task", "claim-task", env=env)
+        self.assertEqual(marked["markedUncertain"], [event["id"]])
+        recovered = board_json("rearm", "--repo", repo.root, "--task", "claim-task",
+                               "--event-id", event["id"], env=env)
+        self.assertEqual(recovered["clearedClaims"], 1)
+        # A late result from the old packet must not overwrite the recovered state.
+        pi_board._finish_queue(board_file, "claim-task", [event["id"]],
+                               {"status": "queued", "exitCode": 0}, time.time(), "packet-live")
+        queue, _ = pi_board.read_queue(board_file)
+        entry = queue["tasks"]["claim-task"]
+        self.assertNotIn(event["id"], entry["claims"])
+        self.assertEqual(entry["lastSkippedFinalize"]["packetId"], "packet-live")
+
+    def test_stdout_capture_is_bounded_while_reading(self):
+        repo, _worktree = self.make()
+        env = self.h_env(self.tmp)
+        double, marker = make_cli_double(self.tmp, behavior="spam")
+        board = board_only(repo, task_id="spam-task", thread=THREAD_A,
+                           transport=pi_board.TRANSPORT_CLI_QUEUE, codex_bin=str(double))
+        pi_board.add_event(board["cards"]["spam-task"], "review_required", 3, "completed:abc:0",
+                           "terminal", {"round": 3, "head": "a" * 40}, {}, "review", 1)
+        write_board(repo, board)
+        result = self.dispatch(repo, "spam-task", env)
+        self.assertEqual(result["status"], "queued")
+        self.assertLessEqual(len(result["receipt"]["outputExcerpt"]), 1000,
+                             "captured output must be bounded while the child runs")
+        self.assertEqual(len(self.marker_lines(marker)), 1)
+
+    def test_default_codex_bin_is_resolved_to_an_absolute_path(self):
+        repo, worktree = self.make()
+        env = self.h_env(self.tmp, PI_DOUBLE_MODE="ok")
+        repo.start("board-default-bin", worktree, env=env)
+        self.assertEqual(repo.wait_terminal("board-default-bin", env=env)["state"], "completed")
+        result = self.register(repo, "board-default-bin", env, thread=THREAD_A)
+        self.assertTrue(Path(result["codexBin"]).is_absolute())
+        self.assertEqual(Path(result["codexBin"]), (self.fake_bin / "codex").resolve())
+        marker = self.fake_bin / "codex.jsonl"
+        self.assertTrue(marker.exists(), "the resolved default binary performed the dispatch")
+
+    def test_packet_utf8_byte_limit_is_bounded(self):
+        repo, _worktree = self.make()
+        board = board_only(repo, task_id="utf8-task", thread=THREAD_A,
+                           transport=pi_board.TRANSPORT_CLI_QUEUE)
+        card = board["cards"]["utf8-task"]
+        events = []
+        for index in range(3):
+            events.append(pi_board.add_event(card, "resource_breach", 3, f"utf8-{index}:p:1",
+                                             "é" * 200, {"round": 3, "head": None},
+                                             {"guardPath": "p"}, "q" * 120, index))
+        original = pi_board.MAX_PACKET_CHARS
+        pi_board.MAX_PACKET_CHARS = 1500
+        try:
+            text, included = pi_board.build_packet(card, events)
+        finally:
+            pi_board.MAX_PACKET_CHARS = original
+        self.assertTrue(included)
+        self.assertLessEqual(len(text.encode("utf-8")), 1500,
+                             "the packet limit must be enforced in UTF-8 bytes")
+
+    def test_oversized_event_falls_back_with_id_and_board_ref(self):
+        repo, _worktree = self.make()
+        board = board_only(repo, task_id="oversize-task", thread=THREAD_A,
+                           transport=pi_board.TRANSPORT_CLI_QUEUE)
+        card = board["cards"]["oversize-task"]
+        event = pi_board.add_event(card, "resource_breach", 3, "huge:p:1", "x" * 300,
+                                   {"round": 3, "head": None}, {"guardPath": "p"},
+                                   "q" * 300, 1)
+        original = pi_board.MAX_PACKET_CHARS
+        pi_board.MAX_PACKET_CHARS = 300
+        try:
+            text, included = pi_board.build_packet(card, [event])
+        finally:
+            pi_board.MAX_PACKET_CHARS = original
+        self.assertEqual(included, [event], "an oversized event must not be silently dropped")
+        self.assertIn(event["id"], text, "the fallback keeps the exact event id")
+        self.assertTrue("show" in text or "board_ref=" in text,
+                        "the fallback gives a bounded board evidence reference")
+        self.assertLessEqual(len(text.encode("utf-8")), 300)
+
+    def test_overflow_packet_directs_draining_in_the_same_turn(self):
+        repo, _worktree = self.make()
+        board = board_only(repo, task_id="drain-task", thread=THREAD_A,
+                           transport=pi_board.TRANSPORT_CLI_QUEUE)
+        card = board["cards"]["drain-task"]
+        events = []
+        for index in range(55):
+            events.append(pi_board.add_event(card, "resource_breach", 3, f"drain-{index}:p:1",
+                                             f"breach {index}", {"round": 3, "head": None},
+                                             {"guardPath": "p"}, "resolve", index))
+        self.assertTrue(card["overflow"]["active"])
+        text, included = pi_board.build_packet(card, events)
+        self.assertTrue(included)
+        self.assertIn("overflow=", text)
+        self.assertIn("same turn", text)
+        self.assertIn("pi_board.py show", text)
+        lower = text.lower()
+        self.assertIn("drain", lower)
+
+    def make_frozen_task(self, repo, task: str):
+        task_dir = repo.task_dir(task)
+        round_dir = task_dir / "rounds" / "1"
+        round_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / "session").mkdir(parents=True, exist_ok=True)
+        (task_dir / "task.json").write_text(json.dumps({
+            "schemaVersion": 1, "task": task, "taskDir": str(task_dir), "repo": str(repo.root),
+            "commonDir": str(repo.state_dir.parent), "worktree": str(repo.root), "readOnly": False,
+            "model": MODEL, "thinking": "max", "constraints": [], "checks": [],
+            "maxWorkers": 1, "timeoutSeconds": 60, "createdAt": time.time(),
+            "startHead": None, "runtimeVersion": "test", "helperHashes": {},
+            "sessionId": task, "sessionDir": str(task_dir / "session"),
+        }), encoding="utf-8")
+        (round_dir / "round.jsonl").touch()
+        (round_dir / "round.err").touch()
+        (round_dir / "round.meta").write_text("", encoding="utf-8")
+        (round_dir / "round.state.json").write_text(json.dumps({
+            "schemaVersion": 1, "round": 1, "state": "starting", "startedAt": time.time(),
+            "exitCode": None, "timedOut": False, "cancelled": False,
+            "taskDir": str(task_dir), "briefSha256": "x",
+        }), encoding="utf-8")
+        (task_dir / "cancel.json").write_text(json.dumps({
+            "schemaVersion": 1, "task": task, "round": 1, "requestedAt": time.time(),
+            "nonce": "pre-spawn",
+        }), encoding="utf-8")
+        return task_dir
+
+    def test_prespawn_cancel_makes_the_same_final_board_notification(self):
+        repo, _worktree = self.make()
+        repo.commit_file("seed.txt", "seed\n")
+        env = self.h_env(self.tmp)
+        double, marker = make_cli_double(self.tmp)
+        task_dir = self.make_frozen_task(repo, "prespawn")
+        self.register(repo, "prespawn", env, thread=THREAD_A, codex_bin=double)
+        lock_fd = os.open(task_dir / ".task.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(CLI), "_worker", "--task-dir", str(task_dir),
+                 "--round", "1", "--lock-fd", str(lock_fd), "--timeout-seconds", "60"],
+                capture_output=True, text=True, env=env, timeout=60)
+        finally:
+            os.close(lock_fd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        state = json.loads((task_dir / "rounds" / "1" / "round.state.json").read_text())
+        self.assertEqual(state["state"], "cancelled")
+        self.assertTrue(self.marker_lines(marker),
+                        "the pre-spawn cancel must still dispatch the terminal notification")
+        card = self.card(repo, "prespawn")
+        kinds = {event["kind"] for event in card["events"]}
+        self.assertIn("review_required", kinds)
+        queue = self.read_queue(repo)["tasks"]["prespawn"]
+        self.assertTrue(any(claim.get("status") == "queued"
+                            for claim in queue["claims"].values()), queue)
+
+    def test_upgrade_refused_when_lifecycle_locks_are_acquired_first(self):
+        repo, worktree = self.make()
+        env = self.h_env(self.tmp, PI_DOUBLE_MODE="ok")
+        repo.start("upgrade-locks", worktree, env=env)
+        self.assertEqual(repo.wait_terminal("upgrade-locks", env=env)["state"], "completed")
+        task_dir = repo.task_dir("upgrade-locks")
+        tools = task_dir / "tools"
+        (tools / "pi_board.py").write_text("junk\n", encoding="utf-8")
+        handles = []
+        for name in (".task.lock", ".supervisor.lock"):
+            handle = open(task_dir / name, "a+", encoding="utf-8")
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            handles.append(handle)
+        try:
+            refused = run_cli("upgrade", "--repo", repo.root, "--task", "upgrade-locks",
+                              env=env, expect=2)
+            self.assertIn("never hot-edited", refused.stderr)
+            self.assertEqual((tools / "pi_board.py").read_text(encoding="utf-8"), "junk\n",
+                             "a refused upgrade must not half-publish helpers")
+            self.assertFalse((task_dir / "tools.new").exists())
+        finally:
+            for handle in handles:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+                handle.close()
+        # With the locks released the same command succeeds cleanly.
+        result = json.loads(run_cli("upgrade", "--repo", repo.root, "--task", "upgrade-locks",
+                                    env=env, expect=0).stdout)
+        self.assertTrue(result["ok"])
+        self.assertEqual((tools / "pi_board.py").read_bytes(),
+                         (RUNTIME / "pi_board.py").read_bytes())
+
+    def test_upgrade_refused_when_only_the_supervisor_lock_is_held(self):
+        repo, worktree = self.make()
+        env = self.h_env(self.tmp, PI_DOUBLE_MODE="ok")
+        repo.start("upgrade-lease", worktree, env=env)
+        self.assertEqual(repo.wait_terminal("upgrade-lease", env=env)["state"], "completed")
+        task_dir = repo.task_dir("upgrade-lease")
+        handle = open(task_dir / ".supervisor.lock", "a+", encoding="utf-8")
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            refused = run_cli("upgrade", "--repo", repo.root, "--task", "upgrade-lease",
+                              env=env, expect=2)
+            self.assertIn("supervisor lease", refused.stderr)
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+            handle.close()
+
+    def test_upgrade_waits_for_the_lifecycle_admission_lock(self):
+        repo, worktree = self.make()
+        env = self.h_env(self.tmp, PI_DOUBLE_MODE="ok")
+        repo.start("upgrade-admission", worktree, env=env)
+        self.assertEqual(repo.wait_terminal("upgrade-admission", env=env)["state"], "completed")
+        admission = repo.state_dir / ".admission.lock"
+        handle = open(admission, "a+", encoding="utf-8")
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        proc = subprocess.Popen([sys.executable, str(CLI), "upgrade", "--repo", str(repo.root),
+                                 "--task", "upgrade-admission"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+        try:
+            time.sleep(0.8)
+            self.assertIsNone(proc.poll(),
+                              "upgrade must wait for the lifecycle admission lock, not race it")
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+            handle.close()
+        stdout, stderr = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 0, stderr)
+        self.assertTrue(json.loads(stdout)["ok"])
+
     def test_upgrade_restores_snapshot_for_terminal_task(self):
         repo, worktree = self.make()
         env = self.h_env(self.tmp, PI_DOUBLE_MODE="ok")
@@ -929,6 +1238,11 @@ class BoardTest(unittest.TestCase):
         frozen = json.loads((repo.task_dir("board-upgrade") / "task.json").read_text())
         self.assertEqual(frozen["helperHashes"]["pi_board.py"],
                          hashlib.sha256((RUNTIME / "pi_board.py").read_bytes()).hexdigest())
+        for name, digest in frozen["helperHashes"].items():
+            self.assertEqual(digest, hashlib.sha256((RUNTIME / name).read_bytes()).hexdigest(),
+                             f"snapshot metadata must match the runtime helper {name}")
+        self.assertTrue(frozen.get("upgradeHistory"))
+        self.assertFalse((repo.task_dir("board-upgrade") / "tools.new").exists())
         self.assertTrue(result["backupDir"])
 
     def test_upgrade_refused_while_active(self):

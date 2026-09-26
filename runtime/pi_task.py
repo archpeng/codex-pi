@@ -628,6 +628,9 @@ def run_worker(args) -> int:
         atomic(task_dir / "cancel.observed", {"round": round_number, "at": time.time(), "beforeSpawn": True})
         finish_round(task_dir, round_number, round_dir, task, state, "cancelled", None,
                      {"timedOut": False, "cancelled": True, "note": "cancellation was requested before Pi started"})
+        # The pre-spawn cancel is a terminal exit too: make the same final board
+        # notification/dispatch as every other terminal path.
+        refresh_board_best_effort(task)
         return 0
 
     tools = READ_ONLY_TOOLS if task["readOnly"] else WRITABLE_TOOLS
@@ -1825,8 +1828,10 @@ def cmd_wait(args) -> dict:
 def cmd_upgrade(args) -> dict:
     """Safely replace a non-running task's frozen helper snapshot.
 
-    Existing live workers are never hot-edited: the task and supervisor locks
-    must both be free. The next ``continue`` then runs the new helpers.
+    Uses the existing lock protocol for mutual exclusion with start/continue:
+    the project admission lock serializes lifecycle work, and the task and
+    supervisor locks are held for the whole validate/replace/persist sequence.
+    The next ``continue`` then runs the new helpers; no half-published state.
     """
     root = canonical_root(Path(args.repo))
     common = git_common_dir(root)
@@ -1834,48 +1839,74 @@ def cmd_upgrade(args) -> dict:
     task_dir = task_dir_for(common, task)
     if not task_dir.is_dir():
         raise ValueError(f"unknown task {task!r}; no evidence at {task_dir}")
-    frozen = read_json(task_dir / "task.json", None)
-    if not isinstance(frozen, dict) or frozen.get("task") != task:
-        raise ValueError(f"task {task!r} has no readable task.json; inspect {task_dir}")
-    frozen_repo = frozen.get("repo")
-    if not isinstance(frozen_repo, str) or Path(frozen_repo).expanduser().resolve() != root:
-        raise ValueError(f"task {task!r} belongs to checkout {frozen_repo!r}, not {root}")
-    if lock_is_held(task_dir / ".task.lock") or lock_is_held(task_dir / ".supervisor.lock"):
-        raise ValueError("task is active; the frozen helper snapshot is never hot-edited while a "
-                         "worker or supervisor owns the task")
-    rounds = list_rounds(task_dir)
-    if not rounds:
-        raise ValueError(f"task {task!r} has no rounds yet")
-    source = Path(__file__).resolve().parent
-    staging = task_dir / "tools.new"
-    shutil.rmtree(staging, ignore_errors=True)
-    hashes = snapshot_helpers(source, staging)
-    tools = task_dir / "tools"
-    backup = task_dir / f"tools.old-{int(time.time())}"
-    moved_old = False
+    admission = lock_fd(state_root(common) / ".admission.lock", blocking=True, timeout=30)
+    task_lock = None
+    supervisor_lock = None
     try:
-        if tools.exists():
-            os.replace(tools, backup)
-            moved_old = True
-        os.replace(staging, tools)
-    except OSError as exc:
+        try:
+            task_lock = lock_fd(task_dir / ".task.lock")
+        except LockHeld:
+            raise ValueError("task is active; the frozen helper snapshot is never hot-edited "
+                             "while a worker owns the task") from None
+        try:
+            supervisor_lock = lock_fd(task_dir / ".supervisor.lock")
+        except LockHeld:
+            raise ValueError("supervisor lease is still held; the frozen helper snapshot is "
+                             "never hot-edited while a supervisor owns the task") from None
+        # Re-validate everything under the held locks; a precheck outside the
+        # locks is not sufficient.
+        frozen = read_json(task_dir / "task.json", None)
+        if not isinstance(frozen, dict) or frozen.get("task") != task:
+            raise ValueError(f"task {task!r} has no readable task.json; inspect {task_dir}")
+        frozen_repo = frozen.get("repo")
+        if not isinstance(frozen_repo, str) or Path(frozen_repo).expanduser().resolve() != root:
+            raise ValueError(f"task {task!r} belongs to checkout {frozen_repo!r}, not {root}")
+        if not list_rounds(task_dir):
+            raise ValueError(f"task {task!r} has no rounds yet")
+        source = Path(__file__).resolve().parent
+        staging = task_dir / "tools.new"
         shutil.rmtree(staging, ignore_errors=True)
-        if moved_old and not tools.exists() and backup.exists():
+        hashes = snapshot_helpers(source, staging)
+        tools = task_dir / "tools"
+        backup = task_dir / f"tools.old-{int(time.time())}"
+        metadata_path = task_dir / "task.json"
+        old_metadata = metadata_path.read_bytes()
+        moved_old = False
+        try:
+            if tools.exists():
+                os.replace(tools, backup)
+                moved_old = True
+            os.replace(staging, tools)
+            frozen.update(helperHashes=hashes, runtimeVersion=runtime_version(), upgradedAt=time.time())
+            history = frozen.get("upgradeHistory") \
+                if isinstance(frozen.get("upgradeHistory"), list) else []
+            frozen["upgradeHistory"] = (history[-4:] + [{"at": frozen["upgradedAt"],
+                                                          "runtimeVersion": frozen["runtimeVersion"]}])
+            atomic(metadata_path, frozen)
+        except (OSError, ValueError) as exc:
+            shutil.rmtree(staging, ignore_errors=True)
             try:
-                os.replace(backup, tools)
+                if moved_old:
+                    if tools.exists():
+                        shutil.rmtree(tools, ignore_errors=True)
+                    if backup.exists() and not tools.exists():
+                        os.replace(backup, tools)
+                elif tools.exists():
+                    shutil.rmtree(tools, ignore_errors=True)
+                metadata_path.write_bytes(old_metadata)
             except OSError:
                 pass
-        raise ValueError(f"helper snapshot upgrade failed safely: {exc}") from None
-    frozen.update(helperHashes=hashes, runtimeVersion=runtime_version(), upgradedAt=time.time())
-    history = frozen.get("upgradeHistory") if isinstance(frozen.get("upgradeHistory"), list) else []
-    frozen["upgradeHistory"] = (history[-4:] + [{"at": frozen["upgradedAt"],
-                                                  "runtimeVersion": frozen["runtimeVersion"]}])
-    atomic(task_dir / "task.json", frozen)
-    return {"ok": True, "task": task, "runtimeVersion": frozen["runtimeVersion"],
-            "helperHashes": hashes, "toolsDir": str(tools),
-            "backupDir": str(backup) if moved_old else None,
-            "note": "known task snapshot upgraded; the next round uses the new helpers. "
-                    "Active tasks are refused and never hot-edited."}
+            raise ValueError(f"helper snapshot upgrade failed and was rolled back: {exc}") from None
+        return {"ok": True, "task": task, "runtimeVersion": frozen["runtimeVersion"],
+                "helperHashes": hashes, "toolsDir": str(tools),
+                "backupDir": str(backup) if moved_old else None,
+                "note": "known task snapshot upgraded under the lifecycle locks; the next round "
+                        "uses the new helpers. Active tasks are refused and never hot-edited."}
+    finally:
+        for fd in (supervisor_lock, task_lock):
+            if fd is not None:
+                os.close(fd)
+        os.close(admission)
 
 
 def cmd_cancel(args) -> dict:

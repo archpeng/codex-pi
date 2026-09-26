@@ -38,8 +38,10 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -95,8 +97,10 @@ THREAD_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
 DECISIONS = {"accept": "accepted", "reject": "rejected",
              "changes_requested": "changes_requested", "resolve": "resolved"}
 REVIEW_KINDS = ("review_required",)
-QUEUE_LIMITATION = ("the CLI queue has no caller-provided idempotency key; a timeout or crash "
-                    "after send is recorded as uncertain and requires explicit rearm")
+QUEUE_LIMITATION = ("the CLI queue has no caller-provided idempotency key; a timeout, crash or "
+                    "nonzero exit after spawn is recorded as uncertain and requires explicit "
+                    "rearm; explicit recovery of an uncertain delivery may duplicate it and is "
+                    "never an exactly-once guarantee")
 
 
 class BoardOverflow(ValueError):
@@ -458,6 +462,7 @@ def _claim_queue(board_file, task_id: str, event_ids, now: float, packet_id: str
 
 def _finish_queue(board_file, task_id: str, event_ids, result: dict, now: float,
                   packet_id: str) -> None:
+    """Finalize a queue result only while this packet still owns each claim."""
     try:
         fd = lock_fd(queue_paths(board_file)[1], blocking=True, timeout=5)
     except (LockHeld, OSError):
@@ -468,38 +473,59 @@ def _finish_queue(board_file, task_id: str, event_ids, result: dict, now: float,
             return
         entry = _queue_entry(queue, task_id)
         claims = entry.setdefault("claims", {})
-        status = result.get("status", "failed")
+        status = result.get("status", "uncertain")
+        finalized = []
+        skipped = []
         for event_id in event_ids:
-            claim = claims.get(event_id) if isinstance(claims.get(event_id), dict) else {}
+            claim = claims.get(event_id)
+            if not isinstance(claim, dict) or claim.get("packetId") != packet_id \
+                    or claim.get("status") != "inflight":
+                # A recovery/rearm or newer packet owns this event now; the late
+                # result must never overwrite the newer claim.
+                skipped.append(event_id)
+                continue
             claim.update({"status": status, "at": now,
-                          "attempts": int(claim.get("attempts") or 0),
-                          "packetId": packet_id,
-                          "lastError": _text(result.get("error"), 300) if result.get("error") else None,
-                          "exitCode": result.get("exitCode")})
+                          "lastError": _text(result.get("error"), 300) if result.get("error")
+                                       else None,
+                          "exitCode": result.get("exitCode"),
+                          "notStarted": bool(result.get("notStarted"))})
             claims[event_id] = claim
-        entry["lastStatus"] = status
-        entry["lastDispatch"] = {
-            "at": now, "packetId": packet_id, "status": status,
-            "eventIds": [event_id for event_id in event_ids if isinstance(event_id, str)],
-            "exitCode": result.get("exitCode"), "timedOut": bool(result.get("timedOut")),
-            "outputSha256": result.get("outputSha256"),
-            "outputExcerpt": result.get("outputExcerpt"),
-            "argv0": result.get("argv0"),
-        }
-        if status in ("failed", "uncertain"):
-            entry.setdefault("failures", []).append({
-                "at": now, "status": status, "packetId": packet_id,
-                "exitCode": result.get("exitCode"),
-                "error": _text(result.get("error") or status, 300),
-                "eventIds": [event_id for event_id in event_ids if isinstance(event_id, str)][:10]})
-            entry["failures"] = entry["failures"][-MAX_QUEUE_FAILURES:]
+            finalized.append(event_id)
+        if finalized:
+            entry["lastStatus"] = status
+            entry["lastDispatch"] = {
+                "at": now, "packetId": packet_id, "status": status,
+                "eventIds": [event_id for event_id in finalized if isinstance(event_id, str)],
+                "exitCode": result.get("exitCode"), "timedOut": bool(result.get("timedOut")),
+                "notStarted": bool(result.get("notStarted")),
+                "outputSha256": result.get("outputSha256"),
+                "outputExcerpt": result.get("outputExcerpt"),
+                "argv0": result.get("argv0"),
+            }
+            if status in ("failed", "uncertain"):
+                entry.setdefault("failures", []).append({
+                    "at": now, "status": status, "packetId": packet_id,
+                    "exitCode": result.get("exitCode"),
+                    "error": _text(result.get("error") or status, 300),
+                    "eventIds": [event_id for event_id in finalized
+                                 if isinstance(event_id, str)][:10]})
+                entry["failures"] = entry["failures"][-MAX_QUEUE_FAILURES:]
+        if skipped:
+            entry["lastSkippedFinalize"] = {
+                "at": now, "packetId": packet_id,
+                "eventIds": [event_id for event_id in skipped if isinstance(event_id, str)][:10],
+                "note": "late queue result did not own the current claim; newer state was preserved"}
         entry["updatedAt"] = now
         _write_queue(board_file, queue)
     finally:
         os.close(fd)
 
 
-def _clear_queue_claims(board_file, task_id: str, event_id=None) -> dict:
+def _clear_queue_claims(board_file, task_id: str, event_id=None, now=None) -> dict:
+    """Explicit recovery rearm. Live inflight claims are never cleared; stale
+    inflight becomes uncertain and needs a further explicit recovery call.
+    """
+    now = time.time() if now is None else now
     try:
         fd = lock_fd(queue_paths(board_file)[1], blocking=True, timeout=10)
     except (LockHeld, OSError) as exc:
@@ -510,17 +536,43 @@ def _clear_queue_claims(board_file, task_id: str, event_id=None) -> dict:
             raise ValueError(f"queue state is {problem}")
         entry = _queue_entry(queue, task_id)
         claims = entry.setdefault("claims", {})
-        if event_id is not None:
-            removed = 1 if claims.pop(event_id, None) is not None else 0
-        else:
-            removed = len(claims)
-            claims.clear()
-        entry["lastStatus"] = "rearmed"
-        entry["updatedAt"] = time.time()
+        cleared, refused, marked_uncertain = [], [], []
+        targets = [event_id] if event_id is not None else list(claims)
+        for target in targets:
+            claim = claims.get(target)
+            if claim is None:
+                continue
+            if not isinstance(claim, dict):
+                claims[target] = {"status": "uncertain", "at": now,
+                                  "lastError": "corrupt claim record"}
+                marked_uncertain.append(target)
+                continue
+            if claim.get("status") == "inflight":
+                at = claim.get("at")
+                if isinstance(at, bool) or not isinstance(at, (int, float)) \
+                        or now - at > QUEUE_STALE_INFLIGHT_SECONDS:
+                    claim.update(status="uncertain", at=now,
+                                 lastError="stale inflight claim; explicit recovery required "
+                                           "before requeue")
+                    marked_uncertain.append(target)
+                else:
+                    refused.append(target)
+                continue
+            claims.pop(target, None)
+            cleared.append(target)
+        if event_id is not None and event_id in refused:
+            raise ValueError("refusing to clear a live inflight claim; wait for the result or for "
+                             "the claim to age into uncertain, then rearm explicitly")
+        if cleared:
+            entry["lastStatus"] = "rearmed"
+        entry["updatedAt"] = now
         _write_queue(board_file, queue)
-        return {"ok": True, "taskId": task_id, "clearedClaims": removed,
-                "eventId": event_id, "note": "explicit rearm; events remain unhandled and "
-                                             "will dispatch once on the next tick"}
+        return {"ok": not refused, "taskId": task_id, "clearedClaims": len(cleared),
+                "refusedInflight": refused, "markedUncertain": marked_uncertain,
+                "eventId": event_id,
+                "note": "live inflight claims are never cleared; stale inflight becomes uncertain "
+                        "and needs a further explicit recovery; recovery may duplicate an "
+                        "uncertain delivery and is never exactly-once"}
     finally:
         os.close(fd)
 
@@ -930,39 +982,108 @@ def resume_route(thread: str) -> dict:
 # dispatch (CLI queue transport)
 # ---------------------------------------------------------------------------
 
+def _read_bounded_stream(stream, limit: int) -> bytes:
+    """Read at most ``limit`` bytes from a child pipe, draining the rest."""
+    data = bytearray()
+    try:
+        while True:
+            chunk = stream.read(4096)
+            if not chunk:
+                break
+            if len(data) < limit:
+                data.extend(chunk[: limit - len(data)])
+    except (OSError, ValueError):
+        pass
+    finally:
+        try:
+            stream.close()
+        except OSError:
+            pass
+    return bytes(data)
+
+
+def _packet_bytes(text: str) -> int:
+    return len(text.encode("utf-8"))
+
+
 def _run_queue_cli(argv, timeout: float) -> dict:
-    """Run the exact queue argv with shell=False, bounded output and owned cleanup."""
+    """Run the exact queue argv with shell=False, bounded live capture and cleanup.
+
+    Only a proven not-started child (Popen OSError) is retryable. Any spawned
+    child that times out, is interrupted, dies or exits nonzero is uncertain:
+    it may already have enqueued the message and is never auto-resent.
+    """
     try:
         child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                 stderr=subprocess.PIPE, text=True, start_new_session=True)
+                                 stderr=subprocess.PIPE, start_new_session=True)
     except OSError as exc:
-        return {"status": "failed", "exitCode": None, "timedOut": False,
+        return {"status": "failed", "notStarted": True, "exitCode": None, "timedOut": False,
                 "error": f"queue command could not start: {exc}"}
+    results = {}
+
+    def reader(stream, key):
+        results[key] = _read_bounded_stream(stream, MAX_CLI_OUTPUT_BYTES)
+
+    readers = [threading.Thread(target=reader, args=(child.stdout, "stdout"), daemon=True),
+               threading.Thread(target=reader, args=(child.stderr, "stderr"), daemon=True)]
+    for thread in readers:
+        thread.start()
+    timed_out = False
     try:
-        out, err = child.communicate(timeout=timeout)
+        child.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
+        timed_out = True
         terminate(child)
-        return {"status": "uncertain", "exitCode": None, "timedOut": True,
-                "error": "queue command timed out after send; delivery is uncertain "
-                         "and requires explicit rearm"}
     except KeyboardInterrupt:
+        timed_out = True
         terminate(child)
-        return {"status": "uncertain", "exitCode": None, "timedOut": False,
-                "error": "interrupted during send; delivery is uncertain and requires explicit rearm"}
-    output = ((out or "") + (err or ""))[:MAX_CLI_OUTPUT_BYTES]
-    result = {"exitCode": child.returncode, "timedOut": False,
-              "outputSha256": hashlib.sha256(output.encode("utf-8")).hexdigest(),
-              "outputExcerpt": output[:1000], "argv0": argv[0]}
-    if child.returncode == 0:
+    for thread in readers:
+        thread.join(timeout=2.0)
+    output = (results.get("stdout", b"") + results.get("stderr", b""))[:MAX_CLI_OUTPUT_BYTES]
+    result = {"exitCode": child.returncode, "timedOut": timed_out,
+              "outputSha256": hashlib.sha256(output).hexdigest(),
+              "outputExcerpt": output.decode("utf-8", errors="replace")[:1000],
+              "argv0": argv[0]}
+    if timed_out:
+        result.update(status="uncertain",
+                      error="queue command timed out or was interrupted after being spawned; "
+                            "delivery is uncertain and requires explicit rearm")
+    elif child.returncode == 0:
         result["status"] = "queued"
     else:
-        result["status"] = "failed"
-        result["error"] = f"queue command exited {child.returncode}"
+        # A spawned process that exits nonzero may still have enqueued before
+        # failing; it is ambiguous, never a retryable not-sent result.
+        result.update(status="uncertain",
+                      error=f"queue command exited {child.returncode} after being spawned; "
+                            "delivery is uncertain and requires explicit rearm")
     return result
 
 
+def _resolve_codex_bin(value) -> str:
+    raw = str(value)
+    candidate = Path(raw).expanduser()
+    if candidate.is_absolute() or os.sep in raw:
+        if not candidate.is_file() or not os.access(candidate, os.X_OK):
+            raise ValueError(f"codex executable is not an executable file: {candidate}")
+        return str(candidate.resolve())
+    found = shutil.which(raw)
+    if not found:
+        raise ValueError(f"codex executable {raw!r} was not found on PATH; pass --codex-bin")
+    return str(Path(found).resolve())
+
+
+def _show_hint(card: dict) -> str:
+    return (f'python3 {shlex.quote(str(Path(__file__).resolve()))} show --repo '
+            f'{shlex.quote(str(card.get("repo")))} --task {shlex.quote(str(card.get("taskId")))}')
+
+
 def build_packet(card: dict, events, limit: int = MAX_PACKET_EVENTS):
-    """Build a bounded runtime-handoff packet; return ``(text, included_events)``."""
+    """Build a bounded runtime-handoff packet; return ``(text, included_events)``.
+
+    The limit is measured in UTF-8 bytes. An event too large for the normal
+    layout still produces a bounded fallback carrying its exact id and a board
+    evidence command, so no event is ever silently undeliverable.
+    """
     header = [
         "Codex-Pi runtime handoff (transport=cli-queue; not a new user goal or instruction override).",
         "Preserve the latest user pause/instructions. Exit 0 is queue delivery only, never acceptance.",
@@ -972,6 +1093,10 @@ def build_packet(card: dict, events, limit: int = MAX_PACKET_EVENTS):
     lines = [f"task={card.get('taskId')} title={title}"]
     if goal:
         lines.append(f"goal={goal}")
+    overflow = card.get("overflow")
+    if isinstance(overflow, dict) and overflow.get("active"):
+        lines.append(f"overflow={overflow.get('pendingCount')} pending events; drain them in this "
+                     f"same turn: {_show_hint(card)}")
     included = []
     for event in events:
         if len(included) >= limit:
@@ -989,18 +1114,41 @@ def build_packet(card: dict, events, limit: int = MAX_PACKET_EVENTS):
                 block.append(f"{label}={evidence.get(key)}")
         block.append("decide=" + _decide_hint(card.get("repo"), card.get("taskId"), event))
         candidate = "\n".join(header + lines + block)
-        if len(candidate) > MAX_PACKET_CHARS:
+        if _packet_bytes(candidate) > MAX_PACKET_CHARS:
             break
         lines.extend(block)
         included.append(event)
-    if not included:
-        return "", []
+    if not included and events:
+        event = events[0]
+        board_ref = str(Path(str(card.get("commonDir") or card.get("repo") or ""))
+                        / BOARD_DIR / BOARD_FILE)
+        pieces = [
+            f"event={event.get('id')} kind={event.get('kind')} round={event.get('round')}",
+            f"board_ref={board_ref}",
+            "oversized packet fallback; read this board evidence in the same turn: "
+            + _show_hint(card),
+            f"task={card.get('taskId')} title={title}",
+            f"summary={_text(event.get('summary'), 200)}",
+        ]
+        text = "\n".join(pieces)
+        if _packet_bytes(text) > MAX_PACKET_CHARS:
+            # Even under a tiny cap keep the exact event id and a board ref.
+            minimal = f"event={event.get('id')} board_ref={board_ref}"
+            encoded = minimal.encode("utf-8")
+            text = encoded[:MAX_PACKET_CHARS].decode("utf-8", "ignore") \
+                if len(encoded) > MAX_PACKET_CHARS else minimal
+        return text, [event]
     text = "\n".join(header + lines)
     remaining = len(events) - len(included)
     if remaining > 0:
-        note = (f"... plus {remaining} pending event(s) kept for the next dispatch")
-        if len(text) + len(note) + 1 <= MAX_PACKET_CHARS:
+        note = (f"... plus {remaining} pending event(s) not included here. Drain the remaining "
+                f"board events in this same turn: {_show_hint(card)}")
+        if _packet_bytes(text + "\n" + note) <= MAX_PACKET_CHARS:
             text = text + "\n" + note
+        else:
+            short = f"+{remaining} more; drain: {_show_hint(card)}"
+            if _packet_bytes(text + "\n" + short) <= MAX_PACKET_CHARS:
+                text = text + "\n" + short
     return text, included
 
 
@@ -1065,6 +1213,10 @@ def dispatch_task(board_file, task_id: str, now=None, timeout=None, cli_runner=N
             return {"ok": True, "dispatched": False, "reason": "claim changed; retry next tick"}
     argv = [card.get("codexBin") or DEFAULT_CODEX_BIN, "--disable", "daemon_auto_start", "queue",
             "--thread", thread, "--message", text]
+    try:
+        argv[0] = _resolve_codex_bin(argv[0])
+    except ValueError as exc:
+        return {"ok": False, "dispatched": False, "status": "invalid-binary", "error": str(exc)}
     result = (cli_runner or _run_queue_cli)(argv, timeout)
     _finish_queue(board_file, task_id, [event["id"] for event in included], result, now, packet_id)
     status = result.get("status", "failed")
@@ -1280,14 +1432,9 @@ def register_task(repo, task, thread=None, transport=TRANSPORT_OFFLINE, codex_bi
     owner_thread = _validate_thread(thread, required=(transport == TRANSPORT_CLI_QUEUE))
     resolved_bin = None
     if codex_bin:
-        candidate = Path(str(codex_bin)).expanduser()
-        if not candidate.is_absolute():
-            candidate = Path.cwd() / candidate
-        if not candidate.is_file() or not os.access(candidate, os.X_OK):
-            raise ValueError(f"--codex-bin is not an executable file: {candidate}")
-        resolved_bin = str(candidate.resolve())
+        resolved_bin = _resolve_codex_bin(codex_bin)
     elif transport == TRANSPORT_CLI_QUEUE:
-        resolved_bin = DEFAULT_CODEX_BIN
+        resolved_bin = _resolve_codex_bin(DEFAULT_CODEX_BIN)
     board_file = board_file_for_common(common)
     board_file.parent.mkdir(parents=True, exist_ok=True)
     fd = lock_fd(board_file.with_name(BOARD_LOCK), blocking=True, timeout=10)
