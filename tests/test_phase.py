@@ -688,6 +688,136 @@ class PhaseTest(unittest.TestCase):
         self.assertEqual(readiness["status"], "unknown")
         self.assertFalse(readiness["readyForReview"])
 
+    def test_count_rules_cover_and_block_correctly(self):
+        # Positive: every declared rule combination reaches covered/ready.
+        repo, worktree = self.make(name="counts-ready")
+        env = self.h_env(PI_DOUBLE_MODE="delay-ok", PI_DOUBLE_DELAY="5")
+        sha = self.write_design(repo)
+        positive = [
+            {"id": "A1", "description": "skip-free tests", "command": "go test ./...",
+             "passCondition": "exit 0, no skip", "evidence": "receipt", "forbidSkip": True},
+            {"id": "A2", "description": "minimum test count", "command": "go test ./...",
+             "passCondition": "exit 0, run>=2", "evidence": "receipt", "minRun": 2},
+            {"id": "A3", "description": "both rules", "command": "go test ./...",
+             "passCondition": "exit 0, run>=2, no skip", "evidence": "receipt",
+             "forbidSkip": True, "minRun": 2},
+        ]
+        path = self.write_contract("ok.json", self.contract(repo, "P-COUNTS-OK", design_sha=sha,
+                                                               items=positive))
+        self.start(repo, worktree, "counts-ready", path, env)
+        repo.wait_round_state("counts-ready", "running")
+        candidate = self.head(worktree)
+        checks = repo.task_dir("counts-ready") / "rounds" / "1" / "round.checks"
+        counts = {"run": 3, "pass": 3, "fail": 0, "skip": 0,
+                  "format": "go_verbose_top_level"}
+        for item in ("A1", "A2", "A3"):
+            self.synth_receipt(checks, item, 0, candidate, counts=dict(counts))
+        repo.wait_terminal("counts-ready")
+        readiness = cli_json("readiness", "--repo", str(repo.root), "--task", "counts-ready",
+                             "--round", "1", env=env)
+        by_id = {item["id"]: item for item in readiness["items"]}
+        self.assertTrue(all(by_id[item]["status"] == "covered" for item in ("A1", "A2", "A3")),
+                        [item["status"] for item in readiness["items"]])
+        self.assertEqual(readiness["status"], "ready")
+        self.assertEqual(readiness["coverage"]["covered"], 3)
+
+        # Negative: missing fields, skips, short runs and combined rules all
+        # stay blocked with the exact classification.
+        repo2, worktree2 = self.make(name="counts-block")
+        env2 = self.h_env(PI_DOUBLE_MODE="delay-ok", PI_DOUBLE_DELAY="5")
+        sha2 = self.write_design(repo2)
+        negative = [
+            {"id": "B1", "description": "skip-free", "command": "go test",
+             "passCondition": "no skip", "evidence": "receipt", "forbidSkip": True},
+            {"id": "B2", "description": "skip-free", "command": "go test",
+             "passCondition": "no skip", "evidence": "receipt", "forbidSkip": True},
+            {"id": "B3", "description": "min run", "command": "go test",
+             "passCondition": "run>=5", "evidence": "receipt", "minRun": 5},
+            {"id": "B4", "description": "both", "command": "go test",
+             "passCondition": "run>=5 no skip", "evidence": "receipt",
+             "forbidSkip": True, "minRun": 5},
+            {"id": "B5", "description": "both skip", "command": "go test",
+             "passCondition": "run>=2 no skip", "evidence": "receipt",
+             "forbidSkip": True, "minRun": 2},
+            {"id": "B6", "description": "both no counts", "command": "go test",
+             "passCondition": "run>=2 no skip", "evidence": "receipt",
+             "forbidSkip": True, "minRun": 2},
+        ]
+        path2 = self.write_contract("block.json", self.contract(repo2, "P-COUNTS-BLOCK",
+                                                                 design_sha=sha2, items=negative))
+        self.start(repo2, worktree2, "counts-block", path2, env2)
+        repo2.wait_round_state("counts-block", "running")
+        candidate2 = self.head(worktree2)
+        checks2 = repo2.task_dir("counts-block") / "rounds" / "1" / "round.checks"
+        self.synth_receipt(checks2, "B1", 0, candidate2)  # no counts -> unknown
+        self.synth_receipt(checks2, "B2", 0, candidate2,
+                           counts={"run": 3, "pass": 2, "fail": 0, "skip": 1})
+        self.synth_receipt(checks2, "B3", 0, candidate2,
+                           counts={"run": 3, "pass": 3, "fail": 0, "skip": 0})
+        # Both rules declared: minRun must still be checked after forbidSkip.
+        self.synth_receipt(checks2, "B4", 0, candidate2,
+                           counts={"run": 3, "pass": 3, "fail": 0, "skip": 0})
+        self.synth_receipt(checks2, "B5", 0, candidate2,
+                           counts={"run": 3, "pass": 1, "fail": 0, "skip": 2})
+        self.synth_receipt(checks2, "B6", 0, candidate2)  # no counts -> unknown
+        repo2.wait_terminal("counts-block")
+        readiness2 = cli_json("readiness", "--repo", str(repo2.root), "--task", "counts-block",
+                              "--round", "1", env=env2)
+        by_id2 = {item["id"]: item["status"] for item in readiness2["items"]}
+        self.assertEqual(by_id2, {"B1": "unknown", "B2": "skipped", "B3": "failed",
+                                  "B4": "failed", "B5": "skipped", "B6": "unknown"})
+        self.assertEqual(readiness2["status"], "not_ready")
+        self.assertEqual(self.rounds(repo2, "counts-block"), [1],
+                         "blocked count rules never auto-continue")
+
+    def test_active_candidate_tracks_a_mid_round_commit(self):
+        repo, worktree = self.make()
+        env = self.h_env(PI_DOUBLE_MODE="delay-ok", PI_DOUBLE_DELAY="15")
+        sha = self.write_design(repo)
+        path = self.write_contract("p.json", self.contract(repo, "P-MID", design_sha=sha))
+        self.start(repo, worktree, "mid-head", path, env)
+        repo.wait_round_state("mid-head", "running")
+        start_head = self.head(worktree)
+        checks = repo.task_dir("mid-head") / "rounds" / "1" / "round.checks"
+        old = subprocess.run(
+            [sys.executable, str(CHECK), "--output-dir", str(checks), "--id", "A1",
+             "--", sys.executable, "-c", "print('old')"], cwd=str(worktree),
+            capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(old.returncode, 0, old.stderr)
+        old_receipt = Path(json.loads(old.stdout)["receipt"]).name
+        # A real commit while the round is active; the new HEAD becomes the
+        # candidate and the old-head receipt must not be treated as current.
+        (worktree / "mid.txt").write_text("mid\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(worktree), "add", "-A"], check=True,
+                       capture_output=True)
+        subprocess.run(["git", "-C", str(worktree), "-c", "user.email=t@e.invalid",
+                        "-c", "user.name=T", "commit", "-qm", "mid round commit"],
+                       check=True, capture_output=True)
+        new_head = self.head(worktree)
+        self.assertNotEqual(new_head, start_head)
+        new = subprocess.run(
+            [sys.executable, str(CHECK), "--output-dir", str(checks), "--id", "A1",
+             "--", sys.executable, "-c", "print('new')"], cwd=str(worktree),
+            capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(new.returncode, 0, new.stderr)
+        new_receipt = Path(json.loads(new.stdout)["receipt"]).name
+        status = cli_json("status", "--repo", str(repo.root), "--task", "mid-head", env=env)
+        self.assertEqual(status["currentHead"], new_head)
+        self.assertIsNone(status["endHead"])
+        self.register(repo, "mid-head", env, transport="cli-queue", thread=THREAD_A)
+        board_json("refresh", "--repo", str(repo.root), "--task", "mid-head", env=env)
+        card = self.card(repo, "mid-head")
+        self.assertEqual(card["phase"]["candidate"], new_head)
+        milestones = self.pending(repo, "mid-head", "progress_update")
+        self.assertEqual(len(milestones), 1)
+        event = milestones[0]
+        self.assertEqual(event["candidate"]["head"], new_head)
+        self.assertEqual(event["evidence"]["factSource"], "verified_receipt")
+        self.assertEqual(event["evidence"]["logVerified"], True)
+        self.assertEqual(Path(event["evidence"]["receiptRef"]).name, new_receipt)
+        self.assertNotIn(old_receipt, event["evidence"]["receiptRef"])
+        repo.wait_terminal("mid-head", env=env, timeout=30)
+
     def test_forbid_skip_requires_parseable_counts(self):
         repo, worktree = self.make()
         env = self.h_env(PI_DOUBLE_MODE="delay-ok", PI_DOUBLE_DELAY="4")

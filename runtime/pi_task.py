@@ -830,7 +830,8 @@ def _readiness_receipt(receipt: Path):
     return {
         "id": check_id, "exitCode": code, "timedOut": bool(data.get("timed_out")),
         "cancelled": bool(data.get("cancelled")),
-        "failed": (code is not None and code != 0) or bool(data.get("timed_out")),
+        "failed": ((code is not None and code != 0) or bool(data.get("timed_out"))
+                   or bool(data.get("cancelled"))),
         "testCounts": _sanitize_counts(data.get("test_counts")),
         "startedAt": _number(data.get("started_at")), "endedAt": _number(data.get("ended_at")),
         "log": log_name, "logSha256": digest, "receipt": receipt.name,
@@ -839,8 +840,8 @@ def _readiness_receipt(receipt: Path):
     }, None
 
 
-def _verify_receipt_log(checks_dir: Path, item: dict):
-    """True/False/None hash verification with a bounded read; None stays unknown."""
+def verify_receipt_log(checks_dir: Path, item: dict):
+    """True/False/None log hash verification with a bounded read; None stays unknown."""
     resolved = checks_dir.resolve()
     log_path = checks_dir / item["log"]
     if item.get("_safe_log") is not None:
@@ -928,34 +929,46 @@ def _scope_check(task_dir: Path, record: dict, candidate: str | None) -> dict:
             overflow.set()
 
     thread = threading.Thread(target=reader, daemon=True)
-    thread.start()
-    thread.join(timeout=10)
-    if thread.is_alive():
-        _stop_bounded_process(proc)
-        result["reason"] = "git diff did not finish within the bounded timeout"
-        return result
-    if overflow.is_set():
-        _stop_bounded_process(proc)
-        result.update({
-            "changedFiles": files[:100], "status": "unknown",
-            "reason": f"the change set exceeds the bounded scope check "
-                      f"(>= {MAX_SCOPE_DIFF_FILES} files); scope is unknown, so readiness is blocked "
-                      "instead of checking only a sorted prefix"})
-        return result
+
+    def close_pipe() -> None:
+        stream = proc.stdout
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
     try:
-        returncode = proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        _stop_bounded_process(proc)
-        result["reason"] = "git diff did not finish within the bounded timeout"
+        thread.start()
+        thread.join(timeout=10)
+        if thread.is_alive():
+            _stop_bounded_process(proc)
+            result["reason"] = "git diff did not finish within the bounded timeout"
+            return result
+        if overflow.is_set():
+            _stop_bounded_process(proc)
+            result.update({
+                "changedFiles": files[:100], "status": "unknown",
+                "reason": f"the change set exceeds the bounded scope check "
+                          f"(>= {MAX_SCOPE_DIFF_FILES} files); scope is unknown, so readiness is blocked "
+                          "instead of checking only a sorted prefix"})
+            return result
+        try:
+            returncode = proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            _stop_bounded_process(proc)
+            result["reason"] = "git diff did not finish within the bounded timeout"
+            return result
+        if returncode != 0:
+            result["reason"] = f"git diff exited {returncode}"
+            return result
+        scope = (record.get("contract") or {}).get("scope") or []
+        out = [path for path in files if not _scope_allows(path, scope)]
+        result.update({"changedFiles": files[:100], "outOfScope": out[:100],
+                       "status": "violation" if out else "ok"})
         return result
-    if returncode != 0:
-        result["reason"] = f"git diff exited {returncode}"
-        return result
-    scope = (record.get("contract") or {}).get("scope") or []
-    out = [path for path in files if not _scope_allows(path, scope)]
-    result.update({"changedFiles": files[:100], "outOfScope": out[:100],
-                   "status": "violation" if out else "ok"})
-    return result
+    finally:
+        close_pipe()
 
 
 def build_readiness(task_dir: Path, task: dict, round_number: int) -> dict:
@@ -1027,7 +1040,7 @@ def build_readiness(task_dir: Path, task: dict, round_number: int) -> dict:
             if not inside(log_path, checks_dir.resolve()):
                 item["logVerified"] = None
             else:
-                item["logVerified"] = _verify_receipt_log(checks_dir, item)
+                item["logVerified"] = verify_receipt_log(checks_dir, item)
             receipts.append(item)
     by_id = {}
     for item in receipts:
@@ -1071,22 +1084,33 @@ def build_readiness(task_dir: Path, task: dict, round_number: int) -> dict:
             elif counts and counts.get("fail"):
                 entry.update(status="failed", reason=f"test counts report {counts.get('fail')} "
                                                       "failures")
-            elif spec.get("forbidSkip"):
-                if not isinstance(counts, dict) or "skip" not in counts:
-                    entry.update(status="unknown", reason=
-                                 "skip-freedom cannot be verified: the receipt has no parseable "
-                                 "test counts (declare forbidSkip only for count-emitting runners)")
-                elif counts.get("skip"):
-                    entry.update(status="skipped", reason=f"test counts report {counts.get('skip')} "
-                                                           "skips")
-            elif spec.get("minRun") is not None:
-                if not isinstance(counts, dict) or "run" not in counts:
-                    entry.update(status="unknown", reason=
-                                 "minRun cannot be verified: the receipt has no parseable test "
-                                 "counts")
-                elif counts.get("run", 0) < spec["minRun"]:
-                    entry.update(status="failed", reason=
-                                 f"test counts report fewer than minRun={spec['minRun']} runs")
+            elif spec.get("forbidSkip") or spec.get("minRun") is not None:
+                # All declared count rules must hold together; a missing field
+                # can never become ``covered`` and an already-declared rule is
+                # never skipped because another rule was checked first.
+                count_status, count_reason = None, None
+                if spec.get("forbidSkip"):
+                    if not isinstance(counts, dict) or "skip" not in counts:
+                        count_status = "unknown"
+                        count_reason = ("skip-freedom cannot be verified: the receipt has no "
+                                        "parseable test counts (declare forbidSkip only for "
+                                        "count-emitting runners)")
+                    elif counts.get("skip"):
+                        count_status = "skipped"
+                        count_reason = f"test counts report {counts.get('skip')} skips"
+                if count_status is None and spec.get("minRun") is not None:
+                    if not isinstance(counts, dict) or "run" not in counts:
+                        count_status = "unknown"
+                        count_reason = ("minRun cannot be verified: the receipt has no parseable "
+                                        "test counts")
+                    elif counts.get("run", 0) < spec["minRun"]:
+                        count_status = "failed"
+                        count_reason = (f"test counts report fewer than minRun={spec['minRun']} "
+                                        "runs")
+                if count_status is None:
+                    entry.update(status="covered", reason="applicable passing receipt")
+                else:
+                    entry.update(status=count_status, reason=count_reason)
             else:
                 entry.update(status="covered", reason="applicable passing receipt")
         items.append(entry)
@@ -2245,7 +2269,8 @@ def _safe_receipt(path: Path):
     code = data.get("exit_code")
     if code is not None and (isinstance(code, bool) or not isinstance(code, int)):
         return None, "unsafe receipt exit code"
-    failed = (code is not None and code != 0) or bool(data.get("timed_out"))
+    failed = ((code is not None and code != 0) or bool(data.get("timed_out"))
+              or bool(data.get("cancelled")))
     head = data.get("head")
     if head is not None and (not isinstance(head, str) or not FULL_OID_RE.fullmatch(head)):
         head = None
@@ -2256,7 +2281,8 @@ def _safe_receipt(path: Path):
             "cancelled": bool(data.get("cancelled")), "failed": failed,
             "testCounts": _sanitize_counts(data.get("test_counts")),
             "startedAt": _number(data.get("started_at")), "endedAt": _number(data.get("ended_at")),
-            "log": log_name, "receipt": path.name, "head": head, "dirty": dirty,
+            "log": log_name, "logSha256": digest, "receipt": path.name, "head": head,
+            "dirty": dirty,
             "resourceLimit": sanitize_snapshot(data.get("resource_limit") or data.get("resourceLimit"))}, None
 
 
@@ -2732,6 +2758,22 @@ def _wait_probe(repo_arg: str, task_arg: str, round_arg=None) -> str:
     return effective_state(state, task_held, supervisor_alive, selected_number == latest_number)
 
 
+def _head_probe(worktree: Path):
+    """Bounded read-only current HEAD probe for an active round."""
+    try:
+        proc = subprocess.run(["git", "-C", str(worktree), "rev-parse", "HEAD"],
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                              timeout=10, shell=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+    if proc.returncode != 0:
+        return None, f"git rev-parse exited {proc.returncode}"
+    raw = proc.stdout.strip()
+    if not FULL_OID_RE.fullmatch(raw):
+        return None, "git returned an unexpected object id"
+    return raw.lower(), None
+
+
 def build_status(repo_arg: str, task_arg: str, round_arg=None) -> dict:
     """Bounded read-only state snapshot. Never starts Pi, builds a summary or scans a transcript."""
     task = require_task_arg(task_arg)
@@ -2761,6 +2803,13 @@ def build_status(repo_arg: str, task_arg: str, round_arg=None) -> dict:
         state = {}
     raw_state = state.get("state")
     effective = effective_state(state, task_held, supervisor_alive, selected_number == latest_number)
+    current_head, head_problem = None, None
+    if raw_state in ACTIVE_STATES:
+        frozen_worktree = frozen.get("worktree")
+        if isinstance(frozen_worktree, str) and frozen_worktree.strip():
+            current_head, head_problem = _head_probe(Path(frozen_worktree))
+        else:
+            head_problem = "no frozen worktree"
     started = _number(state.get("startedAt"))
     ended = _number(state.get("endedAt"))
     now = time.time()
@@ -2788,6 +2837,13 @@ def build_status(repo_arg: str, task_arg: str, round_arg=None) -> dict:
     if raw_state in ACTIVE_STATES and not supervisor_alive:
         notes.append("the recorded state is active but no supervisor lease is held; ownership is "
                     "unknown, not progress")
+    if raw_state in ACTIVE_STATES:
+        if head_problem is not None:
+            notes.append(f"the active round's current HEAD could not be read ({head_problem}); "
+                         "the active candidate identity is unknown")
+        elif isinstance(current_head, str) and current_head != state.get("startHead"):
+            notes.append("the worktree HEAD advanced during the active round; currentHead is the "
+                         "verified current candidate identity")
     if raw_state in TERMINAL_STATES and task_held and not supervisor_alive:
         notes.append("a Pi descendant may still hold the task lock after a terminal record; inspect "
                      "before reuse")
@@ -2863,6 +2919,7 @@ def build_status(repo_arg: str, task_arg: str, round_arg=None) -> dict:
         "exitCode": state.get("exitCode"), "timedOut": bool(state.get("timedOut")),
         "cancelled": bool(state.get("cancelled")),
         "startHead": state.get("startHead"), "endHead": state.get("endHead") or state.get("head"),
+        "currentHead": current_head,
         "briefSha256": state.get("briefSha256"),
         "ownership": {"activeWorker": task_held, "supervisorAlive": supervisor_alive},
         "processes": processes, "executionActivity": execution_activity,

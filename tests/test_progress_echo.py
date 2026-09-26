@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -17,10 +18,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from runtime_helpers import RUNTIME
+from runtime_helpers import RUNTIME, Repo, cleanup_repos
 
 sys.path.insert(0, str(RUNTIME))
 import pi_board  # noqa: E402
+import pi_task  # noqa: E402
 
 THREAD_A = "11111111-2222-3333-4444-555555555555"
 HEAD_A = "a" * 40
@@ -36,7 +38,7 @@ def make_card(task_id: str = "echo-task", *, transport=pi_board.TRANSPORT_CLI_QU
     return card
 
 
-def base_status(card: dict, *, phase_id: str = "P1", contract: str = CONTRACT,
+def base_status(checks_dir: Path, card: dict, *, phase_id: str = "P1", contract: str = CONTRACT,
                 candidate: str = HEAD_A, round_number: int = 1, state: str = "running",
                 end_head=None) -> dict:
     return {
@@ -46,7 +48,7 @@ def base_status(card: dict, *, phase_id: str = "P1", contract: str = CONTRACT,
         "timedOut": False, "cancelled": False,
         "evidence": {"brief": "/evidence/brief.md", "state": "/evidence/state.json",
                      "roundDir": "/evidence/round"},
-        "checks": {"dir": "/evidence/checks", "running": None,
+        "checks": {"dir": str(checks_dir), "running": None,
                    "receipts": {"latest": None, "latestSuccessful": None,
                                 "failedRecent": [], "failedAttempts": 0,
                                 "unknownExitRecent": []},
@@ -58,8 +60,15 @@ def base_status(card: dict, *, phase_id: str = "P1", contract: str = CONTRACT,
     }
 
 
-def passing_receipt(check_id: str = "A1", candidate: str = HEAD_A) -> dict:
-    return {"id": check_id, "receipt": f"{check_id}-pass.json", "log": f"{check_id}-pass.log",
+def passing_receipt(checks_dir: Path, check_id: str = "A1", candidate: str = HEAD_A) -> dict:
+    import hashlib
+    checks_dir = Path(checks_dir)
+    checks_dir.mkdir(parents=True, exist_ok=True)
+    log_name = f"{check_id}-{candidate[:8]}-pass.log"
+    payload = f"verified log for {check_id} on {candidate}\n".encode("utf-8")
+    (checks_dir / log_name).write_bytes(payload)
+    return {"id": check_id, "receipt": f"{check_id}-{candidate[:8]}-pass.json", "log": log_name,
+            "logSha256": hashlib.sha256(payload).hexdigest(),
             "exitCode": 0, "timedOut": False, "cancelled": False, "failed": False,
             "head": candidate, "dirty": False, "testCounts": None}
 
@@ -77,6 +86,29 @@ class ProgressEchoTest(unittest.TestCase):
         self.tmp = Path(self._tmp.name)
         self.addCleanup(os.environ.pop, "CODEX_PI_HANDOFF_ROOT", None)
         os.environ["CODEX_PI_HANDOFF_ROOT"] = str(self.tmp / "handoffs")
+        self.checks_dir = self.tmp / "checks"
+
+    def tearDown(self):
+        cleanup_repos()
+
+    def run_pi_check(self, repo_root: Path, checks: Path, check_id: str = "A1") -> Path:
+        checks.mkdir(parents=True, exist_ok=True)
+        proc = subprocess.run(
+            [sys.executable, str(RUNTIME / "pi_check.py"), "--output-dir", str(checks),
+             "--id", check_id, "--", sys.executable, "-c", "print('ok')"],
+            cwd=str(repo_root), capture_output=True, text=True, env=os.environ.copy(), timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return Path(json.loads(proc.stdout)["receipt"])
+
+    def real_status(self, repo: Repo, checks: Path, head: str, task_id: str):
+        card = make_card(task_id=task_id)
+        status = base_status(checks, card, candidate=head)
+        status["checks"] = pi_task._scan_checks(checks)
+        return card, status
+
+    def head(self, repo: Repo) -> str:
+        return subprocess.check_output(["git", "-C", str(repo.root), "rev-parse", "HEAD"],
+                                       text=True).strip()
 
     def board_file(self, card: dict, task_id: str | None = None) -> Path:
         task_id = task_id or card["taskId"]
@@ -95,7 +127,7 @@ class ProgressEchoTest(unittest.TestCase):
     # ------------------------------------------------------------------
     def test_plain_progress_and_repeated_writes_never_publish(self):
         card = make_card()
-        status = base_status(card)
+        status = base_status(self.checks_dir, card)
         status["progress"] = {"round": 1, "activity": "implementing", "step": "wrote the parser",
                               "evidenceRefs": ["runtime/pi_task.py"], "completedCriteria": [],
                               "updatedAt": 10}
@@ -109,8 +141,8 @@ class ProgressEchoTest(unittest.TestCase):
 
     def test_first_verified_result_publishes_and_deduplicates(self):
         card = make_card()
-        status = base_status(card)
-        status["checks"]["receipts"]["latestSuccessful"] = passing_receipt()
+        status = base_status(self.checks_dir, card)
+        status["checks"]["receipts"]["latestSuccessful"] = passing_receipt(self.checks_dir)
         first = pi_board.maybe_publish_progress(card, status, now=100, interval=600,
                                                 anomaly_seconds=180)
         self.assertIsNotNone(first["created"])
@@ -127,15 +159,15 @@ class ProgressEchoTest(unittest.TestCase):
 
     def test_two_milestones_interval_merge_and_quota(self):
         card = make_card()
-        status = base_status(card)
-        status["checks"]["receipts"]["latestSuccessful"] = passing_receipt()
+        status = base_status(self.checks_dir, card)
+        status["checks"]["receipts"]["latestSuccessful"] = passing_receipt(self.checks_dir)
         first = pi_board.maybe_publish_progress(card, status, now=1000, interval=600,
                                                 anomaly_seconds=180)
         event_one = first["created"]
         self.assertIsNotNone(event_one)
         # Within the interval a new milestone is merged into the pending packet,
         # not queued as a second notification.
-        checking = base_status(card)
+        checking = base_status(self.checks_dir, card)
         checking["progress"] = {"round": 1, "activity": "checking", "step": "running tests",
                                 "evidenceRefs": ["round.checks/A1.log"], "completedCriteria": [],
                                 "updatedAt": 1200}
@@ -150,7 +182,7 @@ class ProgressEchoTest(unittest.TestCase):
                          "pi self-reports stay explicitly unverified in the echo")
         self.assertEqual(card["notify"]["phases"]["P1"]["count"], 1)
         # After the interval the next distinct milestone is a second notification.
-        repairing = base_status(card)
+        repairing = base_status(self.checks_dir, card)
         repairing["progress"] = {"round": 1, "activity": "repairing", "step": "fixing",
                                  "evidenceRefs": [], "completedCriteria": ["A1"],
                                  "updatedAt": 1700}
@@ -162,8 +194,8 @@ class ProgressEchoTest(unittest.TestCase):
         self.assertEqual(card["notify"]["phases"]["P1"]["count"], 2)
         self.assertEqual(len(self.pending(card)), 1, "older pending progress is superseded")
         # A third milestone (new candidate) cannot exceed the two-notification quota.
-        third_status = base_status(card, candidate=HEAD_B, round_number=2)
-        third_status["checks"]["receipts"]["latestSuccessful"] = passing_receipt("A1", HEAD_B)
+        third_status = base_status(self.checks_dir, card, candidate=HEAD_B, round_number=2)
+        third_status["checks"]["receipts"]["latestSuccessful"] = passing_receipt(self.checks_dir, "A1", HEAD_B)
         third = pi_board.maybe_publish_progress(card, third_status, now=2400, interval=600,
                                                 anomaly_seconds=180)
         self.assertIsNone(third["created"])
@@ -173,15 +205,15 @@ class ProgressEchoTest(unittest.TestCase):
     def test_quota_persists_across_a_board_round_trip(self):
         card = make_card()
         path = self.board_file(card)
-        status = base_status(card)
-        status["checks"]["receipts"]["latestSuccessful"] = passing_receipt()
+        status = base_status(self.checks_dir, card)
+        status["checks"]["receipts"]["latestSuccessful"] = passing_receipt(self.checks_dir)
         refresh = pi_board.refresh_with_status(path, card["taskId"], status, now=100, block=False)
         self.assertEqual(len(refresh["newEvents"]), 1)
         stored = self.read_card(path, card["taskId"])
         self.assertEqual(stored["notify"]["phases"]["P1"]["count"], 1)
         # A fresh read (restart) keeps the spend and continues with the second.
         card2 = self.read_card(path, card["taskId"])
-        status2 = base_status(card2)
+        status2 = base_status(self.checks_dir, card2)
         status2["progress"] = {"round": 1, "activity": "repairing", "step": "fix",
                                "evidenceRefs": [], "completedCriteria": ["A1"],
                                "updatedAt": 2000}
@@ -192,8 +224,8 @@ class ProgressEchoTest(unittest.TestCase):
 
     def test_pause_suppresses_and_resume_allows(self):
         card = make_card(paused=True)
-        status = base_status(card)
-        status["checks"]["receipts"]["latestSuccessful"] = passing_receipt()
+        status = base_status(self.checks_dir, card)
+        status["checks"]["receipts"]["latestSuccessful"] = passing_receipt(self.checks_dir)
         blocked = pi_board.maybe_publish_progress(card, status, now=100, interval=600,
                                                   anomaly_seconds=180)
         self.assertIsNone(blocked["created"])
@@ -205,8 +237,8 @@ class ProgressEchoTest(unittest.TestCase):
         route_paused = make_card(task_id="echo-route")
         path = self.board_file(route_paused, "echo-route")
         pi_board.pause_route(THREAD_A, now=1)
-        route_status = base_status(route_paused)
-        route_status["checks"]["receipts"]["latestSuccessful"] = passing_receipt()
+        route_status = base_status(self.checks_dir, route_paused)
+        route_status["checks"]["receipts"]["latestSuccessful"] = passing_receipt(self.checks_dir)
         blocked = pi_board.maybe_publish_progress(route_paused, route_status, now=100,
                                                   interval=600, anomaly_seconds=180)
         self.assertIsNone(blocked["created"])
@@ -219,12 +251,12 @@ class ProgressEchoTest(unittest.TestCase):
     def test_stale_candidate_is_superseded_not_reported_as_current(self):
         card = make_card(task_id="echo-stale")
         path = self.board_file(card, "echo-stale")
-        first_status = base_status(card)
-        first_status["checks"]["receipts"]["latestSuccessful"] = passing_receipt()
+        first_status = base_status(self.checks_dir, card)
+        first_status["checks"]["receipts"]["latestSuccessful"] = passing_receipt(self.checks_dir)
         pi_board.refresh_with_status(path, "echo-stale", first_status, now=1000, block=False)
         self.assertEqual(len(self.pending(self.read_card(path, "echo-stale"))), 1)
-        second_status = base_status(card, candidate=HEAD_B, round_number=2)
-        second_status["checks"]["receipts"]["latestSuccessful"] = passing_receipt("A1", HEAD_B)
+        second_status = base_status(self.checks_dir, card, candidate=HEAD_B, round_number=2)
+        second_status["checks"]["receipts"]["latestSuccessful"] = passing_receipt(self.checks_dir, "A1", HEAD_B)
         refresh = pi_board.refresh_with_status(path, "echo-stale", second_status, now=1700,
                                                block=False)
         stored = self.read_card(path, "echo-stale")
@@ -236,7 +268,7 @@ class ProgressEchoTest(unittest.TestCase):
 
     def test_sustained_anomaly_echoes_once_per_failure_key(self):
         card = make_card()
-        status = base_status(card)
+        status = base_status(self.checks_dir, card)
         status["checks"]["receipts"]["failedRecent"] = [failing_receipt("A1")]
         # First observation records the failure without waking anyone.
         first = pi_board.maybe_publish_progress(card, status, now=100, interval=600,
@@ -258,10 +290,10 @@ class ProgressEchoTest(unittest.TestCase):
 
     def test_repair_progress_suppresses_the_sustained_echo(self):
         card = make_card()
-        status = base_status(card)
+        status = base_status(self.checks_dir, card)
         status["checks"]["receipts"]["failedRecent"] = [failing_receipt("A1")]
         pi_board.maybe_publish_progress(card, status, now=100, interval=600, anomaly_seconds=180)
-        repairing = base_status(card)
+        repairing = base_status(self.checks_dir, card)
         repairing["checks"]["receipts"]["failedRecent"] = [failing_receipt("A1")]
         repairing["progress"] = {"round": 1, "activity": "repairing", "step": "fixing",
                                  "evidenceRefs": ["docs/repair.md"], "completedCriteria": [],
@@ -284,8 +316,8 @@ class ProgressEchoTest(unittest.TestCase):
         card["notify"] = {"schemaVersion": 1, "phases": {"P1": {
             "phaseId": "P1", "contractSha256": CONTRACT, "count": 2,
             "lastAt": 100, "milestones": {}, "abnormal": {}}}}
-        status = base_status(card, state="completed", end_head=HEAD_A)
-        status["checks"]["receipts"]["latestSuccessful"] = passing_receipt()
+        status = base_status(self.checks_dir, card, state="completed", end_head=HEAD_A)
+        status["checks"]["receipts"]["latestSuccessful"] = passing_receipt(self.checks_dir)
         status["phase"]["readiness"] = {"status": "ready", "candidate": HEAD_A,
                                         "coverage": {"required": 1, "covered": 1},
                                         "writerFree": False, "generatedAt": 100}
@@ -295,11 +327,84 @@ class ProgressEchoTest(unittest.TestCase):
                       "final acceptance must not be suppressed by the progress quota")
         self.assertEqual(card["notify"]["phases"]["P1"]["count"], 2)
 
+    def test_verified_milestone_requires_a_matching_log(self):
+        repo = Repo(self.tmp, name="echo-real")
+        head = self.head(repo)
+        # A real passing receipt with a matching log is a verified milestone.
+        checks = self.tmp / "checks-valid"
+        self.run_pi_check(repo.root, checks)
+        card, status = self.real_status(repo, checks, head, "echo-real-valid")
+        verified = pi_board._verified_candidate_receipt(status)
+        self.assertIsNotNone(verified)
+        result = pi_board.maybe_publish_progress(card, status, now=100, interval=600,
+                                                 anomaly_seconds=180)
+        self.assertIsNotNone(result["created"])
+        self.assertEqual(result["created"]["factSource"], "verified_receipt")
+        self.assertEqual(result["created"]["evidence"]["logVerified"], True)
+        # A missing log stays unknown and can never claim a verified result.
+        checks_missing = self.tmp / "checks-missing"
+        receipt_missing = self.run_pi_check(repo.root, checks_missing)
+        (checks_missing / json.loads(receipt_missing.read_text())["log"]).unlink()
+        card_missing, status_missing = self.real_status(repo, checks_missing, head, "echo-real-missing")
+        self.assertIsNone(pi_board._verified_candidate_receipt(status_missing))
+        result_missing = pi_board.maybe_publish_progress(card_missing, status_missing, now=100,
+                                                         interval=600, anomaly_seconds=180)
+        self.assertIsNone(result_missing["created"])
+        # A content mismatch is not verified either.
+        checks_tampered = self.tmp / "checks-tampered"
+        receipt_tampered = self.run_pi_check(repo.root, checks_tampered)
+        log_path = checks_tampered / json.loads(receipt_tampered.read_text())["log"]
+        log_path.write_bytes(log_path.read_bytes() + b"tampered\n")
+        card_tampered, status_tampered = self.real_status(repo, checks_tampered, head,
+                                                          "echo-real-tampered")
+        self.assertIsNone(pi_board._verified_candidate_receipt(status_tampered))
+        result_tampered = pi_board.maybe_publish_progress(card_tampered, status_tampered, now=100,
+                                                          interval=600, anomaly_seconds=180)
+        self.assertIsNone(result_tampered["created"])
+        # A cancelled exit 0 is not a success: the scan must not label it
+        # latestSuccessful and no verified milestone may fire.
+        checks_cancelled = self.tmp / "checks-cancelled"
+        receipt_cancelled = self.run_pi_check(repo.root, checks_cancelled)
+        data = json.loads(receipt_cancelled.read_text())
+        data["cancelled"] = True
+        receipt_cancelled.write_text(json.dumps(data), encoding="utf-8")
+        scan = pi_task._scan_checks(checks_cancelled)
+        self.assertIsNone(scan["receipts"]["latestSuccessful"])
+        self.assertEqual(scan["receipts"]["failedAttempts"], 1)
+        card_cancelled, status_cancelled = self.real_status(repo, checks_cancelled, head,
+                                                            "echo-real-cancelled")
+        self.assertIsNone(pi_board._verified_candidate_receipt(status_cancelled))
+        result_cancelled = pi_board.maybe_publish_progress(card_cancelled, status_cancelled, now=100,
+                                                           interval=600, anomaly_seconds=180)
+        self.assertIsNone(result_cancelled["created"])
+
+    def test_unverified_receipt_never_dispatches(self):
+        repo = Repo(self.tmp, name="echo-real-send")
+        head = self.head(repo)
+        checks = self.tmp / "checks-nodispatch"
+        receipt = self.run_pi_check(repo.root, checks)
+        (checks / json.loads(receipt.read_text())["log"]).unlink()
+        card, status = self.real_status(repo, checks, head, "echo-nodispatch")
+        path = self.board_file(card, "echo-nodispatch")
+        refresh = pi_board.refresh_with_status(path, "echo-nodispatch", status, now=100, block=False)
+        self.assertEqual(refresh["newEvents"], [])
+        calls = []
+
+        def runner(argv, timeout):
+            calls.append(argv)
+            return {"status": "queued", "exitCode": 0, "timedOut": False,
+                    "outputSha256": "0" * 64, "outputExcerpt": "", "argv0": argv[0]}
+
+        with mock.patch.object(pi_board, "_resolve_codex_bin", return_value="/bin/true"):
+            result = pi_board.dispatch_task(path, "echo-nodispatch", cli_runner=runner)
+        self.assertFalse(result["dispatched"])
+        self.assertEqual(calls, [], "an unverified receipt must never trigger a queue send")
+
     def test_progress_event_uncertain_send_is_never_auto_resent(self):
         card = make_card(task_id="echo-send")
         path = self.board_file(card, "echo-send")
-        status = base_status(card)
-        status["checks"]["receipts"]["latestSuccessful"] = passing_receipt()
+        status = base_status(self.checks_dir, card)
+        status["checks"]["receipts"]["latestSuccessful"] = passing_receipt(self.checks_dir)
         pi_board.refresh_with_status(path, "echo-send", status, now=100, block=False)
         calls = []
 

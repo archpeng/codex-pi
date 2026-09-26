@@ -52,7 +52,8 @@ if str(RUNTIME_DIR) not in sys.path:
 
 from pi_task import (ACTIVE_STATES, TERMINAL_STATES, TASK_RE, LockHeld, atomic,  # noqa: E402
                      build_status, canonical_root, git_common_dir, lock_fd, lock_is_held,
-                     read_json, require_allowed_model, require_task_arg, task_dir_for, terminate)
+                     read_json, require_allowed_model, require_task_arg, task_dir_for, terminate,
+                     verify_receipt_log)
 
 SCHEMA_VERSION = 1
 BOARD_DIR = "codex-pi"
@@ -746,7 +747,7 @@ def _phase_projection(card: dict, status: dict, now: float):
         return None, bool(card.get("phase"))
     readiness = phase.get("readiness") or {}
     auto = phase.get("autoContinue") or {}
-    candidate = status.get("endHead") or status.get("startHead")
+    candidate = _phase_candidate_head(status)
     existing = card.get("phase") if isinstance(card.get("phase"), dict) else {}
     same_identity = (existing.get("phaseId") == phase.get("phaseId")
                      and existing.get("contractHash") == phase.get("contractSha256"))
@@ -971,7 +972,7 @@ def _project_phase_events(card: dict, status: dict, now: float) -> list:
     auto = phase.get("autoContinue") or {}
     phase_id = phase.get("phaseId")
     contract_hash = phase.get("contractHash") or phase.get("contractSha256")
-    candidate = status.get("endHead") or status.get("startHead")
+    candidate = _phase_candidate_head(status)
     base_evidence = {"briefRef": evidence_dir.get("brief"), "checksRef": checks.get("dir"),
                      "stateRef": evidence_dir.get("state"), "phaseRef": phase.get("contractRef")}
 
@@ -1062,12 +1063,20 @@ def _phase_anomaly_seconds() -> float:
 
 
 def _phase_candidate_head(status: dict):
-    head = status.get("endHead") or status.get("startHead")
+    """Current candidate identity: terminal endHead, active verified HEAD, then
+    the recorded round-start head. Active rounds expose ``currentHead`` from a
+    bounded read-only worktree probe so a mid-round commit is the candidate."""
+    head = status.get("endHead") or status.get("currentHead") or status.get("startHead")
     return head if isinstance(head, str) else None
 
 
 def _applicable_successful_receipt(status: dict):
-    """A passing receipt hash-bound to the current candidate, or None."""
+    """A metadata-passing receipt bound to the current candidate, or None.
+
+    This is an identity/metadata filter only and does not prove the log; the
+    caller must use ``_verified_candidate_receipt`` before calling a result
+    verified.
+    """
     checks = status.get("checks") or {}
     receipts = checks.get("receipts") or {}
     item = receipts.get("latestSuccessful")
@@ -1075,6 +1084,30 @@ def _applicable_successful_receipt(status: dict):
     if not isinstance(item, dict) or candidate is None:
         return None
     if item.get("head") != candidate or item.get("dirty") is not False:
+        return None
+    if item.get("failed") or item.get("cancelled") or item.get("timedOut"):
+        return None
+    if item.get("exitCode") != 0:
+        return None
+    return item
+
+
+def _verified_candidate_receipt(status: dict):
+    """A candidate-bound passing receipt whose log hash is really verified.
+
+    A missing, unreadable, oversized or mismatching log stays unknown and can
+    never be a "verified result" milestone.
+    """
+    item = _applicable_successful_receipt(status)
+    if item is None:
+        return None
+    checks = status.get("checks") or {}
+    directory = checks.get("dir")
+    if not isinstance(directory, str) or not directory:
+        return None
+    if not isinstance(item.get("logSha256"), str):
+        return None
+    if verify_receipt_log(Path(directory), item) is not True:
         return None
     return item
 
@@ -1116,13 +1149,13 @@ def progress_milestones(status: dict) -> list:
     if not contract or candidate is None:
         return []
     result = []
-    success = _applicable_successful_receipt(status)
+    success = _verified_candidate_receipt(status)
     if success is not None and not _applicable_failures(status):
         result.append((
             f"first_result|{contract}|{candidate}|{success.get('id')}",
             f"verified check {success.get('id')!r} passed on the current candidate",
             {"factSource": "verified_receipt", "checkId": success.get("id"),
-             "receipt": success.get("receipt"),
+             "receipt": success.get("receipt"), "logVerified": True,
              "receiptRef": _receipt_ref(status.get("checks") or {}, success)}))
     progress = status.get("progress") or {}
     if isinstance(progress, dict) and progress.get("round") == status.get("round") \
