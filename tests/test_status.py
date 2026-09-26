@@ -379,6 +379,82 @@ class StatusTest(unittest.TestCase):
             repo.cancel("activity", env=env)
             self.assertEqual(repo.wait_terminal("activity", env=env, timeout=25)["state"], "cancelled")
 
+    def test_status_unknown_exit_is_never_latest_successful(self):
+        repo, worktree = self.make()
+        env = base_env(PI_DOUBLE_MODE="hang")
+        repo.start("unknown-exit", worktree, env=env)
+        repo.wait_round_state("unknown-exit", "running")
+        checks = repo.task_dir("unknown-exit") / "rounds" / "1" / "round.checks"
+        checks.mkdir(parents=True, exist_ok=True)
+        for index, code in enumerate((0, None)):
+            log = checks / f"case-{index}-000000000000.log"
+            log.write_text("evidence\n", encoding="utf-8")
+            (checks / f"case-{index}-000000000000.json").write_text(json.dumps({
+                "schema_version": 1, "id": f"case-{index}", "log": log.name,
+                "log_sha256": "a" * 64, "exit_code": code, "timed_out": False,
+                "started_at": 100 + index, "ended_at": 200 + index,
+                "test_counts": {"run": 1}}), encoding="utf-8")
+        try:
+            receipts = self.status(repo, "unknown-exit", env=env)["checks"]["receipts"]
+            self.assertEqual(receipts["scanned"], 2)
+            self.assertEqual(receipts["failedAttempts"], 0)
+            self.assertEqual(receipts["latest"]["id"], "case-1",
+                             "the unknown exit stays the latest receipt")
+            self.assertEqual(receipts["latestSuccessful"]["id"], "case-0",
+                             "only a real exit code 0 may count as successful")
+            # With only unknown exits there is no successful receipt at all.
+            (checks / "case-0-000000000000.json").unlink()
+            (checks / "case-0-000000000000.log").unlink()
+            receipts = self.status(repo, "unknown-exit", env=env)["checks"]["receipts"]
+            self.assertEqual(receipts["scanned"], 1)
+            self.assertIsNone(receipts["latestSuccessful"],
+                              "missing exit is unknown, never success")
+        finally:
+            repo.cancel("unknown-exit", env=env)
+            self.assertEqual(repo.wait_terminal("unknown-exit", env=env, timeout=25)["state"],
+                             "cancelled")
+
+    def test_status_overflow_metadata_stays_bounded(self):
+        repo, worktree = self.make()
+        env = base_env(PI_DOUBLE_MODE="hang")
+        repo.start("overflow", worktree, env=env)
+        repo.wait_round_state("overflow", "running")
+        checks = repo.task_dir("overflow") / "rounds" / "1" / "round.checks"
+        checks.mkdir(parents=True, exist_ok=True)
+        huge = 10 ** 3000
+        log = checks / "overflow-0-000000000000.log"
+        log.write_text("x\n", encoding="utf-8")
+        (checks / "overflow-time-0-000000000000.running").write_text(json.dumps({
+            "schema_version": 1, "id": "overflow-time", "pid": 1, "started_at": huge,
+            "deadline_at": 2, "timeout_seconds": 60,
+            "deadline_scope": "wrapper timeout only", "log": log.name}), encoding="utf-8")
+        (checks / "overflow-0-000000000000.running").write_text(json.dumps({
+            "schema_version": 1, "id": "overflow", "pid": huge, "started_at": 1,
+            "deadline_at": 2, "timeout_seconds": 60,
+            "deadline_scope": "wrapper timeout only", "log": log.name}), encoding="utf-8")
+        state_path = repo.task_dir("overflow") / "rounds" / "1" / "round.state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["supervisorPid"] = huge
+        state["piPid"] = huge
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        try:
+            started = time.monotonic()
+            data = self.status(repo, "overflow", env=env)
+            self.assertLess(time.monotonic() - started, 10)
+            self.assertLess(len(json.dumps(data)), 100000)
+            self.assertIsNone(data["processes"]["supervisorPid"])
+            self.assertIsNone(data["processes"]["piPid"])
+            running = data["checks"]["running"]
+            self.assertIsNotNone(running, "the valid marker with a huge pid stays uncertain")
+            self.assertIsNone(running["pid"])
+            self.assertFalse(running["pidAlive"])
+            reasons = " ".join(item["reason"] for item in data["checks"]["ignored"])
+            self.assertIn("invalid running marker", reasons)
+        finally:
+            repo.cancel("overflow", env=env)
+            self.assertEqual(repo.wait_terminal("overflow", env=env, timeout=25)["state"],
+                             "cancelled")
+
     def test_wait_is_bounded_and_returns_compact_status_without_cancelling(self):
         repo, worktree = self.make()
         env = base_env(PI_DOUBLE_MODE="hang")

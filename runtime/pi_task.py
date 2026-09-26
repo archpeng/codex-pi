@@ -965,8 +965,21 @@ def _mtime(path: Path):
 def _number(value):
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    value = float(value)
+    try:
+        value = float(value)
+    except (OverflowError, ValueError):
+        return None
     return value if math.isfinite(value) else None
+
+
+MAX_PID = 2 ** 31 - 1
+
+
+def _pid_value(value):
+    """Keep only a plausible POSIX pid; corrupt huge integers are unknown."""
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 < value <= MAX_PID:
+        return None
+    return value
 
 
 def _clip(text, limit: int = STATUS_MAX_LINE) -> str:
@@ -1017,12 +1030,15 @@ def _sanitize_counts(value):
 
 
 def _pid_running(pid) -> bool:
-    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+    pid = _pid_value(pid)
+    if pid is None:
         return False
     try:
         os.kill(pid, 0)
         return True
     except ProcessLookupError:
+        return False
+    except OverflowError:
         return False
     except PermissionError:
         return True
@@ -1128,8 +1144,9 @@ def _scan_checks(checks_dir: Path) -> dict:
     result["receipts"]["latest"] = max(parsed, key=order, default=None)
     result["receipts"]["latestFailed"] = max((item for item in parsed if item["failed"]),
                                               key=order, default=None)
-    result["receipts"]["latestSuccessful"] = max((item for item in parsed if not item["failed"]),
-                                                  key=order, default=None)
+    result["receipts"]["latestSuccessful"] = max(
+        (item for item in parsed if not item["failed"] and item["exitCode"] == 0),
+        key=order, default=None)
 
     active_marker_stems = set()
     for marker in sorted(markers, key=_mtime, reverse=True):
@@ -1159,9 +1176,9 @@ def _scan_checks(checks_dir: Path) -> dict:
         if result["running"] is None:
             result["running"] = {
                 "marker": marker.name, "id": marker_id,
-                "pid": pid if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 else None,
+                "pid": _pid_value(pid),
                 "pidAlive": _pid_running(pid), "startedAt": started, "deadlineAt": deadline,
-                "elapsedMs": int(max(0.0, now - started) * 1000), "timeoutSeconds": timeout,
+                "elapsedMs": int(max(0.0, min(now - started, 10 ** 9)) * 1000), "timeoutSeconds": timeout,
                 "deadlinePassed": bool(now > deadline),
                 "deadlineScope": "wrapper timeout only; never an inner command deadline",
                 "log": log_name, "logEvidence": _tail_evidence(log_path),
@@ -1253,8 +1270,7 @@ def build_status(repo_arg: str, task_arg: str, round_arg=None) -> dict:
                                   "is activity evidence, never useful progress and never acceptance")
     processes = {"taskLockHeld": task_held, "supervisorLeaseHeld": supervisor_alive}
     for key in ("supervisorPid", "piPid"):
-        value = state.get(key)
-        processes[key] = value if isinstance(value, int) and not isinstance(value, bool) else None
+        processes[key] = _pid_value(state.get(key))
     notes = ["status is a bounded read-only snapshot; it generates no summary and parses no transcript",
              "process existence and quiet logs are never progress or failure",
              "exit 0 means the Pi process completed execution only; acceptance stays not_verified"]
