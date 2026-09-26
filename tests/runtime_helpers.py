@@ -228,7 +228,13 @@ class Repo:
             rounds = sorted((task_dir / "rounds").glob("*")) if (task_dir / "rounds").is_dir() else []
             if rounds:
                 data = json.loads((rounds[-1] / "round.state.json").read_text(encoding="utf-8"))
-                if data.get("state") == state_name:
+                # The worker records state=running before spawning Pi and
+                # records piPid immediately after; wait for the identity too so
+                # callers never observe a half-written running record.
+                ready = data.get("state") == state_name
+                if ready and state_name == "running" and not isinstance(data.get("piPid"), int):
+                    ready = False
+                if ready:
                     return data
             if time.monotonic() >= deadline:
                 raise AssertionError(f"round never entered state {state_name!r}")

@@ -5,17 +5,29 @@ This helper records execution evidence only. exit 0 is never acceptance PASS.
 No Codex CLI is invoked here.
 
 While the child runs, a uniquely named ``<id>-<nonce>.running`` marker records
-the attempt identity, wrapper start/deadline, child PID and log name so the
-read-only ``pi_task.py status`` snapshot can see the attempt without scanning
-the transcript. The wrapper deadline is never an inner command deadline, and a
-command failure inside the wrapper (for example a test runner's own timeout)
-stays a nonzero exit even when this wrapper itself did not time out. The final
-immutable receipt is written and the running marker is removed in a final
-cleanup; a killed wrapper leaves the marker as crash evidence.
+the attempt identity, wrapper start/deadline, child PID, optional resource
+guard snapshot and log name so the read-only ``pi_task.py status`` snapshot can
+see the attempt without scanning the transcript. The wrapper deadline is never
+an inner command deadline, and a command failure inside the wrapper (for
+example a test runner's own timeout) stays a nonzero exit even when this
+wrapper itself did not time out. The final immutable receipt is written and the
+running marker is removed in a final cleanup; a killed wrapper leaves the
+marker as crash evidence.
+
+Optional declared directory budget: ``--watch-path PATH --max-bytes N`` counts
+regular-file bytes under one explicitly selected path without following
+symlinks, before spawning and at ``--health-interval-seconds`` (default 15)
+while the owned child runs. Incomplete or unreadable measurements stay unknown
+and are never treated as under budget. A known breach stops only this owned
+check process group, retains the log and writes an immutable receipt with
+explicit resourceLimit bytes/path/reason and a nonzero exit; a breach observed
+at child exit also prevents a pass. Timed out, cancelled and guard-stopped
+attempts keep distinct fields. Without both options the helper is unguarded.
 """
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -24,9 +36,69 @@ import subprocess
 import time
 import uuid
 
+from pi_size import measure
 from pi_task import atomic, terminate
 
 RUNNING_SUFFIX = ".running"
+GUARD_EXIT_CODE = 75
+MIN_HEALTH_INTERVAL = 0.05
+MAX_HEALTH_INTERVAL = 3600.0
+
+
+class Guard:
+    """One declared no-follow directory byte budget for an owned check child."""
+
+    def __init__(self, path, max_bytes: int, interval: float):
+        self.path = Path(os.path.abspath(os.path.expanduser(str(path))))
+        self.max_bytes = int(max_bytes)
+        self.interval = float(interval)
+        self.scans = 0
+        self.unknown_scans = 0
+        self.breached = False
+        self.stopped_child = False
+        self.child_exit_code = None
+        self.reason = None
+        self.preflight = None
+        self.first_breach = None
+        self.last = None
+
+    def scan(self, preflight: bool = False) -> dict:
+        measurement = measure(self.path)
+        self.scans += 1
+        if measurement.get("unknown"):
+            self.unknown_scans += 1
+        self.last = measurement
+        if preflight:
+            self.preflight = measurement
+        if measurement.get("complete") and not measurement.get("unknown") \
+                and measurement.get("bytes") is not None \
+                and measurement["bytes"] > self.max_bytes:
+            self.breached = True
+            if self.first_breach is None:
+                self.first_breach = measurement
+            self.reason = (f"observed {measurement['bytes']} bytes under {self.path} exceed "
+                           f"the declared max_bytes {self.max_bytes}")
+        return measurement
+
+    def snapshot(self) -> dict:
+        last = self.last or {}
+        return {
+            "path": str(self.path),
+            "max_bytes": self.max_bytes,
+            "observed_bytes": last.get("bytes"),
+            "breached": self.breached,
+            "unknown": bool(last.get("unknown")),
+            "complete": bool(last.get("complete")),
+            "reason": self.reason or last.get("reason"),
+            "scans": self.scans,
+            "unknown_scans": self.unknown_scans,
+            "health_interval_seconds": self.interval,
+            "stopped_child": self.stopped_child,
+            "child_exit_code": self.child_exit_code,
+            "checked_at": time.time(),
+            "scope": "regular file bytes under the declared path; symlinks are never followed",
+            "note": "local detection only; unknown is not verified and is never treated as under budget",
+        }
 
 
 def remove_running(marker: Path) -> None:
@@ -36,11 +108,46 @@ def remove_running(marker: Path) -> None:
         pass
 
 
+def wait_for_child(child, guard, timeout_seconds: float, marker: Path, marker_data: dict):
+    """Wait for the owned child, scanning the guard each health interval.
+
+    Returns ``(exit_code, timed_out)``. A guard breach terminates with the
+    dedicated guard exit so timeouts, cancellations and guard stops remain
+    distinguishable.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    interval = guard.interval if guard is not None else timeout_seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return 124, True
+        try:
+            raw = child.wait(timeout=max(0.01, min(remaining, interval)))
+        except subprocess.TimeoutExpired:
+            if guard is not None:
+                guard.scan()
+                marker_data["resource_limit"] = guard.snapshot()
+                atomic(marker, marker_data)
+                if guard.breached:
+                    guard.stopped_child = True
+                    return GUARD_EXIT_CODE, False
+            continue
+        return (raw if raw >= 0 else 128 - raw), False
+
+
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--output-dir', type=Path, required=True)
     parser.add_argument('--id', required=True)
     parser.add_argument('--timeout-seconds', type=float, default=3600)
+    parser.add_argument('--watch-path', type=Path,
+                        help='declared path whose regular-file bytes are budgeted; requires '
+                             '--max-bytes and never follows symlinks')
+    parser.add_argument('--max-bytes', type=int,
+                        help='positive byte budget for regular files under --watch-path')
+    parser.add_argument('--health-interval-seconds', type=float, default=15.0,
+                        help='guard scan period while the owned child runs (default 15)')
     parser.add_argument('argv', nargs=argparse.REMAINDER)
     args = parser.parse_args()
     argv = args.argv[1:] if args.argv[:1] == ['--'] else args.argv
@@ -48,6 +155,17 @@ def main():
         parser.error('provide a safe check id and a command after --')
     if not 0 < args.timeout_seconds <= 604800:
         parser.error('timeout must be positive and at most seven days')
+    if (args.watch_path is None) != (args.max_bytes is None):
+        parser.error('--watch-path and --max-bytes must be provided together')
+    if args.max_bytes is not None and args.max_bytes <= 0:
+        parser.error('--max-bytes must be a positive integer')
+    if not (math.isfinite(args.health_interval_seconds)
+            and MIN_HEALTH_INTERVAL <= args.health_interval_seconds <= MAX_HEALTH_INTERVAL):
+        parser.error(f'--health-interval-seconds must be a finite value between '
+                     f'{MIN_HEALTH_INTERVAL} and {MAX_HEALTH_INTERVAL}')
+    guard = Guard(args.watch_path, args.max_bytes, args.health_interval_seconds) \
+        if args.watch_path is not None else None
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
     stem = args.id + '-' + uuid.uuid4().hex[:12]
     log = args.output_dir / (stem + '.log')
@@ -63,6 +181,8 @@ def main():
         'deadline_scope': 'wrapper timeout only; never an inner command deadline',
         'log': log.name, 'receipt': receipt.name,
     }
+    if guard is not None:
+        marker_data['resource_limit'] = guard.snapshot()
     caught = {'signal': None}
 
     def interrupted(sig, _frame):
@@ -75,14 +195,24 @@ def main():
         previous = {s: signal.signal(s, interrupted) for s in (signal.SIGINT, signal.SIGTERM)}
         try:
             with log.open('xb') as output:
-                child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=output, stderr=output,
-                                         start_new_session=True)
-                marker_data['pid'] = child.pid
-                atomic(marker, marker_data)
-                raw = child.wait(timeout=args.timeout_seconds)
-                code = raw if raw >= 0 else 128 - raw
-        except subprocess.TimeoutExpired:
-            timed_out, code = True, 124
+                if guard is not None:
+                    guard.scan(preflight=True)
+                    marker_data['resource_limit'] = guard.snapshot()
+                    atomic(marker, marker_data)
+                if guard is None or not guard.breached:
+                    child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=output,
+                                             stderr=output, start_new_session=True)
+                    marker_data['pid'] = child.pid
+                    if guard is not None:
+                        marker_data['resource_limit'] = guard.snapshot()
+                    atomic(marker, marker_data)
+                    code, timed_out = wait_for_child(child, guard, args.timeout_seconds,
+                                                     marker, marker_data)
+                else:
+                    # A pre-existing known breach stops this run before any child
+                    # is created; nothing outside this check is touched.
+                    guard.stopped_child = True
+                    code = GUARD_EXIT_CODE
         except KeyboardInterrupt:
             code = 128 + (caught['signal'] or signal.SIGINT)
         except OSError as exc:
@@ -92,9 +222,24 @@ def main():
                 signal.signal(s, signal.SIG_IGN)
             if child is not None:
                 terminate(child)
+                if guard is not None:
+                    guard.child_exit_code = child.returncode
             for s, handler in previous.items():
                 signal.signal(s, handler)
-        raw = log.read_bytes()
+            if guard is not None:
+                # Final measurement also covers bytes added at child exit; a
+                # breach here must not be reported as a pass.
+                guard.scan()
+                marker_data['resource_limit'] = guard.snapshot()
+                try:
+                    atomic(marker, marker_data)
+                except OSError as exc:
+                    error = error or f"guard marker update failed: {exc}"
+                if guard.breached:
+                    guard.stopped_child = guard.stopped_child or child is not None
+                    if not timed_out and caught['signal'] is None and error is None:
+                        code = GUARD_EXIT_CODE
+        raw = log.read_bytes() if log.exists() else b''
         text = raw.decode(errors='replace')
         counts = {'run': len(re.findall(r'^=== RUN\s', text, re.M)),
                   'pass': len(re.findall(r'^--- PASS:', text, re.M)),
@@ -109,18 +254,25 @@ def main():
             dirty, diff_hash = bool(status), hashlib.sha256(diff).hexdigest()
         except subprocess.CalledProcessError:
             head, dirty, diff_hash = None, None, None
+        resource_limit = guard.snapshot() if guard is not None else None
         data = {'schema_version': 1, 'id': args.id, 'argv': argv, 'cwd': str(Path.cwd()),
                 'head': head, 'dirty': dirty, 'tracked_diff_sha256': diff_hash,
                 'started_at': started, 'ended_at': time.time(), 'deadline_at': deadline,
                 'exit_code': code, 'timed_out': timed_out,
+                'cancelled': caught['signal'] is not None,
+                'signal': caught['signal'],
                 'error': error, 'test_counts': counts, 'log': log.name,
                 'log_sha256': hashlib.sha256(raw).hexdigest(),
                 'running_marker': marker.name,
+                'resource_limit': resource_limit,
+                'resourceLimit': resource_limit,
                 'acceptance': 'not_verified'}
         # The immutable receipt replaces the terminal state; the marker is
         # removed in the final cleanup below even if receipt writing fails.
         atomic(receipt, data)
         print(json.dumps({'receipt': str(receipt.resolve()), 'exit_code': code, 'timed_out': timed_out,
+                          'cancelled': caught['signal'] is not None,
+                          'resource_limit': data['resource_limit'],
                           'test_counts': counts, 'acceptance': 'not_verified'}))
         return code
     finally:

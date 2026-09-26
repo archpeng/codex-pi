@@ -12,6 +12,8 @@ import json
 from pathlib import Path
 import re
 
+from pi_size import sanitize_snapshot
+
 RISKY = [
     (r"\bgit\s+push\b", "git push"), (r"\bgit\s+stash\b", "git stash"),
     (r"\bgit\s+add\s+(-A|--all|\.)(\s|$)", "git add -A / ."),
@@ -55,7 +57,9 @@ def receipts(directory: Path) -> list[dict]:
                      and hashlib.sha256(log.read_bytes()).hexdigest() == data["log_sha256"])
             result.append({key: data.get(key) for key in (
                 "id", "argv", "head", "dirty", "exit_code", "timed_out", "test_counts", "log")}
-                | {"receipt": str(path), "log_verified": valid})
+                | {"receipt": str(path), "log_verified": valid,
+                   "resource_limit": sanitize_snapshot(data.get("resource_limit")
+                                                       or data.get("resourceLimit"))})
         except (ValueError, KeyError, OSError, TypeError):
             result.append({"receipt": str(path), "log_verified": False, "exit_code": None})
     return result
@@ -156,19 +160,21 @@ def summarize(log: Path, worktree: Path, run_dir: Path | None = None,
             "acceptance": "not_verified"}
 
 
-CHECK_FLAGS = ("failed", "timed_out", "unverified_log", "unknown_exit", "skipped", "zero_run", "unknown_counts")
+CHECK_FLAGS = ("failed", "timed_out", "unverified_log", "unknown_exit", "skipped", "zero_run", "unknown_counts", "resource_breach")
 
 
 def check_flag_map(check: dict) -> dict:
     code = check.get("exit_code")
     counts = check.get("test_counts") or {}
+    resource = check.get("resource_limit") or {}
     return {"failed": (code is not None and code != 0) or bool(counts.get("fail")),
             "timed_out": bool(check.get("timed_out")),
             "unverified_log": not check["log_verified"],
             "unknown_exit": code is None,
             "skipped": bool(counts.get("skip")),
             "zero_run": bool(counts) and counts.get("run") == 0,
-            "unknown_counts": not counts}
+            "unknown_counts": not counts,
+            "resource_breach": bool(resource.get("breached"))}
 
 
 def check_overview(data: dict, limit: int = 8) -> dict:
@@ -182,6 +188,7 @@ def check_overview(data: dict, limit: int = 8) -> dict:
     receipts = [{"id": check.get("id"), "receipt": check.get("receipt"),
                  "exit_code": check.get("exit_code"), "timed_out": check.get("timed_out"),
                  "test_counts": check.get("test_counts"), "log_verified": check.get("log_verified"),
+                 "resource_limit": check.get("resource_limit"),
                  "flags": [key for key in CHECK_FLAGS if check_flag_map(check)[key]]} for check in selected]
     return {"total": len(checks), "counts": {key: totals[key] for key in CHECK_FLAGS},
             "receipts": receipts, "listed": len(receipts),
@@ -224,7 +231,8 @@ def compact(data: dict) -> str:
     for check in checks:
         totals.update({key: int(value) for key, value in check_flag_map(check).items()})
     lines.append(f"receipt_attempts: total={len(checks)} " + " ".join(f"{key}={totals[key]}" for key in (
-        "failed", "timed_out", "unverified_log", "unknown_exit", "skipped", "zero_run", "unknown_counts")))
+        "failed", "timed_out", "unverified_log", "unknown_exit", "skipped", "zero_run", "unknown_counts",
+        "resource_breach")))
     lines.append("All attempts counted; retries do not erase failures. Absence is missing evidence.")
     priority = CHECK_FLAGS
     selected = sorted(checks, key=lambda check: tuple(-int(check_flag_map(check)[key]) for key in priority))[:8]

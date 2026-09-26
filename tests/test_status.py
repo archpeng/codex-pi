@@ -215,6 +215,11 @@ class StatusTest(unittest.TestCase):
         env_hang = base_env(PI_DOUBLE_MODE="hang")
         repo.continue_task("stale", env=env_hang)
         repo.wait_round_state("stale", "running")
+        round_log = repo.task_dir("stale") / "rounds" / "2" / "round.jsonl"
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not round_log.read_text(
+                encoding="utf-8", errors="replace").strip():
+            time.sleep(0.05)
         stale_summary = repo.task_dir("stale") / "rounds" / "2" / "round.summary.json"
         stale_summary.write_text(json.dumps({"source": "stale sum", "process_exit": "0",
                                              "final_text": "STALE-CURRENT-CLAIM"}), encoding="utf-8")
