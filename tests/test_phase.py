@@ -538,6 +538,82 @@ class PhaseTest(unittest.TestCase):
         self.assertEqual(self.rounds(repo, "unknown-start"), [1, 2],
                          "an unknown start result is never retried")
 
+    def test_budget_exhaustion_blocks_auto_continue(self):
+        repo, worktree = self.make()
+        env = self.h_env(PI_DOUBLE_MODE="ok")
+        sha = self.write_design(repo)
+        path = self.write_contract("p.json", self.contract(repo, "P-BUDGET", design_sha=sha,
+                                                           budget=1))
+        self.start(repo, worktree, "budget-task", path, env)
+        repo.wait_terminal("budget-task")
+        self.assertEqual(self.rounds(repo, "budget-task"), [1])
+        self.assertEqual(self.phase_auto(repo, "budget-task"), {})
+        self.register(repo, "budget-task", env)
+        self.refresh(repo, "budget-task", env)
+        blocked = self.pending(repo, "budget-task", "phase_blocked")
+        self.assertEqual(len(blocked), 1)
+        self.assertEqual(blocked[0]["evidence"]["reason"], "budget_exhausted")
+
+    def test_nonzero_exit_never_auto_continues(self):
+        repo, worktree = self.make()
+        env = self.h_env(PI_DOUBLE_MODE="fail")
+        sha = self.write_design(repo)
+        path = self.write_contract("p.json", self.contract(repo, "P-FAIL-EXIT", design_sha=sha))
+        self.start(repo, worktree, "fail-task", path, env)
+        repo.wait_terminal("fail-task")
+        self.assertEqual(self.rounds(repo, "fail-task"), [1])
+        self.assertEqual(self.phase_auto(repo, "fail-task"), {})
+        self.register(repo, "fail-task", env)
+        self.refresh(repo, "fail-task", env)
+        blocked = self.pending(repo, "fail-task", "phase_blocked")
+        self.assertEqual(len(blocked), 1)
+        self.assertEqual(blocked[0]["evidence"]["reason"], "round_failed")
+
+    def test_out_of_scope_change_escalates_instead_of_auto_continuing(self):
+        repo, worktree = self.make()
+        env = self.h_env(PI_DOUBLE_MODE="delay-ok", PI_DOUBLE_DELAY="4")
+        sha = self.write_design(repo)
+        path = self.write_contract("p.json", self.contract(repo, "P-SCOPE", design_sha=sha,
+                                                           scope=["docs/"]))
+        self.start(repo, worktree, "scope-task", path, env)
+        repo.wait_round_state("scope-task", "running")
+        (worktree / "outside.txt").write_text("out of scope\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(worktree), "add", "-A"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(worktree), "-c", "user.email=t@e.invalid",
+                        "-c", "user.name=T", "commit", "-qm", "outside scope"],
+                       check=True, capture_output=True)
+        repo.wait_terminal("scope-task")
+        self.assertEqual(self.rounds(repo, "scope-task"), [1])
+        self.register(repo, "scope-task", env)
+        self.refresh(repo, "scope-task", env)
+        blocked = self.pending(repo, "scope-task", "phase_blocked")
+        self.assertEqual(len(blocked), 1)
+        self.assertEqual(blocked[0]["evidence"]["reason"], "scope_violation")
+
+    def test_auto_continue_claim_is_single_per_phase(self):
+        repo, worktree = self.make()
+        env = self.h_env(PI_DOUBLE_MODE="hang")
+        sha = self.write_design(repo)
+        path = self.write_contract("p.json", self.contract(repo, "P-QUOTA", design_sha=sha))
+        self.start(repo, worktree, "quota-task", path, env)
+        repo.wait_round_state("quota-task", "running")
+        try:
+            task_dir = repo.task_dir("quota-task")
+            task = json.loads((task_dir / "task.json").read_text(encoding="utf-8"))
+            first, problem = pi_task._claim_auto_continue(task_dir, "P-QUOTA", "a" * 64, 1,
+                                                          "missing_checks", task)
+            self.assertIsNotNone(first, problem)
+            second, existing = pi_task._claim_auto_continue(task_dir, "P-QUOTA", "a" * 64, 1,
+                                                            "missing_checks", task)
+            self.assertIsNone(second)
+            self.assertTrue(existing["used"])
+            ledger = pi_task.read_phase_auto(task_dir)[0]
+            self.assertEqual(list(ledger["phases"]), ["P-QUOTA"])
+            self.assertEqual(ledger["phases"]["P-QUOTA"]["round"], 2)
+        finally:
+            repo.cancel("quota-task", env=env)
+            repo.wait_terminal("quota-task", env=env, timeout=25)
+
     # ------------------------------------------------------------------
     # O1-6 acceptance gate and stale evidence
     # ------------------------------------------------------------------
@@ -597,6 +673,17 @@ class PhaseTest(unittest.TestCase):
         proc = run_board("decide", "--repo", str(repo.root), "--task", "stale-task",
                          "--event-id", event["id"], "--decision", "changes_requested",
                          env=env, expect=2)
+        self.assertIn("stale", proc.stderr)
+        # A contract revision mismatch is equally stale even when the candidate
+        # is unchanged.
+        board = json.loads(board_path.read_text(encoding="utf-8"))
+        board["cards"]["stale-task"]["phase"]["candidate"] = head
+        board["cards"]["stale-task"]["phase"]["contractHash"] = "0" * 64
+        board_path.write_text(json.dumps(board), encoding="utf-8")
+        proc = run_board("decide", "--repo", str(repo.root), "--task", "stale-task",
+                         "--event-id", event["id"], "--decision", "accept",
+                         "--reviewed-head", head, "--phase", "P-STALE",
+                         "--contract-hash", frozen["contractSha256"], env=env, expect=2)
         self.assertIn("stale", proc.stderr)
 
     def test_stale_event_is_not_dispatched_and_is_marked_superseded(self):
