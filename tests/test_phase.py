@@ -1059,37 +1059,117 @@ class PhaseTest(unittest.TestCase):
         self.assertEqual(card["phase"]["acceptedHead"], head)
         self.assertEqual(self.pending(repo, "gate-task"), [])
 
+    def test_snapshot_identity_and_grades_are_consistent_across_components(self):
+        repo, worktree = self.make()
+        env = self.h_env(PI_DOUBLE_MODE="delay-ok", PI_DOUBLE_DELAY="6")
+        sha = self.write_design(repo)
+        path = self.write_contract("p.json", self.contract(repo, "P-SNAP", design_sha=sha))
+        self.start(repo, worktree, "snap-task", path, env)
+        repo.wait_round_state("snap-task", "running")
+        candidate = self.head(worktree)
+        checks = repo.task_dir("snap-task") / "rounds" / "1" / "round.checks"
+        check = subprocess.run(
+            [sys.executable, str(CHECK), "--output-dir", str(checks), "--id", "A1",
+             "--", sys.executable, "-c", "print('ok')"], cwd=str(worktree),
+            capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(check.returncode, 0, check.stderr)
+        # While the round is active the verified snapshot item produces one
+        # bounded progress echo bound to the same candidate as the board.
+        self.register(repo, "snap-task", env, transport="cli-queue", thread=THREAD_A)
+        board_json("refresh", "--repo", str(repo.root), "--task", "snap-task", env=env)
+        active_card = self.card(repo, "snap-task")
+        self.assertEqual(active_card["phase"]["candidate"], candidate)
+        self.assertEqual(active_card["evidence"]["candidateHead"], candidate)
+        milestones = self.pending(repo, "snap-task", "progress_update")
+        self.assertEqual(len(milestones), 1)
+        self.assertEqual(milestones[0]["candidate"]["head"], candidate)
+        self.assertEqual(milestones[0]["evidence"]["factSource"], "verified_receipt")
+        repo.wait_terminal("snap-task")
+
+        def writer_free():
+            live = cli_json("status", "--repo", str(repo.root), "--task", "snap-task", env=env)
+            if not live["ownership"]["activeWorker"] and not live["ownership"]["supervisorAlive"]:
+                return live
+            return None
+
+        status = self.wait_for(writer_free, timeout=20, what="writer-free status")
+        self.assertEqual(status["candidate"], {"status": "known", "head": candidate,
+                                               "source": "endHead", "reason": None})
+        evidence = status["phase"]["evidence"]
+        self.assertEqual(evidence["candidate"]["head"], candidate)
+        self.assertEqual(status["phase"]["candidate"], candidate)
+        self.assertEqual(evidence["items"][0]["status"], "covered")
+        self.assertTrue(evidence["items"][0]["logVerified"])
+        self.assertEqual(evidence["items"][0]["evidenceLevel"], "verified_result")
+        self.assertEqual(evidence["evidenceLevels"]["deliveryReadiness"], "ready")
+        self.assertFalse(evidence["evidenceLevels"]["gptAcceptance"])
+        readiness = cli_json("readiness", "--repo", str(repo.root), "--task", "snap-task",
+                             "--round", "1", env=env)
+        self.assertEqual(readiness["candidate"], candidate)
+        self.assertEqual(readiness["candidateSource"]["head"], candidate)
+        self.assertEqual(readiness["items"][0]["status"], "covered")
+        self.assertEqual(readiness["status"], "ready")
+        board_json("refresh", "--repo", str(repo.root), "--task", "snap-task", env=env)
+        card = self.card(repo, "snap-task")
+        self.assertEqual(card["phase"]["candidate"], candidate)
+        self.assertEqual(card["evidence"]["candidateHead"], candidate)
+        self.assertEqual(len(self.pending(repo, "snap-task", "progress_update")), 1)
+        review = self.pending(repo, "snap-task", "review_required")
+        self.assertEqual(len(review), 1)
+        self.assertEqual(review[0]["candidate"]["head"], candidate)
+        frozen = json.loads((repo.task_dir("snap-task") / "phase.json").read_text(encoding="utf-8"))
+        decided = board_json("decide", "--repo", str(repo.root), "--task", "snap-task",
+                             "--event-id", review[0]["id"], "--decision", "accept",
+                             "--reviewed-head", candidate, "--phase", "P-SNAP",
+                             "--contract-hash", frozen["contractSha256"], env=env)
+        self.assertEqual(decided["decision"], "accepted")
+        self.refresh(repo, "snap-task", env)
+        card = self.card(repo, "snap-task")
+        self.assertEqual(card["phase"]["status"], "accepted")
+        self.assertEqual(card["phase"]["acceptedHead"], candidate)
+
     def test_stale_phase_event_cannot_be_accepted(self):
         repo, worktree, env = self.ready_phase(task="stale-task", phase_id="P-STALE")
         event = self.pending(repo, "stale-task", "review_required")[0]
         head = self.head(worktree)
-        # Move the phase candidate forward without a new review event: the old
-        # event must no longer bind.
-        board_path = repo.state_dir / "board.json"
-        board = json.loads(board_path.read_text(encoding="utf-8"))
-        board["cards"]["stale-task"]["phase"]["candidate"] = "f" * 40
-        board_path.write_text(json.dumps(board), encoding="utf-8")
         frozen = json.loads((repo.task_dir("stale-task") / "phase.json").read_text(encoding="utf-8"))
-        proc = run_board("decide", "--repo", str(repo.root), "--task", "stale-task",
-                         "--event-id", event["id"], "--decision", "accept",
-                         "--reviewed-head", head, "--phase", "P-STALE",
-                         "--contract-hash", frozen["contractSha256"], env=env, expect=2)
-        self.assertIn("stale", proc.stderr)
-        proc = run_board("decide", "--repo", str(repo.root), "--task", "stale-task",
-                         "--event-id", event["id"], "--decision", "changes_requested",
+        contract_sha = frozen["contractSha256"]
+        # 1) A real commit after the terminal round moves the worktree HEAD away
+        #    from the reviewed candidate; the live accept gate must refuse.
+        (worktree / "late.txt").write_text("late\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(worktree), "add", "-A"], check=True,
+                       capture_output=True)
+        subprocess.run(["git", "-C", str(worktree), "-c", "user.email=t@e.invalid",
+                        "-c", "user.name=T", "commit", "-qm", "late commit"], check=True,
+                       capture_output=True)
+        late_head = self.head(worktree)
+        self.assertNotEqual(late_head, head)
+        decide = ["decide", "--repo", str(repo.root), "--task", "stale-task",
+                  "--event-id", event["id"]]
+        proc = run_board(*decide, "--decision", "accept", "--reviewed-head", head,
+                         "--phase", "P-STALE", "--contract-hash", contract_sha,
                          env=env, expect=2)
         self.assertIn("stale", proc.stderr)
-        # A contract revision mismatch is equally stale even when the candidate
-        # is unchanged.
-        board = json.loads(board_path.read_text(encoding="utf-8"))
-        board["cards"]["stale-task"]["phase"]["candidate"] = head
-        board["cards"]["stale-task"]["phase"]["contractHash"] = "0" * 64
-        board_path.write_text(json.dumps(board), encoding="utf-8")
-        proc = run_board("decide", "--repo", str(repo.root), "--task", "stale-task",
-                         "--event-id", event["id"], "--decision", "accept",
-                         "--reviewed-head", head, "--phase", "P-STALE",
-                         "--contract-hash", frozen["contractSha256"], env=env, expect=2)
+        # 2) Installing a live contract revision invalidates the old event even
+        #    when the candidate is unchanged.
+        revised = dict(frozen["contract"], result="revised complete result")
+        phase_record, _problem = pi_task.read_phase_record(repo.task_dir("stale-task"))
+        pi_task.install_phase_contract(repo.task_dir("stale-task"), revised, repo.root,
+                                       worktree, prior=phase_record)
+        proc = run_board(*decide, "--decision", "accept", "--reviewed-head", head,
+                         "--phase", "P-STALE", "--contract-hash", contract_sha,
+                         env=env, expect=2)
         self.assertIn("stale", proc.stderr)
+        # 3) A new round also makes the old round's review event stale.
+        revised_path = self.write_contract("revised.json", revised)
+        run_cli("continue", "--repo", str(repo.root), "--task", "stale-task",
+                "--prompt", "next round", "--contract-file", str(revised_path),
+                env=env, expect=0)
+        proc = run_board(*decide, "--decision", "accept", "--reviewed-head", head,
+                         "--phase", "P-STALE", "--contract-hash", contract_sha,
+                         env=env, expect=2)
+        self.assertIn("stale", proc.stderr)
+        repo.wait_terminal("stale-task", env=env, round=2, timeout=30)
 
     def test_stale_event_is_not_dispatched_and_is_marked_superseded(self):
         repo, _worktree = self.make()

@@ -65,6 +65,7 @@ MAX_PROGRESS_ITEMS = 100
 MAX_PROGRESS_REFS = 20
 MAX_READINESS_ITEMS = 100
 MAX_VERIFY_LOG_BYTES = 33_554_432
+MAX_VERIFY_TOTAL_BYTES = 67_108_864
 MAX_SCOPE_DIFF_FILES = 600
 MIN_AUTO_CONTINUE_SECONDS = 60.0
 FULL_OID_RE = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\Z")
@@ -803,45 +804,64 @@ def cmd_phase_status(args) -> dict:
     return result
 
 
-def _readiness_receipt(receipt: Path):
-    """Strict bounded receipt parse for readiness binding (no log read here)."""
-    data, problem = _read_bounded_json(receipt, STATUS_MAX_FILE_BYTES)
-    if problem is not None or not isinstance(data, dict) or data.get("schema_version") != 1:
-        return None, problem or "unrecognized receipt shape"
-    check_id = data.get("id")
-    log_name = data.get("log")
-    digest = data.get("log_sha256")
-    if not isinstance(check_id, str) or not CHECK_ID_RE.fullmatch(check_id):
-        return None, "unsafe receipt id"
-    if not isinstance(log_name, str) or not log_name.endswith(".log") \
-            or _safe_basename(log_name) is None:
-        return None, "unsafe receipt log identity"
-    if not isinstance(digest, str) or not LOG_DIGEST_RE.fullmatch(digest):
-        return None, "unsafe receipt log hash"
-    code = data.get("exit_code")
-    if code is not None and (isinstance(code, bool) or not isinstance(code, int)):
-        return None, "unsafe receipt exit code"
-    head = data.get("head")
-    if head is not None and (not isinstance(head, str) or not FULL_OID_RE.fullmatch(head)):
-        head = None
-    dirty = data.get("dirty")
-    if not isinstance(dirty, bool):
-        dirty = None
-    return {
-        "id": check_id, "exitCode": code, "timedOut": bool(data.get("timed_out")),
-        "cancelled": bool(data.get("cancelled")),
-        "failed": ((code is not None and code != 0) or bool(data.get("timed_out"))
-                   or bool(data.get("cancelled"))),
-        "testCounts": _sanitize_counts(data.get("test_counts")),
-        "startedAt": _number(data.get("started_at")), "endedAt": _number(data.get("ended_at")),
-        "log": log_name, "logSha256": digest, "receipt": receipt.name,
-        "head": head.lower() if isinstance(head, str) else None, "dirty": dirty,
-        "logVerified": None,
-    }, None
+def normalize_candidate(status: dict) -> dict:
+    """Single candidate-identity normalization used by every consumer.
+
+    Terminal rounds use the exact ``endHead``; active rounds use the bounded
+    ``currentHead`` probe only. A missing probe or unknown ownership never falls
+    back to the round-start commit, because that would present old evidence as
+    current. Returns ``{"status": "known"|"unknown", "head", "source",
+    "reason"}``.
+    """
+    state = status.get("state")
+    if state in TERMINAL_STATES:
+        head = status.get("endHead")
+        if isinstance(head, str) and head:
+            return {"status": "known", "head": head.lower(), "source": "endHead",
+                    "reason": None}
+        return {"status": "unknown", "head": None, "source": None,
+                "reason": "terminal round has no exact endHead"}
+    if state in ACTIVE_STATES:
+        head = status.get("currentHead")
+        if isinstance(head, str) and head:
+            return {"status": "known", "head": head.lower(), "source": "currentHead",
+                    "reason": None}
+        return {"status": "unknown", "head": None, "source": None,
+                "reason": "active HEAD probe unavailable; the round-start commit is not a "
+                          "candidate"}
+    return {"status": "unknown", "head": None, "source": None,
+            "reason": f"ownership state {state!r} has no verified candidate"}
 
 
-def verify_receipt_log(checks_dir: Path, item: dict):
-    """True/False/None log hash verification with a bounded read; None stays unknown."""
+def evaluate_count_rules(spec: dict, counts):
+    """Conjunction of every declared count rule for one acceptance item.
+
+    Returns ``(status, reason)`` with status None when all declared rules pass.
+    Missing counts/fields are unknown, skip>0 is skipped and run<minRun is
+    failed; declaring two rules never skips either one.
+    """
+    if spec.get("forbidSkip"):
+        if not isinstance(counts, dict) or "skip" not in counts:
+            return ("unknown", "skip-freedom cannot be verified: the receipt has no parseable "
+                               "test counts (declare forbidSkip only for count-emitting runners)")
+        if counts.get("skip"):
+            return ("skipped", f"test counts report {counts.get('skip')} skips")
+    if spec.get("minRun") is not None:
+        if not isinstance(counts, dict) or "run" not in counts:
+            return ("unknown", "minRun cannot be verified: the receipt has no parseable test "
+                               "counts")
+        if counts.get("run", 0) < spec["minRun"]:
+            return ("failed", f"test counts report fewer than minRun={spec['minRun']} runs")
+    return (None, None)
+
+
+def verify_receipt_log(checks_dir: Path, item: dict, budget: dict | None = None):
+    """True/False/None log hash verification with a bounded read; None stays unknown.
+
+    ``budget`` is an optional per-snapshot byte allowance: once it would be
+    exceeded the result is None and ``budget['exceeded']`` is set, so the caller
+    can fail closed instead of hashing unbounded logs.
+    """
     resolved = checks_dir.resolve()
     log_path = checks_dir / item["log"]
     if item.get("_safe_log") is not None:
@@ -854,6 +874,12 @@ def verify_receipt_log(checks_dir: Path, item: dict):
         return None
     if size > MAX_VERIFY_LOG_BYTES:
         return None
+    if budget is not None:
+        used = budget.get("bytesUsed", 0)
+        if used + size > MAX_VERIFY_TOTAL_BYTES:
+            budget["exceeded"] = True
+            return None
+        budget["bytesUsed"] = used + size
     digest = hashlib.sha256()
     try:
         with log_path.open("rb") as stream:
@@ -971,91 +997,34 @@ def _scope_check(task_dir: Path, record: dict, candidate: str | None) -> dict:
         close_pipe()
 
 
-def build_readiness(task_dir: Path, task: dict, round_number: int) -> dict:
-    """Mechanical coverage of the exact phase contract against real receipts.
+def evaluate_acceptance_items(contract: dict, candidate_head, checks: dict, checks_dir: Path):
+    """The single receipt-validity evaluation shared by every consumer.
 
-    This is a delivery check, not acceptance: ``status=ready`` only means every
-    requirement has an applicable, passing, hash-verified receipt and the scope
-    check did not find out-of-scope files. Writer ownership is reported
-    separately because the final supervisor tick still holds the task lock.
+    Returns ``(items, coverage, gaps, budget)``. Each item status is one of
+    ``covered``/``failed``/``skipped``/``missing``/``unknown``; ``covered`` means
+    every declared rule passed *and* the candidate-bound receipt log hash was
+    verified. Receipt metadata alone is never a verified result.
     """
-    round_dir = task_dir / "rounds" / str(round_number)
-    checks_dir = round_dir / "round.checks"
-    state = read_json(round_dir / "round.state.json", {}) or {}
-    result = {
-        "schemaVersion": 1, "command": "readiness", "task": task.get("task"),
-        "round": round_number, "phaseId": None, "contractSha256": None,
-        "candidate": None, "status": "unknown", "execution": {
-            "state": state.get("state"), "exitCode": state.get("exitCode"),
-            "timedOut": bool(state.get("timedOut")), "cancelled": bool(state.get("cancelled"))},
-        "items": [], "gaps": [], "coverage": {"required": 0, "covered": 0,
-        "failed": 0, "missing": 0, "unknown": 0, "skipped": 0},
-        "scope": {"status": "unknown", "baselineCommit": None, "changedFiles": [],
-                  "outOfScope": [], "reason": None},
-        "budget": phase_budget(task_dir), "writerFree": not lock_is_held(task_dir / ".task.lock")
-        and not lock_is_held(task_dir / ".supervisor.lock"),
-        "checksDir": str(checks_dir), "acceptance": "not_verified", "generatedAt": time.time(),
-        "notes": ["readiness is a bounded mechanical comparison of the frozen phase contract "
-                  "against real receipts; it is never acceptance and it does not judge design quality"],
-    }
-    record, problem = read_phase_record(task_dir)
-    if not isinstance(record, dict):
-        result["status"] = "no_contract"
-        result["notes"].append(f"no phase contract is installed ({problem}); legacy review applies")
-        return result
-    contract = record.get("contract") or {}
-    result["phaseId"] = contract.get("phaseId")
-    result["contractSha256"] = record.get("contractSha256")
-    result["budget"] = phase_budget(task_dir, record)
-    candidate = state.get("endHead") or state.get("head")
-    if isinstance(candidate, str) and FULL_OID_RE.fullmatch(candidate):
-        candidate = candidate.lower()
-    else:
-        candidate = None
-    result["candidate"] = candidate
-    result["scope"] = _scope_check(task_dir, record, candidate)
-    raw_state = state.get("state")
-    if raw_state not in TERMINAL_STATES:
-        result["status"] = "unknown"
-        result["notes"].append(f"round state {raw_state!r} is not terminal-known; coverage is unknown")
-        return result
-    if candidate is None:
-        result["status"] = "unknown"
-        result["notes"].append("the terminal round has no exact candidate commit; evidence cannot "
-                               "be bound to a candidate")
-        return result
-    wanted = {item.get("checkId") or item.get("id") for item in contract.get("acceptanceItems") or []}
-    receipts = []
-    if checks_dir.is_dir():
-        try:
-            files = sorted((entry for entry in checks_dir.iterdir() if entry.is_file()
-                            and entry.name.endswith(".json")), key=_mtime, reverse=True)
-        except OSError:
-            files = []
-        for receipt in files[:STATUS_MAX_RECEIPTS]:
-            item, issue = _readiness_receipt(receipt)
-            if item is None or item["id"] not in wanted:
-                continue
-            log_path = checks_dir / item["log"]
-            if not inside(log_path, checks_dir.resolve()):
-                item["logVerified"] = None
-            else:
-                item["logVerified"] = verify_receipt_log(checks_dir, item)
-            receipts.append(item)
+    receipts = checks.get("receipts") or {}
+    parsed = receipts.get("recent") or []
     by_id = {}
-    for item in receipts:
-        by_id.setdefault(item["id"], []).append(item)
+    for item in parsed:
+        if isinstance(item, dict):
+            by_id.setdefault(item.get("id"), []).append(item)
+    budget = {"bytesUsed": 0, "exceeded": False}
     items = []
-    coverage = result["coverage"]
+    coverage = {"required": 0, "covered": 0, "failed": 0, "missing": 0, "unknown": 0, "skipped": 0}
     for spec in contract.get("acceptanceItems") or []:
         check_id = spec.get("checkId") or spec.get("id")
         attempts = sorted(by_id.get(check_id, []),
                           key=lambda item: item.get("endedAt") or item.get("startedAt") or 0)
         entry = {"id": spec.get("id"), "checkId": check_id, "status": "missing",
                  "reason": "no receipt for this check id", "receiptRef": None, "logRef": None,
-                 "attempts": len(attempts)}
+                 "attempts": len(attempts), "logVerified": None,
+                 "evidenceLevel": "missing"}
         applicable = [attempt for attempt in attempts
-                      if attempt.get("head") == candidate and attempt.get("dirty") is False]
+                      if candidate_head is not None and attempt.get("head") == candidate_head
+                      and attempt.get("dirty") is False]
         if attempts and not applicable:
             newest = attempts[-1]
             reason = "receipts are not bound to the candidate commit"
@@ -1066,10 +1035,12 @@ def build_readiness(task_dir: Path, task: dict, round_number: int) -> dict:
             entry["reason"] = reason
             entry["receiptRef"] = str(checks_dir / newest["receipt"])
             entry["logRef"] = str(checks_dir / newest["log"])
+            entry["evidenceLevel"] = "receipt_metadata_only"
         elif applicable:
             newest = applicable[-1]
             entry["receiptRef"] = str(checks_dir / newest["receipt"])
             entry["logRef"] = str(checks_dir / newest["log"])
+            entry["evidenceLevel"] = "receipt_metadata"
             counts = newest.get("testCounts")
             if newest.get("timedOut"):
                 entry.update(status="failed", reason="check timed out")
@@ -1079,78 +1050,206 @@ def build_readiness(task_dir: Path, task: dict, round_number: int) -> dict:
                 entry.update(status="unknown", reason="receipt has no exit code")
             elif newest.get("exitCode") != 0:
                 entry.update(status="failed", reason=f"exit {newest.get('exitCode')}")
-            elif newest.get("logVerified") is not True:
-                entry.update(status="unknown", reason="log hash could not be verified")
             elif counts and counts.get("fail"):
-                entry.update(status="failed", reason=f"test counts report {counts.get('fail')} "
-                                                      "failures")
-            elif spec.get("forbidSkip") or spec.get("minRun") is not None:
-                # All declared count rules must hold together; a missing field
-                # can never become ``covered`` and an already-declared rule is
-                # never skipped because another rule was checked first.
-                count_status, count_reason = None, None
-                if spec.get("forbidSkip"):
-                    if not isinstance(counts, dict) or "skip" not in counts:
-                        count_status = "unknown"
-                        count_reason = ("skip-freedom cannot be verified: the receipt has no "
-                                        "parseable test counts (declare forbidSkip only for "
-                                        "count-emitting runners)")
-                    elif counts.get("skip"):
-                        count_status = "skipped"
-                        count_reason = f"test counts report {counts.get('skip')} skips"
-                if count_status is None and spec.get("minRun") is not None:
-                    if not isinstance(counts, dict) or "run" not in counts:
-                        count_status = "unknown"
-                        count_reason = ("minRun cannot be verified: the receipt has no parseable "
-                                        "test counts")
-                    elif counts.get("run", 0) < spec["minRun"]:
-                        count_status = "failed"
-                        count_reason = (f"test counts report fewer than minRun={spec['minRun']} "
-                                        "runs")
-                if count_status is None:
-                    entry.update(status="covered", reason="applicable passing receipt")
-                else:
-                    entry.update(status=count_status, reason=count_reason)
+                entry.update(status="failed",
+                             reason=f"test counts report {counts.get('fail')} failures")
             else:
-                entry.update(status="covered", reason="applicable passing receipt")
+                count_status, count_reason = evaluate_count_rules(spec, counts)
+                if count_status is not None:
+                    entry.update(status=count_status, reason=count_reason)
+                else:
+                    verified = verify_receipt_log(checks_dir, newest, budget)
+                    entry["logVerified"] = verified
+                    if verified is True:
+                        entry.update(status="covered",
+                                     reason="candidate-bound receipt with verified log hash and "
+                                            "satisfied count rules",
+                                     evidenceLevel="verified_result")
+                    elif budget.get("exceeded"):
+                        entry.update(status="unknown",
+                                     reason="log verification budget exceeded; the result stays "
+                                            "unverified")
+                    elif verified is False:
+                        entry.update(status="unknown",
+                                     reason="log hash mismatch; the result is not verified")
+                    else:
+                        entry.update(status="unknown",
+                                     reason="log missing, unreadable or oversized; the result is "
+                                            "not verified")
         items.append(entry)
         coverage[entry["status"]] = coverage.get(entry["status"], 0) + 1
     coverage["required"] = len(items)
     gaps = [{"id": item["id"], "checkId": item["checkId"], "status": item["status"],
              "reason": item["reason"], "receiptRef": item["receiptRef"]}
             for item in items if item["status"] != "covered"]
-    if result["scope"].get("status") == "violation":
+    return items[:MAX_READINESS_ITEMS], coverage, gaps[:MAX_READINESS_ITEMS], budget
+
+
+def build_phase_snapshot(task_dir: Path, task: dict, round_number: int, *, state: dict,
+                         checks: dict, candidate: dict) -> dict:
+    """One normalized phase evidence snapshot consumed by board, events,
+    readiness and the accept gate.
+
+    It carries the candidate identity, per-item evidence grades, scope facts,
+    execution facts and the conjunctive mechanical delivery readiness. It never
+    judges design quality and never claims GPT acceptance.
+    """
+    record, problem = read_phase_record(task_dir)
+    if not isinstance(record, dict):
+        return {"schemaVersion": 1, "round": round_number, "status": "no_contract",
+                "reason": problem, "candidate": candidate}
+    contract = record.get("contract") or {}
+    round_dir = task_dir / "rounds" / str(round_number)
+    checks_dir = Path(checks.get("dir") or (round_dir / "round.checks"))
+    raw_state = state.get("state")
+    candidate_head = candidate.get("head") if candidate.get("status") == "known" else None
+    items, coverage, gaps, budget = evaluate_acceptance_items(contract, candidate_head,
+                                                              checks, checks_dir)
+    scope = _scope_check(task_dir, record, candidate_head)
+    writer_free = (not lock_is_held(task_dir / ".task.lock")
+                   and not lock_is_held(task_dir / ".supervisor.lock"))
+    progress_record = read_progress(round_dir)
+    receipts = checks.get("receipts") or {}
+    scan_partial = bool(checks.get("partial") or receipts.get("truncated")
+                        or receipts.get("partial"))
+    notes = []
+    status, reason = "unknown", None
+    if candidate.get("status") != "known":
+        status, reason = "unknown", candidate.get("reason")
+    elif raw_state not in TERMINAL_STATES:
+        status, reason = "not_ready", f"round state {raw_state!r} is not terminal"
+    elif scope.get("status") == "violation":
+        status, reason = "not_ready", "files outside the declared phase scope"
+    elif any(item["status"] in ("failed", "skipped", "unknown", "missing") for item in items):
+        status, reason = "not_ready", "required acceptance evidence is not fully covered"
+    elif scope.get("status") == "unknown":
+        status, reason = "unknown", scope.get("reason") or "scope check is unknown"
+    elif scan_partial:
+        status, reason = "unknown", "the bounded check scan was partial or truncated"
+    else:
+        status, reason = "ready", "all required evidence is covered for the candidate"
+    if raw_state is not None and raw_state != "completed":
+        notes.append(f"round state {raw_state!r} is terminal but not a normal completion; "
+                     "delivery readiness is false")
+        if status == "ready":
+            status, reason = "not_ready", f"round did not complete normally ({raw_state})"
+    if scope.get("status") == "violation":
         gaps.append({"id": "scope", "checkId": None, "status": "violation",
                      "reason": "files outside the declared phase scope: "
-                     + ", ".join(result["scope"].get("outOfScope") or [])[:300],
-                     "receiptRef": None})
-    result["items"] = items[:MAX_READINESS_ITEMS]
-    result["gaps"] = gaps[:MAX_READINESS_ITEMS]
-    result["coverage"] = coverage
-    if result["scope"].get("status") == "violation":
-        result["status"] = "not_ready"
-    elif any(item["status"] in ("failed", "skipped", "unknown") for item in items):
-        result["status"] = "not_ready"
-    elif any(item["status"] == "missing" for item in items):
-        result["status"] = "not_ready"
-    elif result["scope"].get("status") == "unknown":
-        result["status"] = "unknown"
-        result["notes"].append("the scope/baseline check was unknown, so readiness is unknown")
-    else:
-        result["status"] = "ready"
-    if result["status"] == "ready" and result["writerFree"]:
-        result["readyForReview"] = True
-    elif result["status"] == "ready":
-        result["readyForReview"] = False
-        result["notes"].append("coverage is complete but a writer lock is still held; the final "
-                               "supervisor tick clears the lock before main review")
-    else:
-        result["readyForReview"] = False
-    if raw_state != "completed":
-        result["status"] = "not_ready"
-        result["readyForReview"] = False
-        result["notes"].append(f"round state {raw_state!r} is terminal but not a normal completion; "
-                               "delivery readiness is false regardless of partial receipts")
+                     + ", ".join(scope.get("outOfScope") or [])[:300], "receiptRef": None})
+    ready_for_review = status == "ready" and writer_free
+    if status == "ready" and not writer_free:
+        notes.append("coverage is complete but a writer lock is still held; the final supervisor "
+                     "tick clears the lock before main review")
+    readiness = {"status": status, "reason": reason, "coverage": coverage, "gaps": gaps,
+                 "scope": scope.get("status"), "writerFree": writer_free,
+                 "readyForReview": ready_for_review, "generatedAt": time.time(),
+                 "checkedItems": len(items)}
+    return {
+        "schemaVersion": 1,
+        "round": round_number,
+        "phaseId": contract.get("phaseId"),
+        "contractSha256": record.get("contractSha256"),
+        "candidate": candidate,
+        "execution": {"state": raw_state, "exitCode": state.get("exitCode"),
+                      "timedOut": bool(state.get("timedOut")),
+                      "cancelled": bool(state.get("cancelled")),
+                      "terminal": raw_state in TERMINAL_STATES,
+                      "completed": raw_state == "completed" and state.get("exitCode") == 0},
+        "checksDir": str(checks_dir),
+        "scanPartial": scan_partial,
+        "verificationBudget": budget,
+        "items": items,
+        "coverage": coverage,
+        "gaps": gaps,
+        "scope": scope,
+        "readiness": readiness,
+        "evidenceLevels": {
+            "piSelfReport": {"present": progress_record is not None,
+                             "activity": (progress_record or {}).get("activity"),
+                             "verified": False},
+            "processActivity": {"verified": False,
+                                "note": "process/file activity is never evidence"},
+            "receiptMetadata": {"total": receipts.get("total"),
+                                "scanned": receipts.get("scanned"),
+                                "failedAttempts": receipts.get("failedAttempts"),
+                                "verified": False},
+            "verifiedResults": {"items": [item["id"] for item in items
+                                          if item["status"] == "covered"],
+                                "count": coverage.get("covered", 0)},
+            "deliveryReadiness": status,
+            "gptAcceptance": False,
+        },
+        "notes": notes,
+        "acceptance": "not_verified",
+        "computedAt": time.time(),
+    }
+
+
+def build_readiness(task_dir: Path, task: dict, round_number: int) -> dict:
+    """Readiness view built from the same normalized snapshot the board uses."""
+    round_dir = task_dir / "rounds" / str(round_number)
+    state = read_json(round_dir / "round.state.json", {}) or {}
+    raw_state = state.get("state")
+    current_head, head_problem = None, None
+    if raw_state in ACTIVE_STATES:
+        worktree = task.get("worktree")
+        if isinstance(worktree, str) and worktree.strip():
+            current_head, head_problem = _head_probe(Path(worktree))
+        else:
+            head_problem = "no frozen worktree"
+    candidate = normalize_candidate({"state": raw_state,
+                                     "endHead": state.get("endHead") or state.get("head"),
+                                     "currentHead": current_head})
+    checks = _scan_checks(round_dir / "round.checks")
+    snapshot = build_phase_snapshot(task_dir, task, round_number, state=state, checks=checks,
+                                    candidate=candidate)
+    if snapshot.get("status") == "no_contract":
+        writer_free = (not lock_is_held(task_dir / ".task.lock")
+                       and not lock_is_held(task_dir / ".supervisor.lock"))
+        return {"schemaVersion": 1, "command": "readiness", "task": task.get("task"),
+                "round": round_number, "phaseId": None, "contractSha256": None,
+                "candidate": None, "candidateSource": candidate,
+                "status": "no_contract",
+                "execution": {"state": raw_state, "exitCode": state.get("exitCode"),
+                              "timedOut": bool(state.get("timedOut")),
+                              "cancelled": bool(state.get("cancelled"))},
+                "items": [], "gaps": [],
+                "coverage": {"required": 0, "covered": 0, "failed": 0, "missing": 0,
+                             "unknown": 0, "skipped": 0},
+                "scope": {"status": "unknown", "baselineCommit": None, "changedFiles": [],
+                          "outOfScope": [], "reason": "no phase contract"},
+                "budget": phase_budget(task_dir), "writerFree": writer_free,
+                "checksDir": str(round_dir / "round.checks"), "acceptance": "not_verified",
+                "generatedAt": time.time(), "readyForReview": False,
+                "readinessReason": snapshot.get("reason"),
+                "evidenceLevels": {"gptAcceptance": False},
+                "notes": [f"no phase contract is installed ({snapshot.get('reason')}); "
+                          "legacy review applies"]}
+    result = {
+        "schemaVersion": 1, "command": "readiness", "task": task.get("task"),
+        "round": round_number, "phaseId": snapshot.get("phaseId"),
+        "contractSha256": snapshot.get("contractSha256"),
+        "candidate": snapshot["candidate"].get("head"),
+        "candidateSource": snapshot["candidate"],
+        "status": snapshot["readiness"]["status"],
+        "execution": snapshot["execution"],
+        "items": snapshot["items"], "gaps": snapshot["gaps"], "coverage": snapshot["coverage"],
+        "scope": snapshot["scope"], "budget": phase_budget(task_dir),
+        "writerFree": snapshot["readiness"]["writerFree"],
+        "checksDir": snapshot["checksDir"], "acceptance": "not_verified",
+        "generatedAt": snapshot["readiness"]["generatedAt"],
+        "readyForReview": snapshot["readiness"]["readyForReview"],
+        "readinessReason": snapshot["readiness"]["reason"],
+        "evidenceLevels": snapshot["evidenceLevels"],
+        "snapshot": snapshot,
+        "notes": list(snapshot["notes"]) + [
+            "readiness is built from the same normalized snapshot the board consumes; it is a "
+            "mechanical delivery check, never acceptance"],
+    }
+    if head_problem is not None:
+        result["notes"].append(f"active HEAD probe failed ({head_problem}); the candidate is "
+                               "unknown")
     return result
 
 
@@ -2292,7 +2391,8 @@ def _scan_checks(checks_dir: Path) -> dict:
               "ignoredCount": 0,
               "receipts": {"total": 0, "scanned": 0, "truncated": False, "partial": False,
                            "failedAttempts": 0, "latest": None, "latestFailed": None,
-                           "latestSuccessful": None, "failedRecent": [], "unknownExitRecent": []},
+                           "latestSuccessful": None, "failedRecent": [], "unknownExitRecent": [],
+                           "recent": []},
               "resourceGuard": {"breached": False, "unknown": False, "breaches": [],
                                 "unknownScans": [], "running": None, "latestReceipt": None,
                                 "note": "local no-follow byte guard; unknown is not verified and "
@@ -2335,6 +2435,7 @@ def _scan_checks(checks_dir: Path) -> dict:
     result["receipts"]["total"] = len(receipt_files)
     result["receipts"]["scanned"] = len(parsed)
     result["receipts"]["truncated"] = len(receipt_files) > STATUS_MAX_RECEIPTS
+    result["receipts"]["recent"] = parsed
     result["receipts"]["failedAttempts"] = sum(1 for item in parsed if item["failed"])
     valid_receipt_stems = {Path(item["receipt"]).stem for item in parsed}
 
@@ -2774,6 +2875,11 @@ def _head_probe(worktree: Path):
     return raw.lower(), None
 
 
+def probe_worktree_head(worktree: Path):
+    """Public bounded worktree HEAD probe for the board/accept gate."""
+    return _head_probe(worktree)
+
+
 def build_status(repo_arg: str, task_arg: str, round_arg=None) -> dict:
     """Bounded read-only state snapshot. Never starts Pi, builds a summary or scans a transcript."""
     task = require_task_arg(task_arg)
@@ -2844,6 +2950,9 @@ def build_status(repo_arg: str, task_arg: str, round_arg=None) -> dict:
         elif isinstance(current_head, str) and current_head != state.get("startHead"):
             notes.append("the worktree HEAD advanced during the active round; currentHead is the "
                          "verified current candidate identity")
+    candidate_block = normalize_candidate({"state": effective,
+                                           "endHead": state.get("endHead") or state.get("head"),
+                                           "currentHead": current_head})
     if raw_state in TERMINAL_STATES and task_held and not supervisor_alive:
         notes.append("a Pi descendant may still hold the task lock after a terminal record; inspect "
                      "before reuse")
@@ -2882,12 +2991,20 @@ def build_status(repo_arg: str, task_arg: str, round_arg=None) -> dict:
         elif auto_problem:
             auto_entry = {"status": "unknown", "error": auto_problem}
         readiness = None
-        if effective in TERMINAL_STATES:
-            try:
-                readiness = build_readiness(task_dir, frozen, selected_number)
-            except Exception as exc:  # noqa: BLE001 - status must not fail on one readiness error
-                readiness = {"schemaVersion": 1, "status": "unknown",
-                             "error": f"{type(exc).__name__}: {exc}"}
+        snapshot = None
+        try:
+            snapshot = build_phase_snapshot(task_dir, frozen, selected_number, state=state,
+                                            checks=checks, candidate=candidate_block)
+            readiness = snapshot.get("readiness")
+        except Exception as exc:  # noqa: BLE001 - status must not fail on one snapshot error
+            readiness = {"status": "unknown", "reason": f"{type(exc).__name__}: {exc}",
+                         "coverage": {"required": 0, "covered": 0, "failed": 0,
+                                      "missing": 0, "unknown": 0, "skipped": 0},
+                         "gaps": [], "scope": "unknown", "writerFree": False,
+                         "readyForReview": False, "generatedAt": time.time()}
+            snapshot = {"schemaVersion": 1, "status": "unknown", "candidate": candidate_block,
+                        "items": [], "gaps": [], "readiness": readiness,
+                        "error": f"{type(exc).__name__}: {exc}"}
         phase_info = {
             "phaseId": contract.get("phaseId"),
             "contractSha256": phase_record.get("contractSha256"),
@@ -2895,9 +3012,11 @@ def build_status(repo_arg: str, task_arg: str, round_arg=None) -> dict:
             "baselineCommit": phase_record.get("baselineCommit"),
             "contract": contract_view(contract),
             "state": phase_state.get("state") or "executing",
+            "candidate": candidate_block.get("head"),
             "budget": budget,
             "autoContinue": auto_entry,
             "lastDecision": phase_state.get("lastDecision"),
+            "evidence": snapshot,
             "readiness": readiness,
             "acceptance": "not_verified",
         }
@@ -2919,7 +3038,7 @@ def build_status(repo_arg: str, task_arg: str, round_arg=None) -> dict:
         "exitCode": state.get("exitCode"), "timedOut": bool(state.get("timedOut")),
         "cancelled": bool(state.get("cancelled")),
         "startHead": state.get("startHead"), "endHead": state.get("endHead") or state.get("head"),
-        "currentHead": current_head,
+        "currentHead": current_head, "candidate": candidate_block,
         "briefSha256": state.get("briefSha256"),
         "ownership": {"activeWorker": task_held, "supervisorAlive": supervisor_alive},
         "processes": processes, "executionActivity": execution_activity,

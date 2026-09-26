@@ -52,8 +52,8 @@ if str(RUNTIME_DIR) not in sys.path:
 
 from pi_task import (ACTIVE_STATES, TERMINAL_STATES, TASK_RE, LockHeld, atomic,  # noqa: E402
                      build_status, canonical_root, git_common_dir, lock_fd, lock_is_held,
-                     read_json, require_allowed_model, require_task_arg, task_dir_for, terminate,
-                     verify_receipt_log)
+                     normalize_candidate, probe_worktree_head, read_json,
+                     require_allowed_model, require_task_arg, task_dir_for, terminate)
 
 SCHEMA_VERSION = 1
 BOARD_DIR = "codex-pi"
@@ -748,6 +748,9 @@ def _phase_projection(card: dict, status: dict, now: float):
     readiness = phase.get("readiness") or {}
     auto = phase.get("autoContinue") or {}
     candidate = _phase_candidate_head(status)
+    scope_value = readiness.get("scope")
+    if isinstance(scope_value, dict):
+        scope_value = scope_value.get("status")
     existing = card.get("phase") if isinstance(card.get("phase"), dict) else {}
     same_identity = (existing.get("phaseId") == phase.get("phaseId")
                      and existing.get("contractHash") == phase.get("contractSha256"))
@@ -783,7 +786,7 @@ def _phase_projection(card: dict, status: dict, now: float):
                       "gaps": [{"id": item.get("id"), "status": item.get("status"),
                                 "reason": item.get("reason")}
                                for item in (readiness.get("gaps") or [])[:10]],
-                      "scope": (readiness.get("scope") or {}).get("status"),
+                      "scope": scope_value,
                       "generatedAt": readiness.get("generatedAt")},
         "budget": phase.get("budget") or {},
         "autoContinue": auto or None,
@@ -942,7 +945,9 @@ def _phase_blocked_reason(readiness: dict, auto: dict, status: dict) -> str:
         # The script's post-round classification (for example a pause or a
         # budget stop) is authoritative for that round's delivery gap.
         return str(last["reason"])
-    scope = (readiness.get("scope") or {}).get("status")
+    scope = readiness.get("scope")
+    if isinstance(scope, dict):
+        scope = scope.get("status")
     if scope == "violation":
         return "scope_violation"
     statuses = {item.get("status") for item in readiness.get("items") or []}
@@ -1063,95 +1068,45 @@ def _phase_anomaly_seconds() -> float:
 
 
 def _phase_candidate_head(status: dict):
-    """Single candidate-identity source for the board and progress engine.
+    """One candidate-identity accessor over the normalized candidate block.
 
-    Terminal rounds use the exact ``endHead``. Active rounds require the bounded
-    ``currentHead`` probe: if it is missing (probe failed) the candidate is
-    unknown and must never fall back to the round-start commit, because that
-    would present an old receipt/self-report as current. Unknown ownership has
-    no verified candidate either.
+    The rule lives in ``pi_task.normalize_candidate``; the board never derives a
+    second candidate. A missing block normalizes the raw status with the same
+    function, so fail-closed behavior is identical everywhere.
     """
-    state = status.get("state")
-    if state in TERMINAL_STATES:
-        head = status.get("endHead")
-    elif state in ACTIVE_STATES:
-        head = status.get("currentHead")
-    else:
-        head = None
+    candidate = status.get("candidate")
+    if not isinstance(candidate, dict):
+        candidate = normalize_candidate(status)
+    if candidate.get("status") != "known":
+        return None
+    head = candidate.get("head")
     return head if isinstance(head, str) and head else None
 
 
-def _applicable_successful_receipt(status: dict):
-    """A metadata-passing receipt bound to the current candidate, or None.
-
-    This is an identity/metadata filter only and does not prove the log; the
-    caller must use ``_verified_candidate_receipt`` before calling a result
-    verified.
-    """
-    checks = status.get("checks") or {}
-    receipts = checks.get("receipts") or {}
-    item = receipts.get("latestSuccessful")
-    candidate = _phase_candidate_head(status)
-    if not isinstance(item, dict) or candidate is None:
-        return None
-    if item.get("head") != candidate or item.get("dirty") is not False:
-        return None
-    if item.get("failed") or item.get("cancelled") or item.get("timedOut"):
-        return None
-    if item.get("exitCode") != 0:
-        return None
-    return item
-
-
-def _verified_candidate_receipt(status: dict):
-    """A candidate-bound passing receipt whose log hash is really verified.
-
-    A missing, unreadable, oversized or mismatching log stays unknown and can
-    never be a "verified result" milestone.
-    """
-    item = _applicable_successful_receipt(status)
-    if item is None:
-        return None
-    checks = status.get("checks") or {}
-    directory = checks.get("dir")
-    if not isinstance(directory, str) or not directory:
-        return None
-    if not isinstance(item.get("logSha256"), str):
-        return None
-    if verify_receipt_log(Path(directory), item) is not True:
-        return None
-    return item
-
-
-def _applicable_failures(status: dict) -> list:
-    """Failed receipts bound to the current candidate (bounded, newest first)."""
-    checks = status.get("checks") or {}
-    receipts = checks.get("receipts") or {}
-    candidate = _phase_candidate_head(status)
-    if candidate is None:
+def _snapshot_items(status: dict) -> list:
+    """Per-item evidence grades from the normalized phase snapshot."""
+    phase = status.get("phase")
+    if not isinstance(phase, dict):
         return []
-    items = list(receipts.get("failedRecent") or [])
-    latest = receipts.get("latest")
-    if isinstance(latest, dict) and latest.get("failed"):
-        items.append(latest)
-    result, seen = [], set()
-    for item in items:
-        if not isinstance(item, dict) or item.get("head") != candidate \
-                or item.get("dirty") is not False:
-            continue
-        identity = (item.get("id"), item.get("receipt"))
-        if identity in seen:
-            continue
-        seen.add(identity)
-        result.append(item)
-    return result
+    evidence = phase.get("evidence")
+    if not isinstance(evidence, dict):
+        return []
+    return [item for item in evidence.get("items") or [] if isinstance(item, dict)]
+
+
+def _verified_items(status: dict) -> list:
+    return [item for item in _snapshot_items(status) if item.get("status") == "covered"]
+
+
+def _failed_items(status: dict) -> list:
+    return [item for item in _snapshot_items(status) if item.get("status") == "failed"]
 
 
 def progress_milestones(status: dict) -> list:
     """Stable milestone candidates (key, summary, evidence) for one beat.
 
-    Only verified receipts and meaningful check/repair progress with evidence
-    refs qualify. Plain "implementing" narration is deliberately not a
+    Only verified snapshot items and meaningful check/repair progress with
+    evidence refs qualify. Plain "implementing" narration is deliberately not a
     milestone and never queues.
     """
     phase = status.get("phase") or {}
@@ -1160,14 +1115,16 @@ def progress_milestones(status: dict) -> list:
     if not contract or candidate is None:
         return []
     result = []
-    success = _verified_candidate_receipt(status)
-    if success is not None and not _applicable_failures(status):
+    verified = _verified_items(status)
+    if verified and not _failed_items(status):
+        item = verified[0]
+        check_id = item.get("checkId") or item.get("id")
         result.append((
-            f"first_result|{contract}|{candidate}|{success.get('id')}",
-            f"verified check {success.get('id')!r} passed on the current candidate",
-            {"factSource": "verified_receipt", "checkId": success.get("id"),
-             "receipt": success.get("receipt"), "logVerified": True,
-             "receiptRef": _receipt_ref(status.get("checks") or {}, success)}))
+            f"first_result|{contract}|{candidate}|{check_id}",
+            f"verified check {check_id!r} passed on the current candidate",
+            {"factSource": "verified_receipt", "checkId": check_id,
+             "receiptRef": item.get("receiptRef"), "logVerified": True,
+             "evidenceLevel": item.get("evidenceLevel")}))
     progress = status.get("progress") or {}
     if isinstance(progress, dict) and progress.get("round") == status.get("round") \
             and progress.get("activity") in ("checking", "repairing") \
@@ -1216,8 +1173,9 @@ def _anomaly_milestone(entry: dict, status: dict, now: float, anomaly_seconds: f
     result = None
     contract = entry.get("contractSha256")
     candidate = _phase_candidate_head(status)
-    for item in _applicable_failures(status):
-        key = f"abnormal|{contract}|{candidate}|{item.get('id')}"
+    for item in _failed_items(status):
+        check_id = item.get("checkId") or item.get("id")
+        key = f"abnormal|{contract}|{candidate}|{check_id}"
         record = entry["abnormal"].get(key)
         if not isinstance(record, dict):
             record = {"firstSeenAt": now, "notifiedAt": None}
@@ -1233,14 +1191,13 @@ def _anomaly_milestone(entry: dict, status: dict, now: float, anomaly_seconds: f
             continue
         if result is None:
             result = (key,
-                      f"check {item.get('id')!r} has an unresolved failure observed for "
+                      f"check {check_id!r} has an unresolved failure observed for "
                       f"{int(now - first)}s; pi is expected to be repairing",
-                      {"factSource": "observed_receipt", "checkId": item.get("id"),
-                       "exitCode": item.get("exitCode"),
-                       "timedOut": bool(item.get("timedOut")),
-                       "receipt": item.get("receipt"),
-                       "receiptRef": _receipt_ref(status.get("checks") or {}, item),
-                       "reason": "sustained_anomaly"})
+                      {"factSource": "observed_receipt", "checkId": check_id,
+                       "reason": "sustained_anomaly",
+                       "receiptRef": item.get("receiptRef"), "logRef": item.get("logRef"),
+                       "itemReason": item.get("reason"),
+                       "evidenceLevel": item.get("evidenceLevel")})
     if len(entry["abnormal"]) > MAX_NOTIFY_ABNORMAL:
         ordered = sorted(entry["abnormal"].items(), key=lambda kv: (kv[1] or {}).get("firstSeenAt") or 0)
         entry["abnormal"] = dict(ordered[-MAX_NOTIFY_ABNORMAL:])
@@ -2238,16 +2195,54 @@ def decide(repo, task, event_id, decision, reviewed_head=None, note=None, phase=
                 raise ValueError(f"event kind {kind!r} is a fault/observation; "
                                  "use --decision resolve, not accept")
             if event_phase:
-                readiness = phase_info.get("readiness") or {}
-                if readiness.get("status") != "ready":
-                    raise ValueError("the phase readiness projection is not 'ready'; refresh the "
-                                     "board after the required checks exist instead of accepting "
-                                     "missing/failed/unknown evidence")
+                # Re-confirm the live task state instead of trusting a possibly
+                # stale board projection: round, contract, candidate, readiness,
+                # worktree HEAD and writer-free must all still agree.
+                live_root = card.get("repo") or card.get("worktree") or _root
+                try:
+                    live = build_status(str(live_root), task_id)
+                except Exception as exc:  # noqa: BLE001 - fail closed on unknown live state
+                    raise ValueError(f"cannot re-confirm the live phase state: "
+                                     f"{type(exc).__name__}: {exc}") from None
+                live_phase = live.get("phase") if isinstance(live.get("phase"), dict) else {}
+                live_candidate = live.get("candidate") \
+                    if isinstance(live.get("candidate"), dict) else {}
+                live_readiness = live_phase.get("readiness") \
+                    if isinstance(live_phase.get("readiness"), dict) else {}
+                live_contract = live_phase.get("contractSha256")
+                live_head = live_candidate.get("head") \
+                    if live_candidate.get("status") == "known" else None
+                event_head = (event.get("candidate") or {}).get("head")
+                problems = []
+                if live.get("round") != event.get("round"):
+                    problems.append(f"live round {live.get('round')} != event round "
+                                    f"{event.get('round')}")
+                if live_contract != event.get("contractHash"):
+                    problems.append("the installed contract revision changed")
+                if live_candidate.get("status") != "known":
+                    problems.append(f"the live candidate is unknown "
+                                    f"({live_candidate.get('reason')})")
+                elif live_head != event_head:
+                    problems.append("the live candidate no longer matches the event candidate")
+                if phase_info.get("candidate") not in (None, live_head):
+                    problems.append("the stored board candidate is stale")
+                if phase_info.get("contractHash") != live_contract:
+                    problems.append("the stored board contract revision is stale")
+                if live_readiness.get("status") != "ready":
+                    problems.append(f"live readiness is {live_readiness.get('status')!r}: "
+                                    f"{live_readiness.get('reason')}")
+                worktree_probe = card.get("worktree") or _root
+                head_now, head_problem = probe_worktree_head(Path(str(worktree_probe)))
+                if head_problem is not None:
+                    problems.append(f"worktree HEAD is unknown: {head_problem}")
+                elif head_now != event_head:
+                    problems.append("the worktree HEAD no longer matches the reviewed candidate")
                 evidence_dir = task_dir_for(_common, task_id)
                 if lock_is_held(evidence_dir / ".task.lock") \
                         or lock_is_held(evidence_dir / ".supervisor.lock"):
-                    raise ValueError("a worker or supervisor lock is still held; the round must be "
-                                     "terminal and writer-free before a phase can be accepted")
+                    problems.append("a worker or supervisor lock is still held")
+                if problems:
+                    raise ValueError("refusing a stale phase accept: " + "; ".join(problems))
             event_head = (event.get("candidate") or {}).get("head")
             worktree = card.get("worktree") or _root
             resolved_reviewed, problem = _resolve_commit(worktree, reviewed_head)

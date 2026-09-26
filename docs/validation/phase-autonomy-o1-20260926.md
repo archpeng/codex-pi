@@ -10,7 +10,7 @@
 | --- | --- | --- |
 | O1-1 阶段约定 | `runtime/pi_phase.py` 校验 schemaVersion/必填字段/ID/引用与设计 hash；`pi_task.py start --contract-file` 冻结到 `tasks/<task>/phase.json`，并写入 `phase.state.json` 预算锚点；brief 只引用契约与验收项，不复制设计 | `phase.json`、`phase.state.json`、`rounds/<n>/brief.md` |
 | O1-2 结构化进度 | `pi_task.py progress` 短命令：`--activity/--step/--completed-criteria/--next/--blocker/--evidence-ref`，输入校验、短锁、原子写；`--show` 只读；自报 `verified=false`，与 supervisor 观察/回执分开。每个完整阶段最多两次非阻塞进度回音（默认间隔 ≥10 分钟），普通/重复写入不排队；里程碑、合并、暂停与额度语义见下文 | `rounds/<n>/progress.json`、board card `progress/notify` |
-| O1-3 就绪检查 | `pi_task.py readiness` 按契约验收项与 `pi_check.py` 回执逐项核对：候选身份（receipt `head` 必须等于当前候选且 `dirty=false`）、log hash、exit/timeout/cancel、`minRun`/`forbidSkip`、scope/baseline diff；缺项、失败、跳过、未知分别列出，永不冒充 ready。`forbidSkip` 与 `minRun` 同时声明时两条规则都检查：缺计数/缺字段 → unknown，skip>0 → skipped，run<minRun → failed，全部满足且回执/候选/log 有效 → covered。scope 检查覆盖全部变更文件，超过 600 个文件时返回 unknown 并阻止就绪 | `rounds/<n>/readiness.json`（终态）/ 内存投影 |
+| O1-3 就绪检查 | `pi_task.build_phase_snapshot` 是唯一的规范化阶段证据快照：候选身份（`known(head, source)` / `unknown(reason)`，active 必须由有界真实 HEAD 探测，terminal 必须 exact `endHead`，不回退 startHead）、逐项证据等级（Pi 自报 / 进程活动 / 回执元数据 / 候选匹配且日志哈希验证 / 机械就绪 / GPT 接受分开表达）、scope、执行事实与合取式 readiness。回执缺项/失败/跳过/未知、日志缺失或篡改、计数缺失、扫描不完整均 fail closed；`covered` 必须候选匹配 + log hash 验证 + 计数规则全部满足。短看板、进度/终态事件、`readiness` 命令与 `decide accept` 都消费同一快照；README 不另建推断 | `rounds/<n>/readiness.json`（终态）/ 内存投影；board `phase.evidence` |
 | O1-4 事件分类 | 有阶段契约时，运行中的检查失败/超时/资源问题只留本地回执，不生成 queue 事件；终态只有 delivery-ready、真正需决策的阻塞、超时或所有权异常才产生事件；事件指纹含 phase/contract/candidate/reason；陈旧事件被机械标记 superseded 且不投递 | board card `phase/progress`、`handled` 中的 `superseded` |
 | O1-5 一次自动补齐 | 仅当 Pi 正常退出、缺项可机械列出、无未解决必需检查失败、阶段未暂停、总预算仍允许时，同一 supervisor 在同一 session/worktree 内续接一轮；配额按 phaseId 持久化在 `phase-auto.json`，重复刷新/并发/崩溃不重复占额；启动结果未知标记 unknown 并升级，不猜测重试 | `phase-auto.json`、`phase.state.json.autoContinue` |
 | O1-6 阶段验收门 | `pi_board.py decide --decision accept` 对阶段事件强制 `--phase` 与 `--contract-hash`，并要求 readiness 投影 ready、无 worker/supervisor 锁；旧候选/旧契约/已处理事件拒绝；`continue --contract-file` 切换到新 phaseId 前要求 board 上旧阶段已 accepted 且 acceptedHead 等于最新候选 | board card `phase.status/acceptedHead`、continue 错误信息 |
@@ -55,7 +55,8 @@ python3 runtime/pi_task.py continue --repo REPO --task TASK \
 ### 进度回音与异常可见性（同阶段增补）
 
 - 里程碑只取自真实事实：候选绑定的通过回执（`verified_receipt`，必须同时通过 exit/timeout/cancel、候选 head/dirty、log 内容哈希核对，缺失或篡改日志不得触发）、带证据引用的 `checking/repairing` 进度（`pi_self_report_unverified`），或持续超过异常阈值且没有可验证修复进展的失败事实（`observed_receipt`，低优先级“修复中”）。普通 `implementing` 叙述、重复写入、日志增长都不是里程碑，不排队。
-- active round 的当前候选由有界只读 `git rev-parse HEAD` 核对并投影为 `currentHead`；阶段内提交后，新 HEAD 的回执/进度才被视为当前。若 active HEAD 探测失败，候选身份为未知（不回退 startHead），不发证据进度回音也不把旧回执/旧事件表述为当前；终态以 exact `endHead` 为准。短看板 `evidence.candidateHead` 与 `phase.candidate` 同源。
+- active round 的当前候选由有界只读 `git rev-parse HEAD` 核对并投影为 `currentHead`；阶段内提交后，新 HEAD 的回执/进度才被视为当前。若 active HEAD 探测失败，候选身份为未知（不回退 startHead），不发证据进度回音也不把旧回执/旧事件表述为当前；终态以 exact `endHead` 为准。短看板 `evidence.candidateHead` 与 `phase.candidate` 同源，全部来自 `pi_task.normalize_candidate`。
+- `decide accept` 在决定前会用 `build_status` 重新读取实时状态，逐一核对 round、contract revision、候选、readiness、worktree 当前 HEAD 与 worker/supervisor 锁，并与储存在 board 上的投影比较；任何一项不一致（包括 board 未刷新、终态后又有新提交、契约换版或新 round）都拒绝，不依赖可能陈旧的看板缓存。
 - 每个阶段最多两次进度回音；两次之间默认至少 10 分钟（可用 `CODEX_PI_PROGRESS_NOTIFY_SECONDS` 调整，仅运维/测试）。额度与 `lastAt` 持久在 board card、按 `phaseId` 计数，不随 round、supervisor 重启或重复刷新重置；忙时新里程碑合入尚未投递的同阶段进度事件，不追发。
 - 用户 pause（card 或 Interrupt route）同时阻止进度回音、自动续接和显式 `continue`；普通对话不解除 pause。pause 在决策与启动之间到达时 fail closed：不启动补齐轮，配额保守保留并升级为 `phase_blocked`。
 - 需要决策或可最终验收的 `review_required`/`phase_blocked` 事件不占进度额度，也不受 10 分钟间隔压制；进度事件仍走既有 queue `uncertain` 语义，失败不自动重发。

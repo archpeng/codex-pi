@@ -55,7 +55,12 @@ progress echoes (default 10 minutes apart, persisted per `phaseId`) for verified
 evidence-bearing check/repair milestones; ordinary progress, repeated writes and "still alive"
 never queue. A recorded user pause blocks progress echoes, auto-continuation and explicit
 `continue` until an explicit resume. `accept` binds phase, contract and candidate; a different
-phase requires the previous one accepted on the board and no conflicting worker. Tasks without a
+phase requires the previous one accepted on the board and no conflicting worker. One normalized
+phase evidence snapshot (candidate known/unknown, per-item grades, scope, execution, readiness) is
+built by `pi_task` and consumed by the board, progress events, `readiness` and the accept gate;
+there is no second candidate or receipt-validity inference. `accept` re-reads the live status and
+refuses when the round, contract revision, candidate, readiness, worktree HEAD or writer-free state
+no longer match the stored event. Tasks without a
 contract keep the legacy review path. See
 [docs/validation/phase-autonomy-o1-20260926.md](../../docs/validation/phase-autonomy-o1-20260926.md)
 for operations and the O2/O3 unverified boundary.
