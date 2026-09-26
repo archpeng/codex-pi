@@ -29,6 +29,8 @@ Normal supervision stays inside the detached Pi supervisor. Do independent work,
 
 ## Phase contracts (0.5: accepted O1, verified O2)
 
+Prepare the design and prompt with [the task packet standard](task-packet.md); use the existing contract schema below, not a second task format.
+
 An authorized complete phase may be dispatched with a frozen contract: give `start`/`continue` a
 `--contract-file` JSON (schema in `docs/validation/phase-autonomy-o1-20260926.md`). The contract
 freezes goal, complete result, baseline, scope, design ref/hash, acceptance item IDs with real check
@@ -77,11 +79,11 @@ contract keep the legacy review path. The persisted frozen contract must hash to
 and agree with the phase-state anchor; on a mismatch the board keeps the phase binding with unknown
 readiness so old phase events cannot fall back to the legacy accept path. O1 is accepted at candidate `7331da9`; O2 ran a real two-round
 fixture (R1 `changes_requested`, same-session R2 accepted) documented in
-[o2-eventfold-20260926.md](../../docs/validation/o2-eventfold-20260926.md); O3 is accepted at
+[o2-eventfold-20260926.md](../../../docs/validation/o2-eventfold-20260926.md); O3 is accepted at
 `e65ca30`; O4 hardening is documented in
-[o4-release-hardening-20260926.md](../../docs/validation/o4-release-hardening-20260926.md) and
+[o4-release-hardening-20260926.md](../../../docs/validation/o4-release-hardening-20260926.md) and
 awaits review; formal installation and business-task migration are still pending. See
-[docs/validation/phase-autonomy-o1-20260926.md](../../docs/validation/phase-autonomy-o1-20260926.md)
+[docs/validation/phase-autonomy-o1-20260926.md](../../../docs/validation/phase-autonomy-o1-20260926.md)
 for operations and the current verification boundary.
 
 ## Checks and resource protection
