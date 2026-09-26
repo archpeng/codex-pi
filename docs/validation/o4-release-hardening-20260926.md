@@ -1,0 +1,107 @@
+# O4 发布加固：同候选续发、阶段资源上限与 Python 计数
+
+2026-09-26。O4 在 O3 已接受的候选 `e65ca307e8bb01ed74db8020baf1274ed844fe05` 之上加固三个发布前
+缺口：同阶段同候选的 review 事件续发、契约 `resourceLimits` 在 Pi 执行期间的真实约束、以及
+`unittest` 日志的可验证计数。本文件记录实现、测试证据与仍然存在的边界；确切最终提交见本轮最终
+报告，未安装插件，也不代表 GPT 验收。
+
+## 1. 同候选 review 事件可续发
+
+- 旧行为：ready review 事件的身份只含 phase/contract/candidate/`ready`。事件被机械 supersede 后
+  `add_event` 永远拒绝同一身份；同一轮同一候选的证据失效再恢复时无法产生新的 review 事件。
+- 修复：看板卡上持久保存 `reviewEpisode`（整数，默认 0）。只有 pending `review_required` 被失效
+  取代时才递增，ready 指纹为 `...:ready:<episode>`。因此：
+  - 同一 ready 状态的重复刷新保持幂等（同一身份，不新增事件）；
+  - 证据失效后恢复（新的合法回执，或日志短暂不可读后字节不变地恢复）最多续发一条新 review；
+  - 旧事件保持 handled/superseded；`decide accept` 只能绑定新事件。
+- 证据：`tests/test_phase.py::test_review_event_renews_after_invalidation_with_a_fresh_receipt`
+  与 `::test_review_event_renews_after_transient_unknown_log_recovers` 使用真实 Git 候选、真实
+  回执文件、真实看板与 `decide`，同时断言“重复刷新不增加 revision”。
+- 边界：episode 只随看板卡持久化；它本身不唤醒 GPT，也不绕过既有 pause/额度/派发语义。
+
+## 2. 阶段资源上限约束 Pi 执行期
+
+- 契约校验：`resourceLimits` 的每个路径在 `start`/`continue` 冻结前即校验必须位于 task worktree
+  内，且 worktree 与目标之间的任何组件都不是 symlink；越界、`..` 或 symlink 中间组件直接拒绝，
+  不创建任务证据。扫描时再次校验，若运行中变成 symlink 则按 unknown 处理（绝不放行）。
+- 执行期观测：supervisor 循环独立于 board 刷新周期，每 ≤60 秒巡检（测试/运维可用
+  `CODEX_PI_RESOURCE_SCAN_SECONDS` 覆盖，范围 0.05–60 秒），每轮扫描有**总时间预算**
+  （默认 10 秒，`CODEX_PI_RESOURCE_SCAN_BUDGET_SECONDS` 可覆盖）：每个声明路径的 `pi_size.measure`
+  no-follow 测量被剩余预算限制，未访问的声明保持 unknown；已知超限在所属测量后立即返回，不再
+  扫描其余路径，因此 supervisor 能及时检查子进程、中止、超时并刷新 board。高水位与状态持久保存
+  在 `rounds/<n>/resource.state.json`，Pi 结束后再做一次最终测量。
+- 证据绑定与 fail-closed：持久证据写入当前 round、phaseId、契约 SHA-256 与
+  `limitsSignature`（声明路径+上限的规范摘要）；当 `resourceLimits` 非空时，缺失、损坏、陈旧、
+  与声明不一致、或没有完成最终扫描（`finalScannedAt` 为空）的证据均判为 `unknown`，绝不 ready。
+  ready 还要求每个声明项的最终观测 `complete=true` 且未超限；有效状态由最终逐项观测重新计算，
+  手改的 `status` 与证据矛盾时为 unknown；写入失败不会被当成通过，只会留下缺失/陈旧证据并由上述
+  规则拦截。`resourceLimits=[]` 仍是显式的无上限情形。
+- 已知超限：完整扫描或部分扫描下界超过 `maxBytes` 时立即返回粘性 `breached` 停止原因，只对所属
+  Pi 进程组执行终止（SIGTERM→SIGKILL），记录 `resourceBreached`/`resourceReason`，readiness 为
+  `not_ready`，看板产生一条 `phase_blocked`（reason `resource_breached`，evidence 带路径、
+  max/observed 与依据）。
+- 测量未知：不完整或不可读的测量保持 `unknown`，绝不当作预算内。连续未知达到两分钟（测试可用
+  `CODEX_PI_RESOURCE_UNKNOWN_SECONDS` 覆盖）即升级：终止所属 Pi 进程组，记录 `resourceUnknown`，
+  readiness `not_ready`，看板 `phase_blocked`（reason `resource_unknown`）。短暂未知若在下一次
+  完整测量前恢复，可回到 `ok`，但期间绝不 PASS。
+- 证据：`::test_declared_phase_resource_breach_stops_pi_and_blocks`（真实写爆 worktree，exit 75
+  终止、blocked 事件与高水位）、`::test_declared_phase_resource_unknown_escalates_and_blocks`
+  （chmod 0 目录触发持续未知升级）、`::test_phase_contract_rejects_escaping_resource_limit`
+  （traversal 与 symlink 父组件在 start 时被拒且无任务证据）、
+  `::test_resource_evidence_missing_corrupt_stale_and_incomplete_cannot_pass`（真实 task 与
+  live accept：缺失/损坏/陈旧/最终未完成/矛盾摘要均 unknown，旧 review 事件随之失效，恢复后新
+  episode 才能接受），以及 `::test_resource_scan_budget_bounds_many_limits_and_escalates`
+  （measurement double 下 40 个限制的扫描限时、超限快速停止、持续未知升级）。
+- 边界：保护的是**声明的路径**与**持续可观测的常规文件写入**；不保证任意外部进程的写入、不保证
+  supervisor 自身死亡后的行为，也不监控未声明的路径或最终测量之后产生的文件。没有新增 daemon、
+  heartbeat 或模型调用；用户 pause 语义不变。
+
+## 3. `unittest` 计数
+
+- `pi_check` 在已经读取用于哈希的同一份日志字节上解析**最终候选 summary**：最后一条
+  `Ran N tests in ...s` 必须紧跟可识别的 `OK`/`FAILED` 行，且括号内每个字段都必须是合法的
+  `key=数字`。输出 `{run, pass, fail, skip, format: "python_unittest_summary"}`；Go verbose
+  解析保持不变。
+- 计数规则沿用既有 fail-closed 语义：零运行在声明 `minRun` 时不通过；`skip>0` 在 `forbidSkip` 下为
+  `skipped`；failure 为 `failed`；缺失/畸形/歧义摘要（例如 `skipped=oops`，或先有合法摘要再出现
+  未完成的最终 `Ran` 行）不产生 counts，声明计数规则时为 `unknown`，绝不假通过。未声明计数规则的
+  旧回执不被追溯要求 counts。
+- 证据：`tests/test_receipts.py::test_python_unittest_counts_positive_failure_and_skip`、
+  `::test_python_unittest_zero_and_ambiguous_summaries_stay_explicit`（含 malformed detail 与
+  dangling final summary），以及 `tests/test_phase.py::test_python_count_rules_follow_board_readiness_and_accept`：
+  真实 `unittest` 回执让 readiness `covered`，真实 skip/fail 回执分别阻塞 `decide accept`，恢复后
+  新的 review episode 再被接受。
+- 边界：本阶段任务的冻结 helper 不热替换，因此本阶段自身的最终回执可能没有 counts；新解析器由
+  使用当前源码的运行测试与独立日志复核证明，而不是替换任务工具目录。
+
+## 4. R5 证据完整性修复
+
+- **契约摘要绑定**：`read_phase_record` 在公共读取边界要求持久 `contract` 的规范哈希等于
+  `contractSha256`，并与 `phase.state.json` 的 anchor 一致；不一致/畸形记录返回 invalid，
+  readiness 不 ready，board 保留 phase 绑定并给出 unknown readiness，不会回落到无 phase 的
+  legacy 事件，live `decide` 也会拒绝。恢复原始字节后才重新开启新的 review episode；合法的
+  `install_phase_contract`/`continue` 换版行为不变。`resourceLimits=[]` 只在真实安装的无上限
+  契约中有效。证据：`::test_tampered_contract_digest_cannot_pass_and_restores`（只改
+  `contract.acceptanceItems=[]`，digest 不变）。
+- **资源逐项字节与扫描证据**：非超限项的最终判定必须同时有合法的非负
+  `observedBytes` 与至少一次 `scans`；缺失的声明路径被显式记为已知 0（不是 unknown），已知下界
+  超限仍是 breach。判定不使用持久 aggregate `status` 作为充分条件，而是从逐项最终观测重算；
+  `observedBytes=null` 或 `scans=0` 与 `complete=true,status=ok` 的组合均为 unknown。证据：
+  `::test_resource_evidence_missing_corrupt_stale_and_incomplete_cannot_pass`（含 board/live
+  accept 的 malformed 与 breach 路径）与 `::test_resource_missing_declared_path_is_known_zero`。
+- **矛盾计数汇总**：`unittest_counts` 还拒绝 `FAILED` 无正失败数、`OK` 带 failures/errors、
+  重复 detail 字段、`fail+skip>run`，以及先有合法汇总再出现悬空最终 summary；真正的 OK、
+  OK (skipped=N)、FAILED (…) 与 expected-failure 格式仍解析。证据：
+  `tests/test_receipts.py::test_python_unittest_zero_and_ambiguous_summaries_stay_explicit` 与
+  `tests/test_phase.py::test_contradictory_count_summary_cannot_pass_real_receipt_gate`（零退出、
+  矛盾日志的真实 receipt 不能 ready，旧 review 被拒，恢复后新 episode 才接受）。
+- R4 的资源状态、聚合扫描预算、review 续发与真实 Python 测试语义保持通过。
+
+## 与既有阶段的关系
+
+- O3 已接受候选 `e65ca30` 保持不变；O4 是安装前的独立加固阶段。
+- O4 提交后仍需要 GPT 主会话按完整交付审查；正式安装、托管缓存刷新与业务任务迁移仍不在 Pi 本
+  阶段范围。
+- 证据索引（本仓库）：`runtime/pi_task.py`、`runtime/pi_board.py`、`runtime/pi_check.py`、
+  `tests/test_phase.py`、`tests/test_receipts.py`；最终干净候选的三项验收回执见本轮最终报告与
+  `rounds/5/round.checks/`。

@@ -61,9 +61,15 @@ class ReceiptTest(unittest.TestCase):
     def wait_for_marker(self, check_id: str, timeout: float = 15) -> Path:
         deadline = time.monotonic() + timeout
         while True:
-            found = sorted(self.checks.glob(f"{check_id}-*.running"))
-            if found:
-                return found[0]
+            for candidate in sorted(self.checks.glob(f"{check_id}-*.running")):
+                try:
+                    data = json.loads(candidate.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    data = None
+                # The wrapper writes the marker before spawning and updates it
+                # with the child pid; wait for the initialized marker identity.
+                if isinstance(data, dict) and isinstance(data.get("pid"), int):
+                    return candidate
             if time.monotonic() >= deadline:
                 raise AssertionError(f"running marker for {check_id} never appeared")
             time.sleep(0.05)
@@ -218,6 +224,89 @@ class ReceiptTest(unittest.TestCase):
         self.assertEqual(receipt["exit_code"], 1)
         self.assertFalse(receipt["timed_out"])
         self.assertIsNone(receipt["error"])
+
+    def test_python_unittest_counts_positive_failure_and_skip(self):
+        (self.tmp / "sample_ok.py").write_text(
+            "import unittest\n\nclass Sample(unittest.TestCase):\n"
+            "    def test_one(self):\n        self.assertTrue(True)\n"
+            "    def test_two(self):\n        self.assertEqual(2, 2)\n",
+            encoding="utf-8")
+        ok = self.run_pi_check("py-ok", sys.executable, "-m", "unittest", "-v", "sample_ok")
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        receipt = json.loads(Path(json.loads(ok.stdout)["receipt"]).read_text(encoding="utf-8"))
+        self.assertEqual(receipt["test_counts"],
+                         {"run": 2, "pass": 2, "fail": 0, "skip": 0,
+                          "format": "python_unittest_summary"})
+
+        (self.tmp / "sample_bad.py").write_text(
+            "import unittest\n\nclass Sample(unittest.TestCase):\n"
+            "    def test_fail(self):\n        self.assertEqual(1, 2)\n"
+            "    def test_skip(self):\n        self.skipTest('later')\n",
+            encoding="utf-8")
+        bad = self.run_pi_check("py-bad", sys.executable, "-m", "unittest", "-v", "sample_bad")
+        self.assertNotEqual(bad.returncode, 0)
+        receipt = json.loads(Path(json.loads(bad.stdout)["receipt"]).read_text(encoding="utf-8"))
+        self.assertEqual(receipt["test_counts"]["run"], 2)
+        self.assertEqual(receipt["test_counts"]["fail"], 1)
+        self.assertEqual(receipt["test_counts"]["skip"], 1)
+        self.assertEqual(receipt["test_counts"]["format"], "python_unittest_summary")
+
+    def test_python_unittest_zero_and_ambiguous_summaries_stay_explicit(self):
+        zero = self.run_pi_check(
+            "py-zero", sys.executable, "-c",
+            "print('Ran 0 tests in 0.000s'); print(); print('OK')")
+        self.assertEqual(zero.returncode, 0, zero.stderr)
+        receipt = json.loads(Path(json.loads(zero.stdout)["receipt"]).read_text(encoding="utf-8"))
+        self.assertEqual(receipt["test_counts"]["run"], 0)
+        self.assertEqual(receipt["test_counts"]["fail"], 0)
+        self.assertEqual(receipt["test_counts"]["skip"], 0)
+
+        ambiguous = self.run_pi_check(
+            "py-ambiguous", sys.executable, "-c",
+            "print('Ran 2 tests in 0.010s')")
+        self.assertEqual(ambiguous.returncode, 0, ambiguous.stderr)
+        receipt = json.loads(Path(json.loads(ambiguous.stdout)["receipt"]).read_text(encoding="utf-8"))
+        self.assertIsNone(receipt["test_counts"])
+
+        malformed = self.run_pi_check(
+            "py-malformed", sys.executable, "-c",
+            "print('Ran 2 tests in 0.010s'); print(); print('OK (skipped=oops)')")
+        self.assertEqual(malformed.returncode, 0, malformed.stderr)
+        receipt = json.loads(Path(json.loads(malformed.stdout)["receipt"]).read_text(encoding="utf-8"))
+        self.assertIsNone(receipt["test_counts"],
+                          "a malformed detail field must not become skip=0")
+
+        dangling = self.run_pi_check(
+            "py-dangling", sys.executable, "-c",
+            "print('Ran 2 tests in 0.010s'); print(); print('OK'); print(); "
+            "print('Ran 0 tests in 0.010s')")
+        self.assertEqual(dangling.returncode, 0, dangling.stderr)
+        receipt = json.loads(Path(json.loads(dangling.stdout)["receipt"]).read_text(encoding="utf-8"))
+        self.assertIsNone(receipt["test_counts"],
+                          "an incomplete final summary must not reuse an earlier run count")
+
+        forward = self.run_pi_check(
+            "py-forward", sys.executable, "-c",
+            "print('Ran 2 tests in 0.010s'); print(); print('OK (expected failures=1)')")
+        self.assertEqual(forward.returncode, 0, forward.stderr)
+        receipt = json.loads(Path(json.loads(forward.stdout)["receipt"]).read_text(encoding="utf-8"))
+        self.assertEqual(receipt["test_counts"]["run"], 2)
+        self.assertEqual(receipt["test_counts"]["skip"], 0)
+
+        contradictory = [
+            ("FAILED", "print('Ran 2 tests in 0.010s'); print(); print('FAILED')"),
+            ("dup-skip", "print('Ran 2 tests in 0.010s'); print(); "
+                         "print('OK (skipped=1, skipped=0)')"),
+            ("ok-failures", "print('Ran 2 tests in 0.010s'); print(); "
+                            "print('OK (failures=1)')"),
+            ("failed-zero", "print('Ran 2 tests in 0.010s'); print(); "
+                            "print('FAILED (failures=0, errors=0)')"),
+        ]
+        for label, script in contradictory:
+            proc = self.run_pi_check(f"py-{label}", sys.executable, "-c", script)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            receipt = json.loads(Path(json.loads(proc.stdout)["receipt"]).read_text(encoding="utf-8"))
+            self.assertIsNone(receipt["test_counts"], label)
 
 
 if __name__ == "__main__":

@@ -33,8 +33,13 @@ from pathlib import Path
 import re
 import signal
 import subprocess
+import sys
 import time
 import uuid
+
+# The frozen helper snapshot is immutable evidence: never write bytecode caches
+# into the task tools directory.
+sys.dont_write_bytecode = True
 
 from pi_size import measure
 from pi_task import atomic, terminate
@@ -43,6 +48,61 @@ RUNNING_SUFFIX = ".running"
 GUARD_EXIT_CODE = 75
 MIN_HEALTH_INTERVAL = 0.05
 MAX_HEALTH_INTERVAL = 3600.0
+UNITTEST_RAN_RE = re.compile(r'^Ran (?P<run>\d+) tests? in [\d.]+s\s*$')
+UNITTEST_RESULT_RE = re.compile(r'^(?P<result>OK|FAILED)(?:\s*\((?P<detail>[^)]*)\))?\s*$')
+
+
+def unittest_counts(text: str):
+    """Counts from the unambiguous final unittest summary; None otherwise.
+
+    The last ``Ran N tests ...`` line is the final candidate summary. It must be
+    followed by a recognizable ``OK``/``FAILED`` line; every detail field must be
+    a well-formed, non-duplicated integer ``key=value``; the detail counters must
+    be consistent with the result and the run count. Malformed, contradictory or
+    incomplete evidence returns ``None``, so declared ``minRun``/``forbidSkip``
+    rules stay unknown instead of passing on a contradictory zero-exit log.
+    """
+    lines = text.splitlines()
+    last_ran = None
+    for index, line in enumerate(lines):
+        match = UNITTEST_RAN_RE.match(line.strip())
+        if match:
+            last_ran = (index, int(match.group('run')))
+    if last_ran is None:
+        return None
+    result_line = next((line.strip() for line in lines[last_ran[0] + 1:] if line.strip()), None)
+    if result_line is None:
+        return None
+    result = UNITTEST_RESULT_RE.match(result_line)
+    if result is None:
+        return None
+    failures = errors = skipped = 0
+    seen = set()
+    detail = result.group('detail')
+    if detail is not None:
+        for part in detail.split(','):
+            key, _sep, value = part.strip().partition('=')
+            if not key or not _sep or not value.isdigit() or key in seen:
+                return None
+            seen.add(key)
+            if key == 'failures':
+                failures = int(value)
+            elif key == 'errors':
+                errors = int(value)
+            elif key == 'skipped':
+                skipped = int(value)
+            # other well-formed integer fields (for example expected failures)
+            # are forward-compatible and do not change the fixed counters
+    run = last_ran[1]
+    fail = failures + errors
+    if result.group('result') == 'FAILED' and fail <= 0:
+        return None
+    if result.group('result') == 'OK' and fail > 0:
+        return None
+    if fail + skipped > run:
+        return None
+    return {'run': run, 'pass': max(0, run - fail - skipped), 'fail': fail,
+            'skip': skipped, 'format': 'python_unittest_summary'}
 
 
 class Guard:
@@ -257,11 +317,14 @@ def main():
                         code = GUARD_EXIT_CODE
         raw = log.read_bytes() if log.exists() else b''
         text = raw.decode(errors='replace')
-        counts = {'run': len(re.findall(r'^=== RUN\s', text, re.M)),
-                  'pass': len(re.findall(r'^--- PASS:', text, re.M)),
-                  'fail': len(re.findall(r'^--- FAIL:', text, re.M)),
-                  'skip': len(re.findall(r'^--- SKIP:', text, re.M))}
-        counts = dict(counts, format='go_verbose_top_level') if any(counts.values()) else None
+        counters = {'run': len(re.findall(r'^=== RUN\s', text, re.M)),
+                    'pass': len(re.findall(r'^--- PASS:', text, re.M)),
+                    'fail': len(re.findall(r'^--- FAIL:', text, re.M)),
+                    'skip': len(re.findall(r'^--- SKIP:', text, re.M))}
+        if any(counters.values()):
+            counts = dict(counters, format='go_verbose_top_level')
+        else:
+            counts = unittest_counts(text)
         try:
             head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True,
                                            stderr=subprocess.DEVNULL).strip()

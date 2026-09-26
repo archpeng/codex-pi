@@ -38,6 +38,10 @@ import shutil
 import stat
 import sys
 
+# The frozen helper snapshot is immutable evidence: never write bytecode caches
+# into the task tools directory.
+sys.dont_write_bytecode = True
+
 from pi_size import measure
 
 CHUNK_BYTES = 1024 * 1024

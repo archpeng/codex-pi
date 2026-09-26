@@ -27,6 +27,63 @@ Normal supervision stays inside the detached Pi supervisor. Do independent work,
 
 `result` is collected once per terminal round. It retains raw pointers and bounded summaries, all attempts, model usage and native Pi session evidence below the Git common directory `codex-pi/tasks/`. Open only the relevant receipt/log/diff. Continue the exact saved task for repairs; do not replace a live or unknown worker with a new identity. A reused session does not keep idle Pi processes alive after the round ends.
 
+## Phase contracts (0.5: accepted O1, verified O2)
+
+An authorized complete phase may be dispatched with a frozen contract: give `start`/`continue` a
+`--contract-file` JSON (schema in `docs/validation/phase-autonomy-o1-20260926.md`). The contract
+freezes goal, complete result, baseline, scope, design ref/hash, acceptance item IDs with real check
+commands, the phase budget and the autonomous-repair/escalation boundary. The brief references the
+contract; the project PLAN/design remains authoritative and no parallel plan is created.
+
+```sh
+python3 /absolute/plugin/runtime/pi_task.py progress --repo WT --task TASK --round N \
+    --activity implementing --step '...' --completed-criteria ITEM --next '...' --evidence-ref PATH
+python3 /absolute/plugin/runtime/pi_task.py readiness --repo REPO --task TASK --round N
+python3 /absolute/plugin/runtime/pi_task.py phase-status --repo REPO --task TASK
+python3 /absolute/plugin/runtime/pi_board.py decide --repo REPO --task TASK --event-id EVENT \
+    --decision accept --reviewed-head FULL_SHA --phase PHASE --contract-hash HASH
+```
+
+Ordinary progress is self-report only, never a check receipt and never a queue message. Readiness
+compares the exact contract with real `pi_check` receipts bound to the candidate; missing, failed,
+skipped or unknown evidence is never ready (scope coverage is complete with a bounded cap, and
+`forbidSkip`/`minRun` need parseable counts). Running self-repairable check failures/timeouts stay
+local. A normally completed round with only mechanically missing evidence may be continued once in
+the same session/worktree/budget (quota persisted per phase); the second shortfall, a real design
+question or an unknown start escalates. A phase also emits at most two bounded non-blocking
+progress echoes (default 10 minutes apart, persisted per `phaseId`) for verified receipts or
+evidence-bearing check/repair milestones; ordinary progress, repeated writes and "still alive"
+never queue. A recorded user pause blocks progress echoes, auto-continuation and explicit
+`continue` until an explicit resume. `accept` binds phase, contract and candidate; a different
+phase requires the previous one accepted on the board and no conflicting worker. One normalized
+phase evidence snapshot (candidate known/unknown, per-item grades, scope, execution, readiness) is
+built by `pi_task` and consumed by the board, progress events, `readiness` and the accept gate;
+there is no second candidate or receipt-validity inference. A phase acceptance receipt must present
+the item's declared command and a wrapper deadline within the contract's `commandTimeoutSeconds`;
+a known command or timeout mismatch can never cover the item, missing or contradictory
+identity/timing stays unknown, and every consumer uses that one verdict. The generated phase brief
+uses that per-command cap while a legacy task keeps the project round-timeout example; the
+whole-round supervisor timeout is a separate limit. A ready review event carries a durable episode
+id: invalidating and recovering the same round/candidate publishes exactly one new review event,
+unchanged refreshes stay idempotent, the old event stays superseded, and `accept` binds only the
+new event. `pi_check` also reports run/pass/fail/skip for the unambiguous final `unittest` summary
+(Go verbose counts unchanged); malformed or contradictory final summaries (a `FAILED` without a
+positive failure count, `OK` with failures, duplicate fields, or a dangling final `Ran` line)
+yield no counts, and `minRun`/`forbidSkip` stay unknown/skipped/failed when that summary is missing,
+zero, skipped or failing. `accept` re-reads the live status and
+refuses when the round, contract revision, candidate, readiness, worktree HEAD or writer-free state
+no longer match the stored event. Tasks without a
+contract keep the legacy review path. The persisted frozen contract must hash to its stored digest
+and agree with the phase-state anchor; on a mismatch the board keeps the phase binding with unknown
+readiness so old phase events cannot fall back to the legacy accept path. O1 is accepted at candidate `7331da9`; O2 ran a real two-round
+fixture (R1 `changes_requested`, same-session R2 accepted) documented in
+[o2-eventfold-20260926.md](../../docs/validation/o2-eventfold-20260926.md); O3 is accepted at
+`e65ca30`; O4 hardening is documented in
+[o4-release-hardening-20260926.md](../../docs/validation/o4-release-hardening-20260926.md) and
+awaits review; formal installation and business-task migration are still pending. See
+[docs/validation/phase-autonomy-o1-20260926.md](../../docs/validation/phase-autonomy-o1-20260926.md)
+for operations and the current verification boundary.
+
 ## Checks and resource protection
 
 The generated brief contains task-specific frozen `toolsDir` and round-specific `checksDir`. Run from the Pi worktree:
@@ -37,7 +94,9 @@ python3 /absolute/task/tools/pi_check.py --output-dir /absolute/round/round.chec
 python3 /absolute/task/tools/pi_copy.py /absolute/source /absolute/new-destination --max-bytes 104857600
 ```
 
-Replace example commands and limits with meaningful project budgets. A running marker reports wrapper start, actual deadline, child identity and optional directory guard. Final immutable receipts bind command, revision, exit and log hash. Failed, skipped, interrupted, unknown or zero-test attempts never become a pass. The command timeout and whole Pi round timeout are separate.
+Replace example commands and limits with meaningful project budgets. A running marker reports wrapper start, actual deadline, child identity and optional directory guard. Final immutable receipts bind command, revision, exit and log hash. Failed, skipped, interrupted, unknown or zero-test attempts never become a pass. The command timeout and whole Pi round timeout are separate. For a phase task the per-command `--timeout-seconds` must not exceed the contract's `commandTimeoutSeconds`; a receipt outside that bound or with a different command can never cover its acceptance item.
+
+For a phase task with `resourceLimits`, the supervisor additionally measures every declared in-worktree path at most every 60 seconds while Pi runs and once at termination under a bounded aggregate scan budget, using the no-follow high-water state under the round directory; it validates the path cannot escape the worktree through `..` or symlink components. A known overage (even a partial lower bound already over the cap) stops only the owned Pi process group and makes the phase not ready; a measurement unknown for two minutes escalates the same way. Missing, corrupt, stale, contradictory or final-incomplete resource evidence is unknown when limits are declared, never ready; a complete limit needs a valid nonnegative measured byte count and scan evidence, a missing declared path is known zero, and `resourceLimits=[]` declares no limit. This covers declared paths and persistently observable writes, not arbitrary external writes or a dead supervisor.
 
 Directory guards measure declared regular-file bytes without following symlinks. An observed known breach stops only the owned command group and records the failure; an incomplete measurement stays unknown. The copy helper preserves literal symlinks and refuses existing destinations, recursion, known overages or unknown verification. These rules prevent the 14 MB → 6.5 GB expansion incident without asking the main model to poll.
 

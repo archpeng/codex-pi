@@ -1,15 +1,15 @@
 {
   "name": "codex-pi",
-  "version": "0.4.0+codex.20260926064735",
-  "description": "\u8de8\u9879\u76ee\u7684 Codex \u4e0e Pi \u534f\u4f5c\uff1aDeepSeek Flash \u5b9e\u65bd\u3001\u672c\u5730\u770b\u677f\u6309\u4e8b\u4ef6\u901a\u77e5\u539f\u4e3b\u4efb\u52a1\u3001\u7cbe\u7b80\u8bc1\u636e\u4e0e\u72ec\u7acb\u9a8c\u6536\u3002",
+  "version": "0.5.0+codex.20260926.o1",
+  "description": "跨项目的 Codex 与 Pi 协作：DeepSeek Flash 实施、本地看板按事件通知原主任务、精简证据与独立验收。",
   "author": {
     "name": "Local personal tools"
   },
   "skills": "./skills/",
   "interface": {
     "displayName": "Codex + Pi",
-    "shortDescription": "Pi \u6301\u7eed\u5b9e\u65bd\uff1b\u770b\u677f\u6709\u4e8b\u518d\u901a\u77e5\uff0c\u539f\u4e3b\u4efb\u52a1\u81ea\u52a8\u63a5\u7eed\u3002",
-    "longDescription": "\u516c\u5171 Python \u5de5\u5177\u4e0e\u6bcf\u4e2a\u9879\u76ee\u5c11\u91cf\u7ea6\u675f\u3002Pi \u56fa\u5b9a DeepSeek Flash/max\uff1b\u5df2\u6709 supervisor \u7ef4\u62a4\u770b\u677f\uff0cCodex CLI \u4ec5\u4ee5 queue \u4f20\u9012\u4e8b\u4ef6\u5230\u539f\u684c\u9762\u4efb\u52a1\uff0c\u4e0d\u542f\u52a8\u7b2c\u4e8c\u4e2a\u6a21\u578b\u3002\u63d0\u4f9b\u547d\u4ee4\u65f6\u9650\u3001\u8d44\u6e90\u4fdd\u62a4\u3001\u540c\u4f1a\u8bdd\u8fd4\u4fee\u548c\u660e\u786e\u9a8c\u6536\uff1b\u65e0\u65b0\u589e MCP\u3001heartbeat \u6216\u5e38\u9a7b\u670d\u52a1\u3002",
+    "shortDescription": "Pi 持续实施；看板有事再通知，原主任务自动接续。",
+    "longDescription": "公共 Python 工具与每个项目少量约束。Pi 固定 DeepSeek Flash/max；已有 supervisor 维护看板，Codex CLI 仅以 queue 传递事件到原桌面任务，不启动第二个模型。提供命令时限、资源保护、同会话返修和明确验收；无新增 MCP、heartbeat 或常驻服务。",
     "developerName": "Local personal tools",
     "category": "Productivity",
     "capabilities": [
@@ -17,7 +17,7 @@
       "Write"
     ],
     "defaultPrompt": [
-      "\u4f7f\u7528 $collaborate\uff0c\u5c06\u5f53\u524d\u9879\u76ee\u5df2\u6388\u6743\u7684\u5b8c\u6574\u4efb\u52a1\u4ea4\u7ed9 Pi \u5b9e\u65bd\uff0c\u7531\u5f53\u524d\u4e3b\u4f1a\u8bdd\u8bbe\u8ba1\u5e76\u9a8c\u6536\u3002"
+      "使用 $collaborate，将当前项目已授权的完整任务交给 Pi 实施，由当前主会话设计并验收。"
     ]
   }
 }
