@@ -74,6 +74,29 @@
 - 边界：本阶段任务的冻结 helper 不热替换，因此本阶段自身的最终回执可能没有 counts；新解析器由
   使用当前源码的运行测试与独立日志复核证明，而不是替换任务工具目录。
 
+## 4. R5 证据完整性修复
+
+- **契约摘要绑定**：`read_phase_record` 在公共读取边界要求持久 `contract` 的规范哈希等于
+  `contractSha256`，并与 `phase.state.json` 的 anchor 一致；不一致/畸形记录返回 invalid，
+  readiness 不 ready，board 保留 phase 绑定并给出 unknown readiness，不会回落到无 phase 的
+  legacy 事件，live `decide` 也会拒绝。恢复原始字节后才重新开启新的 review episode；合法的
+  `install_phase_contract`/`continue` 换版行为不变。`resourceLimits=[]` 只在真实安装的无上限
+  契约中有效。证据：`::test_tampered_contract_digest_cannot_pass_and_restores`（只改
+  `contract.acceptanceItems=[]`，digest 不变）。
+- **资源逐项字节与扫描证据**：非超限项的最终判定必须同时有合法的非负
+  `observedBytes` 与至少一次 `scans`；缺失的声明路径被显式记为已知 0（不是 unknown），已知下界
+  超限仍是 breach。判定不使用持久 aggregate `status` 作为充分条件，而是从逐项最终观测重算；
+  `observedBytes=null` 或 `scans=0` 与 `complete=true,status=ok` 的组合均为 unknown。证据：
+  `::test_resource_evidence_missing_corrupt_stale_and_incomplete_cannot_pass`（含 board/live
+  accept 的 malformed 与 breach 路径）与 `::test_resource_missing_declared_path_is_known_zero`。
+- **矛盾计数汇总**：`unittest_counts` 还拒绝 `FAILED` 无正失败数、`OK` 带 failures/errors、
+  重复 detail 字段、`fail+skip>run`，以及先有合法汇总再出现悬空最终 summary；真正的 OK、
+  OK (skipped=N)、FAILED (…) 与 expected-failure 格式仍解析。证据：
+  `tests/test_receipts.py::test_python_unittest_zero_and_ambiguous_summaries_stay_explicit` 与
+  `tests/test_phase.py::test_contradictory_count_summary_cannot_pass_real_receipt_gate`（零退出、
+  矛盾日志的真实 receipt 不能 ready，旧 review 被拒，恢复后新 episode 才接受）。
+- R4 的资源状态、聚合扫描预算、review 续发与真实 Python 测试语义保持通过。
+
 ## 与既有阶段的关系
 
 - O3 已接受候选 `e65ca30` 保持不变；O4 是安装前的独立加固阶段。
@@ -81,4 +104,4 @@
   阶段范围。
 - 证据索引（本仓库）：`runtime/pi_task.py`、`runtime/pi_board.py`、`runtime/pi_check.py`、
   `tests/test_phase.py`、`tests/test_receipts.py`；最终干净候选的三项验收回执见本轮最终报告与
-  `rounds/4/round.checks/`。
+  `rounds/5/round.checks/`。

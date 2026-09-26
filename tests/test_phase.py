@@ -1819,7 +1819,7 @@ class PhaseTest(unittest.TestCase):
         self.assertEqual(readiness()["status"], "not_ready")
         self.assertEqual(readiness()["resource"]["status"], "unknown")
 
-        # Restoring the exact valid evidence recovers a fresh review episode.
+        # Restoring the exact valid evidence opens a fresh review episode.
         state_path.write_bytes(original)
         self.assertEqual(readiness()["resource"]["status"], "ok")
         self.assertEqual(readiness()["status"], "ready")
@@ -1827,12 +1827,57 @@ class PhaseTest(unittest.TestCase):
         renewed = self.pending(repo, task, "review_required")
         self.assertEqual(len(renewed), 1)
         self.assertNotEqual(renewed[0]["id"], first["id"])
+
+        # A complete observation without a measured byte count cannot cover,
+        # and the live accept gate refuses the pending event.
+        state = json.loads(original)
+        state["limits"][0]["observedBytes"] = None
+        state["status"] = "unknown"
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        self.assertEqual(readiness()["resource"]["status"], "unknown")
+        self.assertIn("byte count", readiness()["resource"]["reason"])
+        run_board("decide", "--repo", str(repo.root), "--task", task,
+                  "--event-id", renewed[0]["id"], "--decision", "accept",
+                  "--reviewed-head", candidate, "--phase", "P-RESEVAL",
+                  "--contract-hash", fixture["contractSha256"], env=env, expect=2)
+
+        # A completed observation without scan evidence is unknown as well.
+        state = json.loads(original)
+        state["limits"][0]["scans"] = 0
+        state["status"] = "unknown"
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        self.assertEqual(readiness()["resource"]["status"], "unknown")
+        self.assertIn("scan evidence", readiness()["resource"]["reason"])
+
+        # A consistent persisted overage blocks readiness, the board and accept.
+        state = json.loads(original)
+        state["status"] = "breached"
+        state["limits"][0]["breached"] = True
+        state["limits"][0]["observedBytes"] = 10 ** 12
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        self.assertEqual(readiness()["resource"]["status"], "breached")
+        self.assertEqual(readiness()["status"], "not_ready")
+        run_board("decide", "--repo", str(repo.root), "--task", task,
+                  "--event-id", renewed[0]["id"], "--decision", "accept",
+                  "--reviewed-head", candidate, "--phase", "P-RESEVAL",
+                  "--contract-hash", fixture["contractSha256"], env=env, expect=2)
+        self.refresh(repo, task, env)
+        self.assertTrue(any(event["evidence"].get("reason") == "resource_breached"
+                            for event in self.pending(repo, task, "phase_blocked")))
+
+        # Exact restore recovers one more episode; old events cannot accept.
+        state_path.write_bytes(original)
+        self.assertEqual(readiness()["status"], "ready")
+        self.refresh(repo, task, env)
+        accepted = self.pending(repo, task, "review_required")
+        self.assertEqual(len(accepted), 1)
+        self.assertNotEqual(accepted[0]["id"], renewed[0]["id"])
         run_board("decide", "--repo", str(repo.root), "--task", task,
                   "--event-id", first["id"], "--decision", "accept",
                   "--reviewed-head", candidate, "--phase", "P-RESEVAL",
                   "--contract-hash", fixture["contractSha256"], env=env, expect=2)
         decided = board_json("decide", "--repo", str(repo.root), "--task", task,
-                             "--event-id", renewed[0]["id"], "--decision", "accept",
+                             "--event-id", accepted[0]["id"], "--decision", "accept",
                              "--reviewed-head", candidate, "--phase", "P-RESEVAL",
                              "--contract-hash", fixture["contractSha256"], env=env)
         self.assertEqual(decided["decision"], "accepted")
@@ -1896,6 +1941,136 @@ class PhaseTest(unittest.TestCase):
             stop = monitor3.scan()
         self.assertTrue(stop)
         self.assertEqual(monitor3.snapshot()["status"], "escalated")
+
+    def test_resource_missing_declared_path_is_known_zero(self):
+        round_dir = self.tmp / "missing-path-monitor"
+        round_dir.mkdir()
+        worktree = round_dir / "wt"
+        worktree.mkdir()
+        limits = [{"path": "not-created-yet", "maxBytes": 100}]
+        monitor = pi_task.PhaseResourceMonitor(round_dir, worktree, limits, "P-MISS",
+                                               "a" * 64, 1, scan_budget_seconds=5)
+        monitor.final_scan()
+        verdict = pi_task.evaluate_resource_evidence(
+            round_dir, {"phaseId": "P-MISS", "resourceLimits": limits}, 1, "a" * 64)
+        self.assertEqual(verdict["status"], "ok")
+        self.assertEqual(verdict["limits"][0]["observedBytes"], 0)
+        self.assertTrue(verdict["limits"][0]["complete"])
+
+    def test_tampered_contract_digest_cannot_pass_and_restores(self):
+        fixture = self.ready_accept_fixture("tamper", "P-TAMPER")
+        repo, env = fixture["repo"], fixture["env"]
+        task, candidate = "tamper", fixture["candidate"]
+        phase_file = repo.task_dir(task) / "phase.json"
+        original = phase_file.read_bytes()
+        first = fixture["review"]
+
+        def readiness():
+            return cli_json("readiness", "--repo", str(repo.root), "--task", task,
+                            "--round", "1", env=env)
+
+        self.assertEqual(readiness()["status"], "ready")
+        # Weaken only the frozen contract content; the stored digest stays.
+        tampered = json.loads(original)
+        tampered["contract"]["acceptanceItems"] = []
+        phase_file.write_text(json.dumps(tampered), encoding="utf-8")
+        self.assertNotEqual(readiness()["status"], "ready")
+        phase_status = cli_json("phase-status", "--repo", str(repo.root), "--task", task,
+                                env=env)
+        self.assertEqual(phase_status["phaseProblem"], "digest-mismatch")
+        # The board keeps a phase binding with unknown readiness instead of
+        # falling back to a legacy (unbound) review event.
+        self.refresh(repo, task, env)
+        card = self.card(repo, task)
+        self.assertEqual(card["phase"]["phaseId"], "P-TAMPER")
+        self.assertEqual(card["phase"]["readiness"]["status"], "unknown")
+        self.assertEqual(self.pending(repo, task, "review_required"), [])
+        self.assertTrue(self.pending(repo, task, "phase_blocked"))
+        run_board("decide", "--repo", str(repo.root), "--task", task,
+                  "--event-id", first["id"], "--decision", "accept",
+                  "--reviewed-head", candidate, "--phase", "P-TAMPER",
+                  "--contract-hash", fixture["contractSha256"], env=env, expect=2)
+        # Exact restore recovers exactly one fresh review episode.
+        phase_file.write_bytes(original)
+        self.assertEqual(readiness()["status"], "ready")
+        self.refresh(repo, task, env)
+        renewed = self.pending(repo, task, "review_required")
+        self.assertEqual(len(renewed), 1)
+        self.assertNotEqual(renewed[0]["id"], first["id"])
+        decided = board_json("decide", "--repo", str(repo.root), "--task", task,
+                             "--event-id", renewed[0]["id"], "--decision", "accept",
+                             "--reviewed-head", candidate, "--phase", "P-TAMPER",
+                             "--contract-hash", fixture["contractSha256"], env=env)
+        self.assertEqual(decided["decision"], "accepted")
+
+    def test_contradictory_count_summary_cannot_pass_real_receipt_gate(self):
+        repo, worktree = self.make(name="count-contradiction")
+        sha = self.write_design(repo)
+        script = ("import os; print('Ran 2 tests in 0.010s'); print(); "
+                  "print(os.environ.get('COUNT_MODE', 'OK'))")
+        command = self.python_command("-c", script)
+        item = {"id": "A1", "description": "counted tests", "command": command,
+                "passCondition": "exit 0, run>=2, no skips", "evidence": "receipt",
+                "minRun": 2, "forbidSkip": True}
+        path = self.write_contract("count-contradiction.json",
+                                   self.contract(repo, "P-CONTRA", design_sha=sha, items=[item]))
+        env = self.h_env(PI_DOUBLE_MODE="delay-ok", PI_DOUBLE_DELAY="5")
+        self.start(repo, worktree, "count-contradiction", path, env)
+        repo.wait_round_state("count-contradiction", "running")
+        checks = repo.task_dir("count-contradiction") / "rounds" / "1" / "round.checks"
+
+        def receipt(mode=None):
+            run_env = dict(env)
+            if mode:
+                run_env["COUNT_MODE"] = mode
+            run = subprocess.run(
+                [sys.executable, str(RUNTIME / "pi_check.py"), "--output-dir", str(checks),
+                 "--id", "A1", "--timeout-seconds", "900", "--", *shlex.split(command)],
+                cwd=str(worktree), capture_output=True, text=True, env=run_env, timeout=120)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            return json.loads(Path(json.loads(run.stdout)["receipt"]).read_text(encoding="utf-8"))
+
+        self.assertEqual(receipt()["test_counts"]["run"], 2)
+        self.register(repo, "count-contradiction", env)
+        repo.wait_terminal("count-contradiction", env=env)
+
+        def readiness():
+            return cli_json("readiness", "--repo", str(repo.root), "--task",
+                            "count-contradiction", "--round", "1", env=env)
+
+        def contract_sha():
+            return json.loads((repo.task_dir("count-contradiction") / "phase.json").read_text(
+                encoding="utf-8"))["contractSha256"]
+
+        self.assertEqual(readiness()["status"], "ready")
+        self.refresh(repo, "count-contradiction", env)
+        review = self.pending(repo, "count-contradiction", "review_required")
+        self.assertEqual(len(review), 1)
+
+        # A contradictory zero-exit log cannot satisfy the declared count rules.
+        for mode in ("FAILED", "OK (skipped=1, skipped=0)"):
+            contradictory = receipt(mode)
+            self.assertIsNone(contradictory["test_counts"])
+            self.assertEqual(readiness()["items"][0]["status"], "unknown")
+            run_board("decide", "--repo", str(repo.root), "--task", "count-contradiction",
+                      "--event-id", review[0]["id"], "--decision", "accept",
+                      "--reviewed-head", self.head(worktree), "--phase", "P-CONTRA",
+                      "--contract-hash", contract_sha(), env=env, expect=2)
+        self.refresh(repo, "count-contradiction", env)
+        self.assertEqual(self.pending(repo, "count-contradiction", "review_required"), [])
+        self.assertTrue(self.pending(repo, "count-contradiction", "phase_blocked"))
+
+        # A genuine summary recovers a fresh review episode and acceptance.
+        self.assertIsNotNone(receipt()["test_counts"])
+        self.assertEqual(readiness()["status"], "ready")
+        self.refresh(repo, "count-contradiction", env)
+        renewed = self.pending(repo, "count-contradiction", "review_required")
+        self.assertEqual(len(renewed), 1)
+        decided = board_json("decide", "--repo", str(repo.root), "--task", "count-contradiction",
+                             "--event-id", renewed[0]["id"], "--decision", "accept",
+                             "--reviewed-head", self.head(worktree), "--phase", "P-CONTRA",
+                             "--contract-hash", contract_sha(), env=env)
+        self.assertEqual(decided["decision"], "accepted")
 
 
 if __name__ == "__main__":

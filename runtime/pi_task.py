@@ -462,15 +462,32 @@ def phase_auto_path(task_dir: Path) -> Path:
 
 
 def read_phase_record(task_dir: Path):
-    """Read the frozen phase contract record; returns (record, problem)."""
+    """Read the frozen phase contract record; returns (record, problem).
+
+    The persisted normalized contract must hash to the stored digest, and the
+    phase-state anchor, when present, must name the same revision. Malformed or
+    contradictory records are rejected here so no consumer projects a weaker
+    contract under the same apparent identity.
+    """
     path = phase_path(task_dir)
     if not path.exists():
         return None, "absent"
     data = read_json(path, None)
     if not isinstance(data, dict) or data.get("schemaVersion") != 1 \
             or not isinstance(data.get("contract"), dict) \
-            or not isinstance(data.get("contractSha256"), str):
+            or not isinstance(data.get("contractSha256"), str) \
+            or not FULL_OID_RE.fullmatch(data["contractSha256"]):
         return None, "unrecognized"
+    try:
+        actual = contract_hash(data["contract"])
+    except (TypeError, ValueError):
+        return None, "malformed-contract"
+    if actual != data["contractSha256"]:
+        return None, "digest-mismatch"
+    state = read_phase_state(task_dir)
+    state_sha = state.get("contractSha256") if isinstance(state, dict) else None
+    if isinstance(state_sha, str) and state_sha != data["contractSha256"]:
+        return None, "state-mismatch"
     return data, None
 
 
@@ -709,6 +726,12 @@ def evaluate_resource_evidence(round_dir: Path, contract: dict, round_number: in
         elif entry.get("unknown") or entry.get("complete") is not True:
             unknown = True
             reason = reason or entry.get("reason")
+        elif not isinstance(observed, int) or isinstance(observed, bool) or observed < 0:
+            unknown = True
+            reason = reason or "completed resource observation has no valid measured byte count"
+        elif not isinstance(entry.get("scans"), int) or entry.get("scans", 0) < 1:
+            unknown = True
+            reason = reason or "completed resource observation has no scan evidence"
     effective = ("breached" if breached else "escalated" if escalated
                  else "unknown" if unknown else "ok")
     if state.get("status") != effective:
@@ -835,6 +858,10 @@ class PhaseResourceMonitor:
             missing = (not measurement.get("exists")
                        and measurement.get("reason") == "path does not exist")
             unknown = bool(measurement.get("unknown")) and not missing
+            if missing and entry.get("observedBytes") is None:
+                # A declared path that does not exist yet is a known zero, not
+                # an unmeasured cap.
+                entry["observedBytes"] = 0
             if unknown:
                 self._mark_unknown(
                     entry, now, measurement.get("reason") or "measurement is incomplete")
@@ -3464,6 +3491,52 @@ def probe_worktree_head(worktree: Path):
     return _head_probe(worktree)
 
 
+def _invalid_phase_info(task_dir: Path, problem: str, candidate: dict,
+                        round_number: int) -> dict:
+    """Fail-closed phase identity for an unreadable or tampered contract record.
+
+    The invalid record is never projected as absent: the board keeps a phase
+    binding with unknown readiness so an old phase event cannot fall back to the
+    legacy accept path while the declared contract cannot be trusted.
+    """
+    raw = read_json(phase_path(task_dir), None)
+    raw = raw if isinstance(raw, dict) else {}
+    contract = raw.get("contract") if isinstance(raw.get("contract"), dict) else {}
+    phase_id = contract.get("phaseId")
+    if not isinstance(phase_id, str) \
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", phase_id):
+        phase_id = "INVALID-CONTRACT"
+    digest = raw.get("contractSha256")
+    if not isinstance(digest, str) or not FULL_OID_RE.fullmatch(digest):
+        digest = "0" * 64
+    reason = f"phase contract record is invalid ({problem}); readiness is unknown"
+    readiness = {"status": "unknown", "reason": reason,
+                 "coverage": {"required": 0, "covered": 0, "failed": 0, "missing": 0,
+                              "unknown": 0, "skipped": 0},
+                 "gaps": [], "scope": "unknown", "writerFree": False,
+                 "readyForReview": False, "execution": {"status": "unknown"},
+                 "resource": None, "generatedAt": time.time()}
+    return {
+        "phaseId": phase_id, "contractSha256": digest,
+        "contractRef": str(phase_path(task_dir)),
+        "baselineCommit": raw.get("baselineCommit"),
+        "state": "invalid", "candidate": candidate.get("head"),
+        "budget": phase_budget(task_dir, None), "autoContinue": None,
+        "lastDecision": None,
+        "evidence": {"schemaVersion": 1, "round": round_number, "phaseId": phase_id,
+                     "contractSha256": digest, "candidate": candidate,
+                     "execution": {"state": None, "exitCode": None, "cancelled": None,
+                                   "timedOut": None},
+                     "items": [], "coverage": readiness["coverage"], "gaps": [],
+                     "scope": {"status": "unknown", "outOfScope": [], "changedFiles": []},
+                     "readiness": readiness, "resource": None,
+                     "evidenceLevels": {"gptAcceptance": False},
+                     "notes": [reason], "acceptance": "not_verified"},
+        "readiness": readiness,
+        "acceptance": "not_verified",
+    }
+
+
 def build_status(repo_arg: str, task_arg: str, round_arg=None) -> dict:
     """Bounded read-only state snapshot. Never starts Pi, builds a summary or scans a transcript."""
     task = require_task_arg(task_arg)
@@ -3605,6 +3678,8 @@ def build_status(repo_arg: str, task_arg: str, round_arg=None) -> dict:
             "acceptance": "not_verified",
         }
     elif phase_problem not in (None, "absent"):
+        phase_info = _invalid_phase_info(task_dir, phase_problem, candidate_block,
+                                         selected_number)
         notes.append(f"phase contract state is {phase_problem}; phase readiness is unknown")
     progress = read_progress(selected_dir)
     if progress is not None:

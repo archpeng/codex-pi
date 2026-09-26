@@ -56,10 +56,11 @@ def unittest_counts(text: str):
     """Counts from the unambiguous final unittest summary; None otherwise.
 
     The last ``Ran N tests ...`` line is the final candidate summary. It must be
-    followed by a recognizable ``OK``/``FAILED`` line, and every detail field
-    must be a well-formed integer ``key=value``. Malformed details (for example
-    ``skipped=oops``) and an incomplete final summary return ``None``, so
-    declared ``minRun``/``forbidSkip`` rules stay unknown instead of passing.
+    followed by a recognizable ``OK``/``FAILED`` line; every detail field must be
+    a well-formed, non-duplicated integer ``key=value``; the detail counters must
+    be consistent with the result and the run count. Malformed, contradictory or
+    incomplete evidence returns ``None``, so declared ``minRun``/``forbidSkip``
+    rules stay unknown instead of passing on a contradictory zero-exit log.
     """
     lines = text.splitlines()
     last_ran = None
@@ -76,12 +77,14 @@ def unittest_counts(text: str):
     if result is None:
         return None
     failures = errors = skipped = 0
+    seen = set()
     detail = result.group('detail')
     if detail is not None:
         for part in detail.split(','):
             key, _sep, value = part.strip().partition('=')
-            if not key or not _sep or not value.isdigit():
+            if not key or not _sep or not value.isdigit() or key in seen:
                 return None
+            seen.add(key)
             if key == 'failures':
                 failures = int(value)
             elif key == 'errors':
@@ -92,6 +95,12 @@ def unittest_counts(text: str):
             # are forward-compatible and do not change the fixed counters
     run = last_ran[1]
     fail = failures + errors
+    if result.group('result') == 'FAILED' and fail <= 0:
+        return None
+    if result.group('result') == 'OK' and fail > 0:
+        return None
+    if fail + skipped > run:
+        return None
     return {'run': run, 'pass': max(0, run - fail - skipped), 'fail': fail,
             'skip': skipped, 'format': 'python_unittest_summary'}
 

@@ -293,6 +293,21 @@ class ReceiptTest(unittest.TestCase):
         self.assertEqual(receipt["test_counts"]["run"], 2)
         self.assertEqual(receipt["test_counts"]["skip"], 0)
 
+        contradictory = [
+            ("FAILED", "print('Ran 2 tests in 0.010s'); print(); print('FAILED')"),
+            ("dup-skip", "print('Ran 2 tests in 0.010s'); print(); "
+                         "print('OK (skipped=1, skipped=0)')"),
+            ("ok-failures", "print('Ran 2 tests in 0.010s'); print(); "
+                            "print('OK (failures=1)')"),
+            ("failed-zero", "print('Ran 2 tests in 0.010s'); print(); "
+                            "print('FAILED (failures=0, errors=0)')"),
+        ]
+        for label, script in contradictory:
+            proc = self.run_pi_check(f"py-{label}", sys.executable, "-c", script)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            receipt = json.loads(Path(json.loads(proc.stdout)["receipt"]).read_text(encoding="utf-8"))
+            self.assertIsNone(receipt["test_counts"], label)
+
 
 if __name__ == "__main__":
     unittest.main()
