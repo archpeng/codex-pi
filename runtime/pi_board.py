@@ -86,6 +86,12 @@ MAX_CLI_OUTPUT_BYTES = 4096
 QUEUE_STALE_INFLIGHT_SECONDS = 120.0
 MAX_PACKET_CHARS = 3500
 MAX_PACKET_EVENTS = 3
+MAX_PROGRESS_NOTIFICATIONS = 2
+PROGRESS_NOTIFY_INTERVAL_SECONDS = 600.0
+PROGRESS_ANOMALY_SECONDS = 180.0
+MAX_NOTIFY_MILESTONES = 50
+MAX_NOTIFY_ABNORMAL = 50
+PROGRESS_EVENT_KIND = "progress_update"
 DEFAULT_CODEX_BIN = "codex"
 TRANSPORT_OFFLINE = "offline"
 TRANSPORT_CLI_QUEUE = "cli-queue"
@@ -1037,6 +1043,281 @@ def _project_phase_events(card: dict, status: dict, now: float) -> list:
     return added
 
 
+def _phase_progress_budget_seconds() -> float:
+    raw = os.environ.get("CODEX_PI_PROGRESS_NOTIFY_SECONDS")
+    try:
+        value = float(raw) if raw else PROGRESS_NOTIFY_INTERVAL_SECONDS
+    except (TypeError, ValueError):
+        value = PROGRESS_NOTIFY_INTERVAL_SECONDS
+    return value if 0.0 <= value <= 86400.0 else PROGRESS_NOTIFY_INTERVAL_SECONDS
+
+
+def _phase_anomaly_seconds() -> float:
+    raw = os.environ.get("CODEX_PI_PROGRESS_ANOMALY_SECONDS")
+    try:
+        value = float(raw) if raw else PROGRESS_ANOMALY_SECONDS
+    except (TypeError, ValueError):
+        value = PROGRESS_ANOMALY_SECONDS
+    return value if 0.0 <= value <= 86400.0 else PROGRESS_ANOMALY_SECONDS
+
+
+def _phase_candidate_head(status: dict):
+    head = status.get("endHead") or status.get("startHead")
+    return head if isinstance(head, str) else None
+
+
+def _applicable_successful_receipt(status: dict):
+    """A passing receipt hash-bound to the current candidate, or None."""
+    checks = status.get("checks") or {}
+    receipts = checks.get("receipts") or {}
+    item = receipts.get("latestSuccessful")
+    candidate = _phase_candidate_head(status)
+    if not isinstance(item, dict) or candidate is None:
+        return None
+    if item.get("head") != candidate or item.get("dirty") is not False:
+        return None
+    return item
+
+
+def _applicable_failures(status: dict) -> list:
+    """Failed receipts bound to the current candidate (bounded, newest first)."""
+    checks = status.get("checks") or {}
+    receipts = checks.get("receipts") or {}
+    candidate = _phase_candidate_head(status)
+    if candidate is None:
+        return []
+    items = list(receipts.get("failedRecent") or [])
+    latest = receipts.get("latest")
+    if isinstance(latest, dict) and latest.get("failed"):
+        items.append(latest)
+    result, seen = [], set()
+    for item in items:
+        if not isinstance(item, dict) or item.get("head") != candidate \
+                or item.get("dirty") is not False:
+            continue
+        identity = (item.get("id"), item.get("receipt"))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        result.append(item)
+    return result
+
+
+def progress_milestones(status: dict) -> list:
+    """Stable milestone candidates (key, summary, evidence) for one beat.
+
+    Only verified receipts and meaningful check/repair progress with evidence
+    refs qualify. Plain "implementing" narration is deliberately not a
+    milestone and never queues.
+    """
+    phase = status.get("phase") or {}
+    contract = phase.get("contractSha256")
+    candidate = _phase_candidate_head(status)
+    if not contract or candidate is None:
+        return []
+    result = []
+    success = _applicable_successful_receipt(status)
+    if success is not None and not _applicable_failures(status):
+        result.append((
+            f"first_result|{contract}|{candidate}|{success.get('id')}",
+            f"verified check {success.get('id')!r} passed on the current candidate",
+            {"factSource": "verified_receipt", "checkId": success.get("id"),
+             "receipt": success.get("receipt"),
+             "receiptRef": _receipt_ref(status.get("checks") or {}, success)}))
+    progress = status.get("progress") or {}
+    if isinstance(progress, dict) and progress.get("round") == status.get("round") \
+            and progress.get("activity") in ("checking", "repairing") \
+            and (progress.get("completedCriteria") or progress.get("evidenceRefs")):
+        result.append((
+            f"check_{progress.get('activity')}|{contract}|{candidate}",
+            f"pi reports {progress.get('activity')} progress with evidence references",
+            {"factSource": "pi_self_report_unverified",
+             "activity": progress.get("activity"),
+             "completedCriteria": progress.get("completedCriteria") or [],
+             "evidenceRefs": progress.get("evidenceRefs") or [],
+             "step": progress.get("step"), "next": progress.get("next")}))
+    return result
+
+
+def _repair_progress_after(status: dict, since: float) -> bool:
+    progress = status.get("progress") or {}
+    updated = progress.get("updatedAt")
+    if not isinstance(updated, (int, float)) or isinstance(updated, bool) or updated <= since:
+        return False
+    return (progress.get("activity") == "repairing"
+            and bool(progress.get("completedCriteria") or progress.get("evidenceRefs")))
+
+
+def _notify_ledger(card: dict, phase_id: str, contract: str, now: float) -> dict:
+    store = card.get("notify")
+    if not isinstance(store, dict):
+        store = {"schemaVersion": 1, "phases": {}}
+        card["notify"] = store
+    phases = store.setdefault("phases", {})
+    entry = phases.get(phase_id)
+    if not isinstance(entry, dict):
+        entry = {}
+    entry.update({"phaseId": phase_id, "contractSha256": contract,
+                  "count": int(entry.get("count") or 0),
+                  "milestones": entry.get("milestones") if isinstance(entry.get("milestones"), dict) else {},
+                  "abnormal": entry.get("abnormal") if isinstance(entry.get("abnormal"), dict) else {},
+                  "updatedAt": now})
+    phases[phase_id] = entry
+    return entry
+
+
+def _anomaly_milestone(entry: dict, status: dict, now: float, anomaly_seconds: float):
+    """First sustained, unresolved applicable failure -> one bounded echo."""
+    changed = False
+    result = None
+    contract = entry.get("contractSha256")
+    candidate = _phase_candidate_head(status)
+    for item in _applicable_failures(status):
+        key = f"abnormal|{contract}|{candidate}|{item.get('id')}"
+        record = entry["abnormal"].get(key)
+        if not isinstance(record, dict):
+            record = {"firstSeenAt": now, "notifiedAt": None}
+            entry["abnormal"][key] = record
+            changed = True
+        if record.get("notifiedAt"):
+            continue
+        first = record.get("firstSeenAt")
+        if not isinstance(first, (int, float)) or isinstance(first, bool) \
+                or now - first < anomaly_seconds:
+            continue
+        if _repair_progress_after(status, first):
+            continue
+        if result is None:
+            result = (key,
+                      f"check {item.get('id')!r} has an unresolved failure observed for "
+                      f"{int(now - first)}s; pi is expected to be repairing",
+                      {"factSource": "observed_receipt", "checkId": item.get("id"),
+                       "exitCode": item.get("exitCode"),
+                       "timedOut": bool(item.get("timedOut")),
+                       "receipt": item.get("receipt"),
+                       "receiptRef": _receipt_ref(status.get("checks") or {}, item),
+                       "reason": "sustained_anomaly"})
+    if len(entry["abnormal"]) > MAX_NOTIFY_ABNORMAL:
+        ordered = sorted(entry["abnormal"].items(), key=lambda kv: (kv[1] or {}).get("firstSeenAt") or 0)
+        entry["abnormal"] = dict(ordered[-MAX_NOTIFY_ABNORMAL:])
+    return result, changed
+
+
+def maybe_publish_progress(card: dict, status: dict, now=None, interval=None,
+                           anomaly_seconds=None,
+                           max_notifications: int = MAX_PROGRESS_NOTIFICATIONS) -> dict:
+    """Publish at most two bounded phase progress echoes; never a decision event.
+
+    Returns ``{"changed": bool, "created": event|None, "merged": event|None}``.
+    The quota and the last-notification time live on the persisted card and are
+    keyed by phaseId, so rounds, supervisor restarts and repeated refreshes do
+    not reset them. Pause, route pause, offline transport and a candidate
+    without phase identity fail closed (nothing is queued).
+    """
+    now = time.time() if now is None else now
+    interval = _phase_progress_budget_seconds() if interval is None else float(interval)
+    anomaly_seconds = _phase_anomaly_seconds() if anomaly_seconds is None else float(anomaly_seconds)
+    phase = status.get("phase")
+    if not isinstance(phase, dict) or not phase.get("phaseId"):
+        return {"changed": False, "created": None, "merged": None, "reason": "no phase"}
+    if card.get("transport") != TRANSPORT_CLI_QUEUE:
+        return {"changed": False, "created": None, "merged": None,
+                "reason": "transport is not cli-queue"}
+    if status.get("state") not in ACTIVE_STATES:
+        # Terminal delivery is owned by the review/blocked event path, which is
+        # never suppressed by the progress quota; no duplicate progress echo.
+        return {"changed": False, "created": None, "merged": None,
+                "reason": "no active round"}
+    if card.get("paused"):
+        return {"changed": False, "created": None, "merged": None, "reason": "paused"}
+    thread = card.get("ownerThread")
+    if isinstance(thread, str):
+        route_is_paused, problem = route_paused(thread)
+        if problem is not None or route_is_paused:
+            return {"changed": False, "created": None, "merged": None,
+                    "reason": f"route pause {problem or 'active'}"}
+    contract = phase.get("contractSha256")
+    candidate = _phase_candidate_head(status)
+    if not contract or candidate is None:
+        return {"changed": False, "created": None, "merged": None,
+                "reason": "phase contract or candidate unknown"}
+    entry = _notify_ledger(card, phase["phaseId"], contract, now)
+    anomaly, changed = _anomaly_milestone(entry, status, now, anomaly_seconds)
+    milestones = progress_milestones(status)
+    chosen = next(((key, summary, evidence) for key, summary, evidence in milestones
+                   if key not in entry["milestones"]), None)
+    if chosen is None and anomaly is not None and anomaly[0] not in entry["milestones"]:
+        chosen = anomaly
+    if chosen is None:
+        return {"changed": changed, "created": None, "merged": None}
+    key, summary, evidence = chosen
+    evidence_all = {"briefRef": (status.get("evidence") or {}).get("brief"),
+                    "checksRef": (status.get("checks") or {}).get("dir"),
+                    "stateRef": (status.get("evidence") or {}).get("state"),
+                    **evidence}
+    if int(entry.get("count") or 0) >= max_notifications:
+        entry["milestones"][key] = {"at": now, "suppressed": "quota"}
+        entry["updatedAt"] = now
+        return {"changed": True, "created": None, "merged": None,
+                "reason": "notification quota exhausted"}
+    fingerprint = (f"phase:{phase['phaseId']}:contract:{contract}:candidate:{candidate}:"
+                   f"progress:{key}")
+    last = entry.get("lastAt")
+    if isinstance(last, (int, float)) and not isinstance(last, bool) and now - last < interval:
+        merged = None
+        pending = [event for event in pending_events(card)
+                   if event.get("kind") == PROGRESS_EVENT_KIND
+                   and event.get("phaseId") == phase["phaseId"]]
+        if pending:
+            merged = pending[-1]
+            merged["summary"] = _text(summary, MAX_SUMMARY)
+            merged["fingerprint"] = _text(fingerprint, 200)
+            merged["evidence"] = evidence_all
+            merged["candidate"] = {"round": status.get("round"), "head": candidate,
+                                   "state": status.get("state")}
+            merged["updatedAt"] = now
+        entry["milestones"][key] = {"at": now, "merged": bool(merged),
+                                    "suppressedByInterval": True}
+        entry["updatedAt"] = now
+        return {"changed": True, "created": None, "merged": merged,
+                "reason": "merged within the notification interval"}
+    _supersede_phase_kinds(card, now, (PROGRESS_EVENT_KIND,), keep_fingerprint=fingerprint)
+    event = add_event(card, PROGRESS_EVENT_KIND, status.get("round"), fingerprint, summary,
+                      {"round": status.get("round"), "head": candidate,
+                       "state": status.get("state")},
+                      evidence_all,
+                      "No decision is required; this is a bounded progress echo. Re-read the "
+                      "short board for the latest facts and continue.", now)
+    if event is None:
+        entry["milestones"][key] = {"at": now, "deduplicated": True}
+        entry["updatedAt"] = now
+        return {"changed": True, "created": None, "merged": None, "reason": "identity dedup"}
+    event["phaseId"] = phase["phaseId"]
+    event["contractHash"] = contract
+    event["factSource"] = evidence.get("factSource")
+    entry["count"] = int(entry.get("count") or 0) + 1
+    entry["lastAt"] = now
+    entry["milestones"][key] = {"at": now, "eventId": event["id"]}
+    if anomaly is not None and anomaly[0] == key:
+        entry["abnormal"][key]["notifiedAt"] = now
+    if len(entry["milestones"]) > MAX_NOTIFY_MILESTONES:
+        ordered = sorted(entry["milestones"].items(), key=lambda kv: (kv[1] or {}).get("at") or 0)
+        entry["milestones"] = dict(ordered[-MAX_NOTIFY_MILESTONES:])
+    entry["updatedAt"] = now
+    return {"changed": True, "created": event, "merged": None}
+
+
+def _notify_view(card: dict):
+    store = card.get("notify")
+    if not isinstance(store, dict):
+        return None
+    phases = store.get("phases") or {}
+    return {phase_id: {"count": entry.get("count"), "lastAt": entry.get("lastAt"),
+                       "milestones": len(entry.get("milestones") or {}),
+                       "abnormal": len(entry.get("abnormal") or {})}
+            for phase_id, entry in list(phases.items())[:5] if isinstance(entry, dict)}
+
+
 def project_events(card: dict, status: dict, now: float) -> list:
     """Actionable facts only; phase contracts suppress local/self-repairable check events."""
     phase = status.get("phase")
@@ -1141,6 +1422,11 @@ def refresh_with_status(board_file, task_id: str, status: dict, now=None, block:
         if isinstance(card.get("phase"), dict) and _supersede_stale_phase_events(card, now):
             changed = True
         added = project_events(card, status, now)
+        progress = maybe_publish_progress(card, status, now)
+        if progress.get("created") is not None:
+            added.append(progress["created"])
+        if progress.get("changed"):
+            changed = True
         _update_overflow(card, now)
         changed = changed or bool(added)
         if changed:
@@ -1638,6 +1924,7 @@ def compact_card(card: dict, max_events: int = 5) -> dict:
         "pauseNote": card.get("pauseNote"), "pi": card.get("pi"),
         "phase": card.get("phase"), "progress": card.get("progress"),
         "evidence": card.get("evidence"), "check": card.get("check"),
+        "progressNotify": _notify_view(card),
         "attention": card.get("attention"), "codex": card.get("codex"),
         "pendingEvents": [compact_event(event) for event in pending[:max_events]],
         "pendingCount": len(pending),

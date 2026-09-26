@@ -46,10 +46,15 @@ python3 /absolute/plugin/runtime/pi_board.py decide --repo REPO --task TASK --ev
 
 Ordinary progress is self-report only, never a check receipt and never a queue message. Readiness
 compares the exact contract with real `pi_check` receipts bound to the candidate; missing, failed,
-skipped or unknown evidence is never ready. Running self-repairable check failures/timeouts stay
+skipped or unknown evidence is never ready (scope coverage is complete with a bounded cap, and
+`forbidSkip`/`minRun` need parseable counts). Running self-repairable check failures/timeouts stay
 local. A normally completed round with only mechanically missing evidence may be continued once in
 the same session/worktree/budget (quota persisted per phase); the second shortfall, a real design
-question or an unknown start escalates. `accept` binds phase, contract and candidate; a different
+question or an unknown start escalates. A phase also emits at most two bounded non-blocking
+progress echoes (default 10 minutes apart, persisted per `phaseId`) for verified receipts or
+evidence-bearing check/repair milestones; ordinary progress, repeated writes and "still alive"
+never queue. A recorded user pause blocks progress echoes, auto-continuation and explicit
+`continue` until an explicit resume. `accept` binds phase, contract and candidate; a different
 phase requires the previous one accepted on the board and no conflicting worker. Tasks without a
 contract keep the legacy review path. See
 [docs/validation/phase-autonomy-o1-20260926.md](../../docs/validation/phase-autonomy-o1-20260926.md)

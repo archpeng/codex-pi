@@ -33,8 +33,13 @@ from pathlib import Path
 import re
 import signal
 import subprocess
+import sys
 import time
 import uuid
+
+# The frozen helper snapshot is immutable evidence: never write bytecode caches
+# into the task tools directory.
+sys.dont_write_bytecode = True
 
 from pi_size import measure
 from pi_task import atomic, terminate

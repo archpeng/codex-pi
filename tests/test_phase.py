@@ -16,6 +16,7 @@ import time
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
 from runtime_helpers import (RUNTIME, Repo, base_env, cleanup_repos, cli_json, default_config,
                              run_cli)
@@ -317,21 +318,21 @@ class PhaseTest(unittest.TestCase):
             frozen_task = repo.task_dir("progress-task") / "tools" / "pi_task.py"
             proc = subprocess.run(
                 [sys.executable, str(frozen_task), "progress", "--repo", str(worktree),
-                 "--task", "progress-task", "--round", "1", "--activity", "checking",
+                 "--task", "progress-task", "--round", "1", "--activity", "implementing",
                  "--step", "implemented the parser", "--completed-criteria", "A1",
                  "--next", "run the acceptance check", "--evidence-ref", "runtime/pi_task.py"],
                 capture_output=True, text=True, env=env, timeout=60)
             self.assertEqual(proc.returncode, 0, proc.stderr)
-            self.assertEqual(json.loads(proc.stdout)["activity"], "checking")
+            self.assertEqual(json.loads(proc.stdout)["activity"], "implementing")
             progress_file = repo.task_dir("progress-task") / "rounds" / "1" / "progress.json"
             stored = json.loads(progress_file.read_text(encoding="utf-8"))
-            self.assertEqual(stored["activity"], "checking")
+            self.assertEqual(stored["activity"], "implementing")
             self.assertEqual(stored["completedCriteria"], ["A1"])
             self.assertEqual(stored["reportedBy"], "pi")
             self.assertFalse(stored["verified"])
             status = cli_json("status", "--repo", str(repo.root), "--task", "progress-task",
                               env=env)
-            self.assertEqual(status["progress"]["activity"], "checking")
+            self.assertEqual(status["progress"]["activity"], "implementing")
             self.assertEqual(status["progress"]["completedCriteria"], ["A1"])
             # Ordinary progress produces no event and no queue message.
             first = self.refresh(repo, "progress-task", env)
@@ -340,13 +341,24 @@ class PhaseTest(unittest.TestCase):
             self.assertFalse(self.fake_marker.exists(),
                              "ordinary progress must never invoke the queue CLI")
             revision = json.loads((repo.state_dir / "board.json").read_text(encoding="utf-8"))["revision"]
+            # A repairing update with evidence is a real milestone; it may
+            # notify once, but repeating the identical write must not queue a
+            # second time and refresh itself never dispatches.
             run_cli("progress", "--repo", str(worktree), "--task", "progress-task",
                     "--activity", "repairing", "--next", "retry the check", "--blocker", "",
                     env=env, expect=0)
             self.refresh(repo, "progress-task", env)
             self.assertGreater(json.loads((repo.state_dir / "board.json").read_text(encoding="utf-8"))["revision"],
                                revision)
-            self.assertEqual(self.pending(repo, "progress-task"), [])
+            milestones = self.pending(repo, "progress-task", "progress_update")
+            self.assertEqual(len(milestones), 1)
+            run_cli("progress", "--repo", str(worktree), "--task", "progress-task",
+                    "--activity", "repairing", "--next", "retry the check", "--blocker", "",
+                    env=env, expect=0)
+            self.refresh(repo, "progress-task", env)
+            self.assertEqual(len(self.pending(repo, "progress-task", "progress_update")), 1)
+            self.assertEqual(len(self.pending(repo, "progress-task")), 1,
+                             "repeated identical milestones must not add events")
             self.assertFalse(self.fake_marker.exists())
             # Invalid input is refused without touching evidence.
             before = progress_file.read_bytes()
@@ -613,6 +625,206 @@ class PhaseTest(unittest.TestCase):
         finally:
             repo.cancel("quota-task", env=env)
             repo.wait_terminal("quota-task", env=env, timeout=25)
+
+    def test_scope_check_covers_all_changed_files_beyond_a_prefix(self):
+        repo, worktree = self.make()
+        env = self.h_env(PI_DOUBLE_MODE="delay-ok", PI_DOUBLE_DELAY="6")
+        sha = self.write_design(repo)
+        path = self.write_contract("p.json", self.contract(repo, "P-501", design_sha=sha,
+                                                           scope=["docs/"]))
+        self.start(repo, worktree, "scope-501", path, env)
+        repo.wait_round_state("scope-501", "running")
+        # 500 sorted in-scope files plus one out-of-scope file that sorts after
+        # them: a prefix-only check would miss the violation.
+        docs = worktree / "docs"
+        docs.mkdir(parents=True, exist_ok=True)
+        for index in range(500):
+            (docs / f"f{index:04d}.txt").write_text("x\n", encoding="utf-8")
+        (worktree / "zzz-outside.txt").write_text("outside\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(worktree), "add", "-A"], check=True,
+                       capture_output=True)
+        subprocess.run(["git", "-C", str(worktree), "-c", "user.email=t@e.invalid",
+                        "-c", "user.name=T", "commit", "-qm", "many files"], check=True,
+                       capture_output=True)
+        repo.wait_terminal("scope-501")
+        readiness = cli_json("readiness", "--repo", str(repo.root), "--task", "scope-501",
+                             "--round", "1", env=env)
+        self.assertEqual(readiness["scope"]["status"], "violation")
+        self.assertIn("zzz-outside.txt", readiness["scope"]["outOfScope"])
+        self.assertEqual(readiness["status"], "not_ready")
+        self.assertFalse(readiness["readyForReview"])
+        self.register(repo, "scope-501", env)
+        self.refresh(repo, "scope-501", env)
+        self.assertEqual(self.pending(repo, "scope-501", "review_required"), [])
+        blocked = self.pending(repo, "scope-501", "phase_blocked")
+        self.assertEqual(len(blocked), 1)
+        self.assertEqual(blocked[0]["evidence"]["reason"], "scope_violation")
+
+    def test_scope_check_overflow_is_unknown_and_blocks_ready(self):
+        repo, worktree = self.make()
+        env = self.h_env(PI_DOUBLE_MODE="delay-ok", PI_DOUBLE_DELAY="6")
+        sha = self.write_design(repo)
+        path = self.write_contract("p.json", self.contract(repo, "P-CAP", design_sha=sha,
+                                                           scope=["."]))
+        self.start(repo, worktree, "scope-cap", path, env)
+        repo.wait_round_state("scope-cap", "running")
+        docs = worktree / "docs"
+        docs.mkdir(parents=True, exist_ok=True)
+        for index in range(pi_task.MAX_SCOPE_DIFF_FILES + 10):
+            (docs / f"c{index:05d}.txt").write_text("x\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(worktree), "add", "-A"], check=True,
+                       capture_output=True)
+        subprocess.run(["git", "-C", str(worktree), "-c", "user.email=t@e.invalid",
+                        "-c", "user.name=T", "commit", "-qm", "overflow files"], check=True,
+                       capture_output=True)
+        candidate = self.head(worktree)
+        checks = repo.task_dir("scope-cap") / "rounds" / "1" / "round.checks"
+        self.synth_receipt(checks, "A1", 0, candidate)
+        repo.wait_terminal("scope-cap")
+        readiness = cli_json("readiness", "--repo", str(repo.root), "--task", "scope-cap",
+                             "--round", "1", env=env)
+        self.assertEqual(readiness["scope"]["status"], "unknown")
+        self.assertIn("bounded scope check", readiness["scope"]["reason"])
+        self.assertEqual(readiness["status"], "unknown")
+        self.assertFalse(readiness["readyForReview"])
+
+    def test_forbid_skip_requires_parseable_counts(self):
+        repo, worktree = self.make()
+        env = self.h_env(PI_DOUBLE_MODE="delay-ok", PI_DOUBLE_DELAY="4")
+        sha = self.write_design(repo)
+        items = [
+            {"id": "A1", "description": "counted tests", "command": "go test ./...",
+             "passCondition": "exit 0 and zero skips", "evidence": "receipt",
+             "forbidSkip": True},
+            {"id": "A2", "description": "non-test check", "command": "git diff --check",
+             "passCondition": "exit 0", "evidence": "receipt"},
+        ]
+        path = self.write_contract("p.json", self.contract(repo, "P-COUNTS", design_sha=sha,
+                                                            items=items))
+        self.start(repo, worktree, "counts-task", path, env)
+        repo.wait_round_state("counts-task", "running")
+        candidate = self.head(worktree)
+        checks = repo.task_dir("counts-task") / "rounds" / "1" / "round.checks"
+        self.synth_receipt(checks, "A1", 0, candidate)  # no parseable counts
+        self.synth_receipt(checks, "A2", 0, candidate)  # non-test command, no counts needed
+        repo.wait_terminal("counts-task")
+        readiness = cli_json("readiness", "--repo", str(repo.root), "--task", "counts-task",
+                             "--round", "1", env=env)
+        by_id = {item["id"]: item for item in readiness["items"]}
+        self.assertEqual(by_id["A1"]["status"], "unknown")
+        self.assertIn("counts", by_id["A1"]["reason"])
+        self.assertEqual(by_id["A2"]["status"], "covered")
+        self.assertEqual(readiness["status"], "not_ready")
+        self.assertEqual(self.rounds(repo, "counts-task"), [1],
+                         "unverifiable counts must not auto-continue")
+
+    def test_explicit_continue_is_blocked_while_paused(self):
+        repo, worktree = self.make()
+        env = self.h_env(PI_DOUBLE_MODE="ok")
+        self.start(repo, worktree, "pause-continue", None, env)
+        self.wait_terminal(repo, "pause-continue")
+        self.register(repo, "pause-continue", env)
+        board_json("pause", "--repo", str(repo.root), "--task", "pause-continue",
+                   "--note", "user paused", env=env)
+        proc = run_cli("continue", "--repo", str(repo.root), "--task", "pause-continue",
+                       "--prompt", "more", env=env, expect=2)
+        self.assertIn("paused", proc.stderr)
+        self.assertEqual(len(self.rounds(repo, "pause-continue")), 1)
+        board_json("resume", "--repo", str(repo.root), "--task", "pause-continue", env=env)
+        run_cli("continue", "--repo", str(repo.root), "--task", "pause-continue",
+                "--prompt", "more", env=env, expect=0)
+        repo.wait_terminal("pause-continue", round=2)
+        self.assertEqual(len(self.rounds(repo, "pause-continue")), 2)
+
+    def test_explicit_continue_is_blocked_by_a_route_pause(self):
+        repo, worktree = self.make()
+        env = self.h_env(PI_DOUBLE_MODE="ok")
+        os.environ["CODEX_PI_HANDOFF_ROOT"] = str(self.tmp / "handoffs")
+        self.addCleanup(os.environ.pop, "CODEX_PI_HANDOFF_ROOT", None)
+        self.start(repo, worktree, "route-continue", None, env)
+        self.wait_terminal(repo, "route-continue")
+        self.register(repo, "route-continue", env, transport="cli-queue", thread=THREAD_A)
+        pi_board.pause_route(THREAD_A, now=time.time())
+        proc = run_cli("continue", "--repo", str(repo.root), "--task", "route-continue",
+                       "--prompt", "more", env=env, expect=2)
+        self.assertIn("paused", proc.stderr)
+        self.assertEqual(len(self.rounds(repo, "route-continue")), 1)
+        pi_board.resume_route(THREAD_A)
+        run_cli("continue", "--repo", str(repo.root), "--task", "route-continue",
+                "--prompt", "more", env=env, expect=0)
+        repo.wait_terminal("route-continue", round=2)
+
+    def test_late_pause_between_claim_and_start_fails_closed(self):
+        repo, worktree = self.make()
+        env = self.h_env(PI_DOUBLE_MODE="hang")
+        sha = self.write_design(repo)
+        path = self.write_contract("p.json", self.contract(repo, "P-LATE", design_sha=sha))
+        self.start(repo, worktree, "late-pause", path, env)
+        repo.wait_round_state("late-pause", "running")
+        # Registering creates the board whose lock the start decision now holds;
+        # the mocked pause check reports "not paused" for the decision and
+        # "late pause" for the locked re-check.
+        self.register(repo, "late-pause", env)
+        task_dir = repo.task_dir("late-pause")
+        round_dir = task_dir / "rounds" / "1"
+        task = json.loads((task_dir / "task.json").read_text(encoding="utf-8"))
+        head = self.head(worktree)
+        round_state = json.loads((round_dir / "round.state.json").read_text(encoding="utf-8"))
+        round_state.update({"state": "completed", "exitCode": 0, "endHead": head,
+                            "endedAt": time.time(), "timedOut": False, "cancelled": False})
+        (round_dir / "round.state.json").write_text(json.dumps(round_state), encoding="utf-8")
+        try:
+            with mock.patch.object(pi_task, "board_pause_active",
+                                   side_effect=[(False, None), (True, "late pause")]) as pause:
+                result = pi_task.post_round_phase(task, task_dir, 1, round_dir,
+                                                  {"exitCode": 0, "endHead": head,
+                                                   "endedAt": time.time()}, "completed")
+            self.assertIsNone(result, "a late pause must not start the continuation")
+            self.assertEqual(pause.call_count, 2)
+            self.assertFalse((task_dir / "rounds" / "2").exists())
+            ledger = self.phase_auto(repo, "late-pause")
+            self.assertEqual(ledger["P-LATE"]["status"], "blocked")
+            self.assertEqual(ledger["P-LATE"]["reason"], "paused")
+            state = self.phase_state(repo, "late-pause")
+            self.assertEqual(state["lastDecision"]["reason"], "paused")
+        finally:
+            repo.cancel("late-pause", env=env)
+            repo.wait_terminal("late-pause", env=env, timeout=25)
+
+    def test_unavailable_pause_lock_fails_closed(self):
+        repo, worktree = self.make()
+        env = self.h_env(PI_DOUBLE_MODE="hang")
+        sha = self.write_design(repo)
+        path = self.write_contract("p.json", self.contract(repo, "P-LOCK", design_sha=sha))
+        self.start(repo, worktree, "pause-lock", path, env)
+        repo.wait_round_state("pause-lock", "running")
+        self.register(repo, "pause-lock", env)
+        task_dir = repo.task_dir("pause-lock")
+        round_dir = task_dir / "rounds" / "1"
+        task = json.loads((task_dir / "task.json").read_text(encoding="utf-8"))
+        head = self.head(worktree)
+        round_state = json.loads((round_dir / "round.state.json").read_text(encoding="utf-8"))
+        round_state.update({"state": "completed", "exitCode": 0, "endHead": head,
+                            "endedAt": time.time(), "timedOut": False, "cancelled": False})
+        (round_dir / "round.state.json").write_text(json.dumps(round_state), encoding="utf-8")
+        import fcntl
+        lock_path = repo.state_dir / "board.lock"
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            result = pi_task.post_round_phase(task, task_dir, 1, round_dir,
+                                              {"exitCode": 0, "endHead": head,
+                                               "endedAt": time.time()}, "completed")
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+        self.assertIsNone(result, "an unverifiable pause state must not start a continuation")
+        self.assertFalse((task_dir / "rounds" / "2").exists())
+        ledger = self.phase_auto(repo, "pause-lock")
+        self.assertEqual(ledger["P-LOCK"]["status"], "blocked")
+        self.assertEqual(ledger["P-LOCK"]["reason"], "pause_state_unknown")
+        repo.cancel("pause-lock", env=env)
+        repo.wait_terminal("pause-lock", env=env, timeout=25)
 
     # ------------------------------------------------------------------
     # O1-6 acceptance gate and stale evidence

@@ -11,6 +11,11 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import sys
+
+# The frozen helper snapshot is immutable evidence: never write bytecode caches
+# into the task tools directory.
+sys.dont_write_bytecode = True
 
 from pi_size import sanitize_snapshot
 

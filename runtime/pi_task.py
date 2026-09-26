@@ -25,9 +25,14 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
+
+# The frozen helper snapshot is immutable evidence: never write bytecode caches
+# into the task tools directory. Must run before the local imports below.
+sys.dont_write_bytecode = True
 
 import pi_phase
 from pi_phase import contract_hash, contract_view, load_contract, validate_contract
@@ -60,6 +65,7 @@ MAX_PROGRESS_ITEMS = 100
 MAX_PROGRESS_REFS = 20
 MAX_READINESS_ITEMS = 100
 MAX_VERIFY_LOG_BYTES = 33_554_432
+MAX_SCOPE_DIFF_FILES = 600
 MIN_AUTO_CONTINUE_SECONDS = 60.0
 FULL_OID_RE = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\Z")
 PHASE_TERMINAL_STATES = ("completed", "failed", "timed_out", "cancelled", "interrupted")
@@ -866,6 +872,29 @@ def _scope_allows(path: str, scope) -> bool:
     return False
 
 
+def _stop_bounded_process(proc: subprocess.Popen) -> None:
+    """Stop an owned diff reader without failing on an already-reaped leader.
+
+    Darwin can raise EPERM from ``killpg`` when the group leader is a zombie;
+    reaping the child and re-checking the group keeps this bounded stop safe
+    for the scope guard and other short-lived readers.
+    """
+    if proc.poll() is not None:
+        proc.wait()
+        return
+    try:
+        terminate(proc)
+    except PermissionError:
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            proc.wait()
+
+
 def _scope_check(task_dir: Path, record: dict, candidate: str | None) -> dict:
     result = {"status": "unknown", "baselineCommit": record.get("baselineCommit"),
               "changedFiles": [], "outOfScope": [], "reason": None}
@@ -875,17 +904,53 @@ def _scope_check(task_dir: Path, record: dict, candidate: str | None) -> dict:
         return result
     task = read_json(task_dir / "task.json", {}) or {}
     worktree = Path(task.get("worktree", "."))
+    argv = ["git", "-C", str(worktree), "diff", "--name-only", f"{baseline}..{candidate}"]
     try:
-        proc = subprocess.run(["git", "-C", str(worktree), "diff", "--name-only",
-                               f"{baseline}..{candidate}"], stdin=subprocess.DEVNULL,
-                              capture_output=True, text=True, timeout=10, shell=False)
-    except (OSError, subprocess.SubprocessError) as exc:
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True, start_new_session=True)
+    except OSError as exc:
         result["reason"] = f"git diff unavailable: {exc}"
         return result
-    if proc.returncode != 0:
-        result["reason"] = f"git diff exited {proc.returncode}"
+    files = []
+    overflow = threading.Event()
+
+    def reader():
+        try:
+            for line in proc.stdout:  # type: ignore[union-attr]
+                path = line.strip()
+                if not path:
+                    continue
+                if len(files) >= MAX_SCOPE_DIFF_FILES:
+                    overflow.set()
+                    continue
+                files.append(path)
+        except (OSError, ValueError):
+            overflow.set()
+
+    thread = threading.Thread(target=reader, daemon=True)
+    thread.start()
+    thread.join(timeout=10)
+    if thread.is_alive():
+        _stop_bounded_process(proc)
+        result["reason"] = "git diff did not finish within the bounded timeout"
         return result
-    files = [line.strip() for line in proc.stdout.splitlines() if line.strip()][:500]
+    if overflow.is_set():
+        _stop_bounded_process(proc)
+        result.update({
+            "changedFiles": files[:100], "status": "unknown",
+            "reason": f"the change set exceeds the bounded scope check "
+                      f"(>= {MAX_SCOPE_DIFF_FILES} files); scope is unknown, so readiness is blocked "
+                      "instead of checking only a sorted prefix"})
+        return result
+    try:
+        returncode = proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        _stop_bounded_process(proc)
+        result["reason"] = "git diff did not finish within the bounded timeout"
+        return result
+    if returncode != 0:
+        result["reason"] = f"git diff exited {returncode}"
+        return result
     scope = (record.get("contract") or {}).get("scope") or []
     out = [path for path in files if not _scope_allows(path, scope)]
     result.update({"changedFiles": files[:100], "outOfScope": out[:100],
@@ -1006,12 +1071,22 @@ def build_readiness(task_dir: Path, task: dict, round_number: int) -> dict:
             elif counts and counts.get("fail"):
                 entry.update(status="failed", reason=f"test counts report {counts.get('fail')} "
                                                       "failures")
-            elif spec.get("forbidSkip") and counts and counts.get("skip"):
-                entry.update(status="skipped", reason=f"test counts report {counts.get('skip')} "
-                                                       "skips")
-            elif spec.get("minRun") is not None and (not counts or counts.get("run", 0) < spec["minRun"]):
-                entry.update(status="failed", reason=
-                             f"test counts report fewer than minRun={spec['minRun']} runs")
+            elif spec.get("forbidSkip"):
+                if not isinstance(counts, dict) or "skip" not in counts:
+                    entry.update(status="unknown", reason=
+                                 "skip-freedom cannot be verified: the receipt has no parseable "
+                                 "test counts (declare forbidSkip only for count-emitting runners)")
+                elif counts.get("skip"):
+                    entry.update(status="skipped", reason=f"test counts report {counts.get('skip')} "
+                                                           "skips")
+            elif spec.get("minRun") is not None:
+                if not isinstance(counts, dict) or "run" not in counts:
+                    entry.update(status="unknown", reason=
+                                 "minRun cannot be verified: the receipt has no parseable test "
+                                 "counts")
+                elif counts.get("run", 0) < spec["minRun"]:
+                    entry.update(status="failed", reason=
+                                 f"test counts report fewer than minRun={spec['minRun']} runs")
             else:
                 entry.update(status="covered", reason="applicable passing receipt")
         items.append(entry)
@@ -1331,7 +1406,11 @@ def write_brief(path: Path, text: str) -> str:
 
 
 def worker_env() -> dict:
-    return os.environ.copy()
+    env = os.environ.copy()
+    # The frozen helper snapshot is immutable evidence: never let bytecode
+    # caches appear in the task tools directory while a worker runs.
+    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+    return env
 
 
 def spawn_worker(task_dir: Path, round_number: int, lock_fd_value: int, timeout_seconds: float) -> None:
@@ -1410,6 +1489,30 @@ def finish_round(task_dir: Path, round_number: int, round_dir: Path, task: dict,
         atomic(round_dir / "round.state.json", state)
 
 
+def _board_pause_lock(task: dict):
+    """Hold the board lock when a board exists, so a concurrent pause cannot
+    interleave with the auto-continuation start decision.
+
+    Returns ``(fd, board_path, problem)``: ``fd`` is None for an offline task
+    or when the lock could not be acquired (then ``problem`` is set and the
+    caller must fail closed).
+    """
+    common = task.get("commonDir") if isinstance(task, dict) else None
+    if not isinstance(common, str):
+        return None, None, None
+    board = Path(common) / "codex-pi" / "board.json"
+    if not board.is_file():
+        return None, None, None
+    try:
+        from pi_board import BOARD_LOCK
+    except Exception as exc:  # noqa: BLE001 - fail closed when the lock identity is unknown
+        return None, board, f"board lock identity unavailable: {type(exc).__name__}: {exc}"
+    try:
+        return lock_fd(board.with_name(BOARD_LOCK), blocking=True, timeout=5), board, None
+    except LockHeld:
+        return None, board, "board lock was held; pause state is unknown"
+
+
 def post_round_phase(task: dict, task_dir: Path, round_number: int, round_dir: Path,
                     state: dict, outcome: str):
     """Decide review/escalate/auto-continue after one finished round.
@@ -1466,20 +1569,44 @@ def post_round_phase(task: dict, task_dir: Path, round_number: int, round_dir: P
                       exhaustedReason="second round still missing required evidence")
         write_phase_state(task_dir, phase_state)
         return None
-    next_number = round_number + 1
-    try:
-        prompt = compose_gap_prompt(task, record, decision.get("gaps") or [])
-        prior = {"round": round_number, "state": outcome, "exitCode": state.get("exitCode"),
-                 "endHead": state.get("endHead")}
-        ensure_round_inputs(task_dir, next_number, prompt, task, prior)
-    except Exception as exc:  # noqa: BLE001 - unknown start must escalate, never retry
-        mark_auto("unknown", startError=f"{type(exc).__name__}: {exc}")
+    # Fail closed on a pause that arrived between the decision read and the
+    # start. The board lock is held across the final pause check and the round
+    # creation, so an explicit pause is either already visible here or is
+    # serialized after the start (existing pause/cancel semantics then apply).
+    board_lock, board_path, lock_problem = _board_pause_lock(task)
+    if lock_problem:
+        mark_auto("blocked", blockedAt=time.time(), reason="pause_state_unknown",
+                  detail=lock_problem)
+        phase_state["lastDecision"] = {"action": "escalate", "reason": "pause_state_unknown",
+                                        "at": time.time()}
         write_phase_state(task_dir, phase_state)
         return None
-    mark_auto("started", startedAt=time.time())
-    write_phase_state(task_dir, phase_state)
-    return {"round": next_number, "timeoutSeconds": decision.get("timeoutSeconds"),
-            "decision": decision}
+    try:
+        if board_path is not None:
+            paused_now, pause_reason = board_pause_active(task)
+            if paused_now:
+                mark_auto("blocked", blockedAt=time.time(), reason="paused", detail=pause_reason)
+                phase_state["lastDecision"] = {"action": "escalate", "reason": "paused",
+                                                "at": time.time()}
+                write_phase_state(task_dir, phase_state)
+                return None
+        next_number = round_number + 1
+        try:
+            prompt = compose_gap_prompt(task, record, decision.get("gaps") or [])
+            prior = {"round": round_number, "state": outcome, "exitCode": state.get("exitCode"),
+                     "endHead": state.get("endHead")}
+            ensure_round_inputs(task_dir, next_number, prompt, task, prior)
+        except Exception as exc:  # noqa: BLE001 - unknown start must escalate, never retry
+            mark_auto("unknown", startError=f"{type(exc).__name__}: {exc}")
+            write_phase_state(task_dir, phase_state)
+            return None
+        mark_auto("started", startedAt=time.time())
+        write_phase_state(task_dir, phase_state)
+        return {"round": next_number, "timeoutSeconds": decision.get("timeoutSeconds"),
+                "decision": decision}
+    finally:
+        if board_lock is not None:
+            os.close(board_lock)
 
 
 def run_worker(args) -> int:
@@ -1801,6 +1928,10 @@ def cmd_continue(args) -> dict:
                 time.sleep(0.05)
         if lock_is_held(task_dir / ".supervisor.lock"):
             raise ValueError("supervisor lease is still held; task is not terminal-known")
+        paused, pause_reason = board_pause_active(frozen)
+        if paused:
+            raise ValueError(f"task handoff is paused ({pause_reason}); an explicit pi_board resume "
+                             "is required before continuing")
         rounds = list_rounds(task_dir)
         if not rounds:
             raise ValueError(f"task {task!r} has no completed round; do not continue an unknown run")
