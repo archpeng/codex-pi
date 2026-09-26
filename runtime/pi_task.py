@@ -1269,6 +1269,7 @@ def _scan_checks(checks_dir: Path) -> dict:
         entry = {"source": source, "name": name, "path": snapshot.get("path"),
                  "maxBytes": snapshot.get("maxBytes"), "observedBytes": snapshot.get("observedBytes"),
                  "breached": bool(snapshot.get("breached")), "unknown": bool(snapshot.get("unknown")),
+                 "breachBasis": snapshot.get("breachBasis"),
                  "reason": snapshot.get("reason")}
         if entry["breached"]:
             guard["breached"] = True

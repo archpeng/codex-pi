@@ -221,6 +221,9 @@ def sanitize_snapshot(value, path_limit: int = MAX_PATH_TEXT):
     stopped = value.get("stopped_child")
     if isinstance(stopped, bool):
         out["stoppedChild"] = stopped
+    basis = value.get("breach_basis")
+    if isinstance(basis, str) and basis in ("complete", "partial lower bound"):
+        out["breachBasis"] = basis
     interval = value.get("health_interval_seconds")
     if isinstance(interval, (int, float)) and not isinstance(interval, bool) \
             and 0 < float(interval) <= 3600:

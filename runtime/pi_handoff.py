@@ -757,6 +757,13 @@ def handle_interrupt(session: str, event: dict) -> dict:
     atomic(session_marker_path(root, session),
            {"schemaVersion": SCHEMA_VERSION, "sessionId": session, "suspendedAt": time.time(),
             "generation": generation, "turnId": bounded(event.get("turn_id") or "", 200)})
+    # Persist the same interruption for the opt-in board gate/claims: only an
+    # explicit resume may clear it, and normal prompts/SessionStart never do.
+    try:
+        from pi_board import pause_session
+        pause_session(session, "user interrupted this Codex session")
+    except Exception:  # noqa: BLE001 - the handoff path must never crash on this
+        pass
     deadline = time.monotonic() + INTERRUPT_BUDGET_SECONDS
     for key, raw in session_binding_records(root, session):
         if time.monotonic() >= deadline:

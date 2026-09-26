@@ -58,6 +58,7 @@ class Guard:
         self.stopped_child = False
         self.child_exit_code = None
         self.reason = None
+        self.breach_basis = None
         self.preflight = None
         self.first_breach = None
         self.last = None
@@ -79,14 +80,19 @@ class Guard:
         self.last = measurement
         if preflight:
             self.preflight = measurement
-        if measurement.get("complete") and not measurement.get("unknown") \
-                and measurement.get("bytes") is not None \
-                and measurement["bytes"] > self.max_bytes:
+        # A bounded/incomplete walk still yields a lower bound: if that known
+        # lower bound already exceeds the cap, exceeding the cap is proven and
+        # the owned check must stop even though the full size stays unknown.
+        observed = measurement.get("bytes")
+        if isinstance(observed, int) and not isinstance(observed, bool) and observed > self.max_bytes:
+            complete = bool(measurement.get("complete")) and not measurement.get("unknown")
             self.breached = True
+            self.breach_basis = "complete" if complete else "partial lower bound"
             if self.first_breach is None:
                 self.first_breach = measurement
-            self.reason = (f"observed {measurement['bytes']} bytes under {self.path} exceed "
-                           f"the declared max_bytes {self.max_bytes}")
+            self.reason = (f"observed at least {observed} bytes under {self.path} exceed "
+                           f"the declared max_bytes {self.max_bytes}"
+                           + ("" if complete else " (partial lower bound; full size unknown)"))
         return measurement
 
     def snapshot(self) -> dict:
@@ -96,6 +102,7 @@ class Guard:
             "max_bytes": self.max_bytes,
             "observed_bytes": last.get("bytes"),
             "breached": self.breached,
+            "breach_basis": self.breach_basis,
             "unknown": bool(last.get("unknown")),
             "complete": bool(last.get("complete")),
             "reason": self.reason or last.get("reason"),

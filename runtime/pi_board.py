@@ -11,17 +11,20 @@ Roles are explicit commands, not a permission framework:
     write the opt-in automation gate record;
   * ``refresh``   -- Pi/runner (and hook recovery): project real bounded status
     into the card and publish deduplicated attention events;
-  * ``decide``    -- main only: handle one exact event and record an explicit
-    accepted/rejected/changes_requested decision bound to its candidate;
+  * ``decide``    -- main only: handle one exact event with an explicit
+    accepted/rejected/changes_requested/resolved decision bound to its
+    candidate; ``accepted`` is only for a review event with a real candidate
+    commit and never for a fault;
   * ``pause``/``resume`` -- main: explicit persisted control state;
   * ``show``/``packet`` -- bounded compact reads for the selected owner;
   * ``gate``      -- pre-model UserPromptSubmit filter for one exact registered
     automatic tick.
 
-Reading or delivering an event does not handle or accept it. ``accepted`` is
-only ever written by an explicit ``decide --decision accept``; a zero exit code
-is never acceptance. Corrupt, missing or oversized state is reported as unknown,
-never as "unchanged".
+Reading or delivering an event does not handle or accept it. Delivery uses a
+small expiring claim (leases), so a lost host turn is retried after a bounded
+interval while an in-flight claim stays quiet. Unhandled events are never
+discarded; a bounded write overflow is refused explicitly instead of silently
+dropping pending work.
 
 This module never invokes the Codex CLI, starts a model or spawns a watcher.
 """
@@ -51,26 +54,42 @@ BOARD_DIR = "codex-pi"
 BOARD_FILE = "board.json"
 BOARD_LOCK = "board.lock"
 MONITOR_LOG = "board-monitor.log"
+MONITOR_FILE = "board.monitor.json"
+MONITOR_LOCK = "board.monitor.lock"
 MAX_BOARD_BYTES = 262_144
 MAX_MONITOR_LOG_BYTES = 65_536
-MAX_EVENTS_PER_CARD = 50
+MAX_MONITOR_BYTES = 65_536
+MAX_HANDLED_EVENTS = 20
+MAX_HANDLED_IDS = 1000
+MAX_PENDING_DISPLAY = 50
 MAX_SUMMARY = 300
 MAX_NOTE = 300
+MAX_MONITORS = 200
 REFRESH_INTERVAL_SECONDS = 15.0
+MONITOR_LEASE_SECONDS = 90.0
 EVENT_ID_RE = re.compile(r"[0-9a-f]{64}\Z")
 HEAD_RE = re.compile(r"[0-9a-fA-F]{7,64}\Z")
 SESSION_RE = re.compile(r"[^\x00-\x1f\x7f]{1,200}\Z")
 AUTOMATION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,99}\Z")
-DECISIONS = {"accept": "accepted", "reject": "rejected", "changes_requested": "changes_requested"}
+DECISIONS = {"accept": "accepted", "reject": "rejected",
+             "changes_requested": "changes_requested", "resolve": "resolved"}
+REVIEW_KINDS = ("review_required",)
+FAULT_KINDS = ("check_timeout", "task_timeout", "resource_breach", "ownership_unknown",
+               "ownership_lingering", "monitor_stale")
 GATE_DIR = "gates"
 GATE_SCHEMA_VERSION = 1
 MAX_GATE_BYTES = 32_768
 AUDIT_FILE = "gate-audit.jsonl"
 MAX_AUDIT_BYTES = 262_144
-DELIVERED_LIMIT = 100
+CLAIM_LIMIT = 200
+GATE_CLAIM_SECONDS = 300.0
 STOP_MODES = ("continue", "block")
-INSTRUCTIONS_TEMPLATE = "codex-pi-board-tick {nonce}"
 MAX_PACKET_CHARS = 3500
+MAX_PACKET_EVENTS = 3
+INSTRUCTIONS_TEMPLATE = (
+    "Codex-Pi board probe nonce={nonce}. Purpose: deliver pending board events. "
+    "If the board gate/filter is not active, report it inactive and pause this probe; "
+    "do not do other work.")
 
 # Only this exact envelope shape is eligible for the local pre-model gate. Any
 # other text (human text containing "heartbeat", quoted markup, extra
@@ -81,6 +100,10 @@ HEARTBEAT_RE = re.compile(
     r"  <current_time_iso>([^<>\n]{1,64})</current_time_iso>\n"
     r"  <instructions>\n([^\n]{1,200})\n"
     r"  </instructions>\n</heartbeat>\n?\Z")
+
+
+class BoardOverflow(ValueError):
+    """The bounded board snapshot cannot hold the pending work."""
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +188,24 @@ def board_file_for_repo(repo):
     return root, common, board_file_for_common(common)
 
 
+def monitor_lease_seconds() -> float:
+    raw = os.environ.get("CODEX_PI_MONITOR_LEASE_SECONDS")
+    try:
+        value = float(raw) if raw else MONITOR_LEASE_SECONDS
+    except (TypeError, ValueError):
+        value = MONITOR_LEASE_SECONDS
+    return value if 1.0 <= value <= 86400 else MONITOR_LEASE_SECONDS
+
+
+def _claim_ttl_seconds() -> float:
+    raw = os.environ.get("CODEX_PI_GATE_CLAIM_SECONDS")
+    try:
+        value = float(raw) if raw else GATE_CLAIM_SECONDS
+    except (TypeError, ValueError):
+        value = GATE_CLAIM_SECONDS
+    return value if 1.0 <= value <= 3600 else GATE_CLAIM_SECONDS
+
+
 def validate_board(data) -> str | None:
     if not isinstance(data, dict):
         return "board is not a JSON object"
@@ -198,12 +239,145 @@ def read_board(path):
     return data, None
 
 
+def _serialized_board(board) -> bytes:
+    return (json.dumps(board, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
+
+def _shrink_handled(board) -> None:
+    """Aggressive handled-history pruning only; never touches unhandled work."""
+    for card in (board.get("cards") or {}).values():
+        if not isinstance(card, dict):
+            continue
+        card["events"] = [event for event in card.get("events", [])
+                          if isinstance(event, dict) and not event.get("handled")]
+        handled = card.get("handled")
+        if isinstance(handled, dict) and len(handled) > MAX_HANDLED_IDS:
+            ordered = sorted(handled.items(), key=lambda item: (item[1] or {}).get("at") or 0)
+            card["handled"] = dict(ordered[-MAX_HANDLED_IDS:])
+
+
+def _write_board(board_file, board) -> None:
+    """Refuse a write that would exceed the bounded snapshot; never drop pending."""
+    payload = _serialized_board(board)
+    if len(payload) > MAX_BOARD_BYTES:
+        _shrink_handled(board)
+        payload = _serialized_board(board)
+        if len(payload) > MAX_BOARD_BYTES:
+            raise BoardOverflow(
+                f"board snapshot would exceed MAX_BOARD_BYTES={MAX_BOARD_BYTES}; refusing the "
+                f"write instead of silently dropping unhandled events or decisions: {board_file}")
+    atomic(board_file, board)
+
+
+# ---------------------------------------------------------------------------
+# monitor lease/freshness (separate from the semantic board revision)
+# ---------------------------------------------------------------------------
+
+def monitor_paths(board_file):
+    directory = Path(board_file).parent
+    return directory / MONITOR_FILE, directory / MONITOR_LOCK
+
+
+def read_monitors(board_file):
+    path, _lock = monitor_paths(board_file)
+    if not path.exists():
+        return None, "missing"
+    data, problem = _read_bounded_json(path, MAX_MONITOR_BYTES)
+    if problem is not None:
+        return None, problem
+    if not isinstance(data, dict) or data.get("schemaVersion") != 1 \
+            or not isinstance(data.get("tasks"), dict):
+        return None, "invalid"
+    return data, None
+
+
+def monitor_for(monitors, task_id):
+    if not isinstance(monitors, dict):
+        return None
+    record = (monitors.get("tasks") or {}).get(task_id)
+    return record if isinstance(record, dict) else None
+
+
+def write_monitor_record(board_file, task_id: str, record: dict, now: float) -> bool:
+    """Persist one bounded monitor lease entry without touching board revision."""
+    path, lock = monitor_paths(board_file)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = lock_fd(lock, blocking=False)
+    except (LockHeld, OSError):
+        return False
+    try:
+        data, problem = _read_bounded_json(path, MAX_MONITOR_BYTES)
+        if problem is not None or not isinstance(data, dict):
+            data = {"schemaVersion": 1, "tasks": {}}
+        tasks = data.setdefault("tasks", {})
+        entry = dict(record)
+        entry["task"] = task_id
+        entry["refreshedAt"] = now
+        entry["updatedAt"] = now
+        tasks[task_id] = entry
+        if len(tasks) > MAX_MONITORS:
+            ordered = sorted(tasks.items(), key=lambda item: (item[1] or {}).get("updatedAt") or 0)
+            data["tasks"] = dict(ordered[-MAX_MONITORS:])
+        data["schemaVersion"] = 1
+        if len(_serialized_monitors(data)) > MAX_MONITOR_BYTES:
+            return False
+        atomic(path, data)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def _serialized_monitors(data) -> bytes:
+    return (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
+
+def record_monitor_error(task: dict, message: str) -> None:
+    """Bounded monitor-error evidence: log plus a visible unhealthy lease record."""
+    common_raw = task.get("commonDir") if isinstance(task, dict) else None
+    if not isinstance(common_raw, str) or not common_raw.strip():
+        return
+    directory = Path(common_raw) / BOARD_DIR
+    path = directory / MONITOR_LOG
+    task_id = task.get("task") if isinstance(task, dict) else None
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        line = json.dumps({"schemaVersion": 1, "at": time.time(), "task": task_id,
+                           "error": _text(message, 300)}, ensure_ascii=False) + "\n"
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(line)
+        if path.stat().st_size > MAX_MONITOR_LOG_BYTES:
+            _trim_lines(path, MAX_MONITOR_LOG_BYTES // 2)
+    except OSError:
+        pass
+    try:
+        board_file = board_file_for_common(Path(common_raw))
+        monitors, _problem = read_monitors(board_file)
+        previous = monitor_for(monitors, task_id)
+        record = dict(previous) if isinstance(previous, dict) else {}
+        record.update({"task": task_id, "healthy": False, "error": _text(message, 300),
+                       "source": "monitor", "pid": os.getpid()})
+        write_monitor_record(board_file, task_id, record, time.time())
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _read_monitors_quiet(board_file):
+    try:
+        return read_monitors(board_file)
+    except Exception:  # noqa: BLE001
+        return None, "unreadable"
+
+
 # ---------------------------------------------------------------------------
 # card / event model
 # ---------------------------------------------------------------------------
 
 def _default_codex() -> dict:
-    return {"review": "pending", "reviewedHead": None, "decidedAt": None, "lastEventId": None}
+    return {"review": "pending", "reviewedHead": None, "decidedAt": None, "lastEventId": None,
+            "lastDecision": None, "lastDecisionAt": None, "history": []}
 
 
 def _new_card(task_id, codex_task_id, owner_session, title, goal, brief_ref, plan_ref,
@@ -216,8 +390,8 @@ def _new_card(task_id, codex_task_id, owner_session, title, goal, brief_ref, pla
         "createdAt": now, "updatedAt": now,
         "paused": False, "pausedAt": None, "pauseNote": None,
         "pi": {"round": None, "state": None, "stage": None, "updatedAt": None},
-        "evidence": {}, "check": None, "events": [], "nextSeq": 1,
-        "attention": None, "codex": _default_codex(), "monitorError": None,
+        "evidence": {}, "check": None, "events": [], "handled": {}, "overflow": None,
+        "nextSeq": 1, "attention": None, "codex": _default_codex(),
     }
 
 
@@ -233,24 +407,56 @@ def find_event(card: dict, event_id: str):
     return None
 
 
+def event_handled(card: dict, event_id: str) -> bool:
+    if event_id in (card.get("handled") or {}):
+        return True
+    event = find_event(card, event_id)
+    return bool(event is not None and event.get("handled"))
+
+
+def pending_events(card: dict) -> list:
+    return [event for event in card.get("events", [])
+            if isinstance(event, dict) and not event.get("handled")]
+
+
 def _prune_events(card: dict) -> None:
+    """Prune handled history only; unhandled events are never discarded."""
     events = [event for event in card.get("events", []) if isinstance(event, dict)]
-    if len(events) <= MAX_EVENTS_PER_CARD:
-        card["events"] = events
-        return
-    unhandled = [event for event in events if not event.get("handled")]
+    handled_map = card.setdefault("handled", {})
     handled = [event for event in events if event.get("handled")]
-    room = max(0, MAX_EVENTS_PER_CARD - len(unhandled))
-    kept = unhandled[-MAX_EVENTS_PER_CARD:] + (handled[-room:] if room else [])
-    kept.sort(key=lambda event: event.get("seq") or 0)
-    card["events"] = kept
+    for event in handled:
+        handled_map.setdefault(event.get("id"), {
+            "at": event.get("handledAt") or 0, "decision": event.get("decision"),
+            "reviewedHead": event.get("reviewedHead"), "round": event.get("round")})
+    unhandled = [event for event in events if not event.get("handled")]
+    keep_handled = handled[-MAX_HANDLED_EVENTS:]
+    card["events"] = sorted(unhandled + keep_handled, key=lambda event: event.get("seq") or 0)
+    if len(handled_map) > MAX_HANDLED_IDS:
+        ordered = sorted(handled_map.items(), key=lambda item: (item[1] or {}).get("at") or 0)
+        card["handled"] = dict(ordered[-MAX_HANDLED_IDS:])
+
+
+def _update_overflow(card: dict, now: float) -> None:
+    count = len(pending_events(card))
+    if count > MAX_PENDING_DISPLAY:
+        card["overflow"] = {"active": True, "pendingCount": count, "updatedAt": now,
+                            "note": "pending events exceed the display budget; the board retains "
+                                    "all of them and requires explicit decisions"}
+    elif isinstance(card.get("overflow"), dict) and card["overflow"].get("active"):
+        card["overflow"] = {"active": False, "pendingCount": count, "resolvedAt": now}
 
 
 def add_event(card: dict, kind: str, round_number, fingerprint: str, summary: str,
               candidate: dict, evidence: dict, question: str, now: float):
-    """Idempotent publication: one immutable identity per task/round/kind/fingerprint."""
+    """Idempotent publication: one immutable identity per task/round/kind/fingerprint.
+
+    Returns the new event, or ``None`` when the same identity already exists,
+    is handled, or was already decided in the compact handled map.
+    """
     identity = event_identity(card["taskId"], round_number, kind, fingerprint)
     if find_event(card, identity) is not None:
+        return None
+    if identity in (card.get("handled") or {}):
         return None
     seq = int(card.get("nextSeq") or 1)
     event = {
@@ -268,6 +474,7 @@ def add_event(card: dict, kind: str, round_number, fingerprint: str, summary: st
     codex = card.setdefault("codex", _default_codex())
     codex["review"] = "pending"  # new unhandled work; accepted is never inferred
     _prune_events(card)
+    _update_overflow(card, now)
     return event
 
 
@@ -298,7 +505,11 @@ def _receipt_ref(checks: dict, latest):
 
 
 def project_status(card: dict, status: dict, now: float) -> bool:
-    """Projection only (round/state/stage/evidence/check); never an event."""
+    """Projection only (round/state/stage/evidence/check); never an event.
+
+    Timestamps change in memory; an unchanged projection does not bump the
+    semantic board revision. Monitor freshness is recorded separately.
+    """
     changed = False
     pi = card.setdefault("pi", {})
     new_pi = {
@@ -377,7 +588,7 @@ def project_events(card: dict, status: dict, now: float) -> list:
             "Decide whether to repair, cancel or extend the deadline; the round state is exact evidence.",
             {"receiptRef": _receipt_ref(checks, latest)})
     timeout_receipts = [item for item in (receipts.get("failedRecent") or [])
-                       if isinstance(item, dict) and item.get("timedOut")]
+                        if isinstance(item, dict) and item.get("timedOut")]
     if not timeout_receipts and isinstance(latest, dict) and latest.get("timedOut"):
         timeout_receipts = [latest]
     for item in timeout_receipts:
@@ -389,13 +600,15 @@ def project_events(card: dict, status: dict, now: float) -> list:
         if not isinstance(breach, dict):
             continue
         name = breach.get("name") or breach.get("source")
-        add("resource_breach",
-            f"{name}:{breach.get('observedBytes')}:{breach.get('maxBytes')}",
-            f"resource budget breached: {breach.get('observedBytes')} > {breach.get('maxBytes')} "
-            f"under {breach.get('path')}",
+        # Fingerprint the check/receipt/declared cap, never the changing byte
+        # count: one continuing breach is one event.
+        add("resource_breach", f"{name}:{breach.get('path')}:{breach.get('maxBytes')}",
+            f"resource budget breached under {breach.get('path')} "
+            f"(at least {breach.get('observedBytes')} bytes > cap {breach.get('maxBytes')})",
             "Decide whether to stop, widen the declared budget or repair; guard evidence is exact.",
             {"guardPath": breach.get("path"), "observedBytes": breach.get("observedBytes"),
-             "maxBytes": breach.get("maxBytes")})
+             "maxBytes": breach.get("maxBytes"), "source": breach.get("source"),
+             "breachBasis": breach.get("breachBasis")})
     if recorded in TERMINAL_STATES and state != "unknown":
         add("review_required", f"{state}:{head}:{status.get('exitCode')}",
             f"round {status.get('round')} reached terminal state {state}",
@@ -417,8 +630,13 @@ def project_events(card: dict, status: dict, now: float) -> list:
     return added
 
 
-def refresh_with_status(board_file, task_id: str, status: dict, now=None, block: bool = True):
-    """Short-lock projection refresh; no write when nothing meaningful changed."""
+def refresh_with_status(board_file, task_id: str, status: dict, now=None, block: bool = True,
+                        source: str = "cli"):
+    """Short-lock projection refresh; no board write when nothing meaningful changed.
+
+    Monitor freshness is always recorded separately, so a healthy quiet task
+    stays visibly leased without bumping the semantic revision.
+    """
     now = time.time() if now is None else now
     board_file = Path(board_file)
     if not board_file.is_file():
@@ -427,6 +645,10 @@ def refresh_with_status(board_file, task_id: str, status: dict, now=None, block:
         fd = lock_fd(board_file.with_name(BOARD_LOCK), blocking=block,
                      timeout=5.0 if block else 0.0)
     except LockHeld:
+        write_monitor_record(board_file, task_id, {
+            "task": task_id, "health": "lock-contended", "healthy": False,
+            "error": "board lock was held during refresh", "source": source,
+            "state": status.get("state"), "round": status.get("round")}, now)
         return {"ok": True, "refreshed": False, "reason": "board lock held"}
     try:
         board, problem = read_board(board_file)
@@ -437,56 +659,50 @@ def refresh_with_status(board_file, task_id: str, status: dict, now=None, block:
             return {"ok": True, "refreshed": False, "reason": "task is not registered"}
         changed = project_status(card, status, now)
         added = project_events(card, status, now)
+        _update_overflow(card, now)
         changed = changed or bool(added)
         if changed:
             board["revision"] = int(board.get("revision") or 0) + 1
             board["updatedAt"] = now
-            atomic(board_file, board)
+            _write_board(board_file, board)
+        write_monitor_record(board_file, task_id, {
+            "task": task_id, "healthy": True, "error": None, "source": source,
+            "state": status.get("state"), "round": status.get("round"),
+            "boardRevision": board.get("revision"), "pid": os.getpid()}, now)
         return {"ok": True, "refreshed": bool(changed), "revision": board.get("revision"),
                 "taskId": task_id, "pi": dict(card.get("pi") or {}),
                 "newEvents": [event["id"] for event in added],
-                "pendingEvents": sum(1 for event in card.get("events", [])
-                                     if isinstance(event, dict) and not event.get("handled")),
+                "pendingEvents": len(pending_events(card)),
+                "overflow": card.get("overflow"),
                 "card": compact_card(card)}
     finally:
         os.close(fd)
 
 
-def refresh_registered_task(task: dict, now=None, block: bool = True):
+def refresh_registered_task(task: dict, now=None, block: bool = True, source: str = "supervisor"):
+    """Cheap registration pre-check before any status work."""
     common_raw = task.get("commonDir") if isinstance(task, dict) else None
-    if not isinstance(common_raw, str) or not common_raw.strip():
+    task_id = task.get("task") if isinstance(task, dict) else None
+    if not isinstance(common_raw, str) or not common_raw.strip() or not isinstance(task_id, str):
         return {"ok": True, "refreshed": False, "reason": "task has no commonDir"}
     board_file = board_file_for_common(Path(common_raw))
     if not board_file.is_file():
         return {"ok": True, "refreshed": False, "reason": "no board"}
-    status = build_status(task["repo"], task["task"])
-    return refresh_with_status(board_file, task["task"], status, now, block)
-
-
-def record_monitor_error(task: dict, message: str) -> None:
-    """Bounded monitor-error evidence; never kills Pi and never raises."""
-    common_raw = task.get("commonDir") if isinstance(task, dict) else None
-    if not isinstance(common_raw, str) or not common_raw.strip():
-        return
-    directory = Path(common_raw) / BOARD_DIR
-    path = directory / MONITOR_LOG
-    try:
-        directory.mkdir(parents=True, exist_ok=True)
-        line = json.dumps({"schemaVersion": 1, "at": time.time(),
-                           "task": task.get("task") if isinstance(task, dict) else None,
-                           "error": _text(message, 300)}, ensure_ascii=False) + "\n"
-        with path.open("a", encoding="utf-8") as stream:
-            stream.write(line)
-        if path.stat().st_size > MAX_MONITOR_LOG_BYTES:
-            _trim_lines(path, MAX_MONITOR_LOG_BYTES // 2)
-    except OSError:
-        pass
+    # Avoid any status/scan work for a task that is not registered, even when
+    # another task on the same board is active.
+    board, problem = read_board(board_file)
+    if board is None:
+        raise ValueError(f"board state is {problem}: {board_file}")
+    if not isinstance((board.get("cards") or {}).get(task_id), dict):
+        return {"ok": True, "refreshed": False, "reason": "task is not registered"}
+    status = build_status(task["repo"], task_id)
+    return refresh_with_status(board_file, task_id, status, now, block, source=source)
 
 
 def refresh_supervisor(task: dict):
     """Bounded best-effort refresh called from the existing Pi supervisor loop."""
     try:
-        return refresh_registered_task(task, block=False)
+        return refresh_registered_task(task, block=False, source="supervisor")
     except Exception as exc:  # noqa: BLE001 - monitor errors must not kill Pi
         try:
             record_monitor_error(task, f"{type(exc).__name__}: {exc}")
@@ -504,16 +720,54 @@ def gate_paths(session: str):
     return directory / f"{session_key(session)}.json", directory / f"{session_key(session)}.lock"
 
 
+def session_pause_path(session: str) -> Path:
+    return handoff_root() / GATE_DIR / f"{session_key(session)}.paused.json"
+
+
 def read_gate(session: str):
     path, _lock = gate_paths(session)
     data, problem = _read_bounded_json(path, MAX_GATE_BYTES)
     if problem is not None:
         return None, problem
     if (not isinstance(data, dict) or data.get("schemaVersion") != GATE_SCHEMA_VERSION
-            or data.get("sessionId") != session
-            or not isinstance(data.get("delivered"), dict)):
+            or data.get("sessionId") != session):
         return None, "invalid"
     return data, None
+
+
+def pause_session(session: str, reason: str = "user interrupted this Codex session",
+                  now=None) -> dict:
+    now = time.time() if now is None else now
+    session = _validate_session(session)
+    path = session_pause_path(session)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic(path, {"schemaVersion": 1, "sessionId": session, "pausedAt": now,
+                  "reason": _text(reason, 200), "source": "interrupt"})
+    return {"ok": True, "sessionId": session, "pausedAt": now}
+
+
+def session_paused(session: str):
+    path = session_pause_path(session)
+    if not path.exists():
+        return False, None
+    data, problem = _read_bounded_json(path, 4096)
+    if problem is not None:
+        return False, problem
+    if not isinstance(data, dict) or data.get("sessionId") != session:
+        return False, "invalid"
+    return True, None
+
+
+def resume_session(session: str) -> dict:
+    session = _validate_session(session)
+    path = session_pause_path(session)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise ValueError(f"could not clear session pause {path}: {exc}") from None
+    return {"ok": True, "sessionId": session, "sessionPauseCleared": True}
 
 
 def register_gate(session: str, automation_id: str, board_file: Path, task_ids, nonce: str,
@@ -524,16 +778,15 @@ def register_gate(session: str, automation_id: str, board_file: Path, task_ids, 
     try:
         existing, _problem = _read_bounded_json(path, MAX_GATE_BYTES)
         existing = existing if isinstance(existing, dict) else {}
-        existing_delivered = existing.get("delivered") if isinstance(existing.get("delivered"), dict) else {}
+        existing_claims = _active_claims(existing, now, _claim_ttl_seconds())
         record = {
             "schemaVersion": GATE_SCHEMA_VERSION, "sessionId": session,
             "sessionHash": session_key(session), "automationId": automation_id,
             "nonce": nonce, "instructions": instructions,
             "boardPath": str(board_file), "taskIds": list(task_ids),
             "createdAt": existing.get("createdAt") or now, "updatedAt": now,
-            # Re-registering with the same nonce preserves delivery state; a new
-            # nonce is an explicit re-arm that clears it.
-            "delivered": existing_delivered if existing.get("nonce") == nonce else {},
+            # Same nonce preserves delivery claims; a new nonce is an explicit re-arm.
+            "claims": existing_claims if existing.get("nonce") == nonce else {},
         }
         atomic(path, record)
         return record
@@ -542,7 +795,7 @@ def register_gate(session: str, automation_id: str, board_file: Path, task_ids, 
 
 
 def rearm(repo, task, session_id, now=None) -> dict:
-    """Explicitly clear delivery state for one registered session without changing the prompt."""
+    """Explicitly clear delivery claims for one registered session without changing the prompt."""
     now = time.time() if now is None else now
     _root, _common, board_file = board_file_for_repo(repo)
     task_id = require_task_arg(task)
@@ -557,11 +810,12 @@ def rearm(repo, task, session_id, now=None) -> dict:
             raise ValueError("gate registration board does not match this repository")
         if task_id not in (gate.get("taskIds") or []):
             raise ValueError(f"gate registration does not cover task {task_id!r}")
-        gate["delivered"] = {}
+        gate["claims"] = {}
+        gate.pop("delivered", None)
         gate["updatedAt"] = now
         atomic(path, gate)
         return {"ok": True, "sessionId": session, "taskId": task_id,
-                "deliveredCleared": True, "gatePath": str(path),
+                "claimsCleared": True, "gatePath": str(path),
                 "note": "explicit re-arm only; pending events are unchanged and will be "
                         "delivered once on the next exact registered tick"}
     finally:
@@ -577,9 +831,10 @@ def envelope(automation_id: str, current_time_iso: str, instructions: str) -> st
 
 
 def _audit(decision: str, session: str, gate, cards, event_ids, started: float, now: float,
-           reason=None) -> None:
+           reason=None, input_keys=None) -> None:
     try:
         latency_ms = int(max(0.0, (time.monotonic() - started) * 1000))
+        keys = sorted({str(key) for key in (input_keys or []) if isinstance(key, str)})[:20]
         line = json.dumps({
             "schemaVersion": 1, "at": now, "decision": decision, "latencyMs": latency_ms,
             "sessionHash": session_key(session)[:16],
@@ -587,6 +842,7 @@ def _audit(decision: str, session: str, gate, cards, event_ids, started: float, 
             "taskIds": sorted({str(card.get("taskId")) for card in cards
                                if isinstance(card, dict)})[:10],
             "eventIds": [event_id for event_id in event_ids if isinstance(event_id, str)][:10],
+            "inputKeys": keys,
             "reason": _text(reason, 200) if reason else None,
         }, ensure_ascii=False) + "\n"
         directory = handoff_root() / GATE_DIR
@@ -606,34 +862,56 @@ def stop_output(mode: str, reason: str) -> dict:
     return {"continue": False, "stopReason": reason}
 
 
-def _gate_diagnostic(session: str, message: str, started: float, now: float) -> dict:
-    _audit("diagnostic", session, None, [], [], started, now, reason=message)
+def _gate_diagnostic(session: str, message: str, started: float, now: float, gate=None,
+                     input_keys=None) -> dict:
+    _audit("diagnostic", session, gate, [], [], started, now, reason=message,
+           input_keys=input_keys)
     text = ("codex-pi board gate diagnostic: " + _text(message, 400) +
             ". The automatic tick was allowed through (fail open); board state is unknown, "
             "not 'unchanged'.")
     return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": text}}
 
 
-def _mark_delivered(session: str, event_ids, now: float) -> None:
+def _active_claims(gate, now: float, ttl: float) -> dict:
+    raw = gate.get("claims") if isinstance(gate, dict) else None
+    if not isinstance(raw, dict):
+        raw = gate.get("delivered") if isinstance(gate, dict) else None
+    claims = {}
+    for key, value in (raw or {}).items():
+        if isinstance(key, str) and isinstance(value, (int, float)) and not isinstance(value, bool) \
+                and now - value < ttl:
+            claims[key] = value
+    return claims
+
+
+def _claim_delivered(session: str, event_ids, now: float, ttl: float) -> list:
+    """Nonblocking expiring claim; returns the ids actually claimed this tick."""
     path, lock = gate_paths(session)
     try:
-        fd = lock_fd(lock, blocking=True, timeout=2)
-    except LockHeld:
-        return  # never block the hook; one redelivery is safer than a long wait
+        fd = lock_fd(lock, blocking=False)
+    except (LockHeld, OSError):
+        return []
     try:
         data, problem = _read_bounded_json(path, MAX_GATE_BYTES)
         if problem is not None or not isinstance(data, dict):
-            return
-        delivered = data.setdefault("delivered", {})
+            return []
+        claims = _active_claims(data, now, ttl)
+        claimed = []
         for event_id in event_ids:
-            if isinstance(event_id, str):
-                delivered[event_id] = now
-        if len(delivered) > DELIVERED_LIMIT:
-            ordered = sorted(delivered.items(),
-                             key=lambda item: item[1] if isinstance(item[1], (int, float)) else 0)
-            data["delivered"] = dict(ordered[-DELIVERED_LIMIT:])
+            if not isinstance(event_id, str) or event_id in claims:
+                continue
+            claims[event_id] = now
+            claimed.append(event_id)
+        if len(claims) > CLAIM_LIMIT:
+            ordered = sorted(claims.items(), key=lambda item: item[1])
+            claims = dict(ordered[-CLAIM_LIMIT:])
+        data["claims"] = claims
+        data.pop("delivered", None)
         data["updatedAt"] = now
         atomic(path, data)
+        return claimed
+    except OSError:
+        return []
     finally:
         os.close(fd)
 
@@ -648,33 +926,145 @@ def cards_for_session(board: dict, session: str) -> list:
     return result
 
 
+def _refresh_hint(card: dict) -> str:
+    return (f'python3 {shlex.quote(str(Path(__file__).resolve()))} refresh '
+            f'--repo {shlex.quote(str(card.get("repo")))} '
+            f'--task {shlex.quote(str(card.get("taskId")))}')
+
+
 def _decide_hint(repo, task_id, event: dict) -> str:
-    head = (event.get("candidate") or {}).get("head") or "unknown"
+    head = (event.get("candidate") or {}).get("head")
+    if event.get("kind") in REVIEW_KINDS and isinstance(head, str) and HEAD_RE.fullmatch(head):
+        decision = "accept|reject|changes_requested"
+        suffix = f" --reviewed-head {head}"
+    else:
+        decision = "resolve|reject"
+        suffix = ""
     return (f'python3 {shlex.quote(str(Path(__file__).resolve()))} decide '
             f'--repo {shlex.quote(str(repo))} --task {shlex.quote(str(task_id))} '
-            f'--event-id {event.get("id")} --decision accept|reject --reviewed-head {head}')
+            f'--event-id {event.get("id")} --decision {decision}{suffix}')
 
 
-def build_packet(session: str, pending, limit: int = 3) -> str:
-    lines = ["codex-pi board packet (registered automatic tick; delivery is not acknowledgement)"]
-    for card, event in pending[:limit]:
-        evidence = event.get("evidence") or {}
-        head = (event.get("candidate") or {}).get("head")
-        lines.append(f"task={card.get('taskId')} round={event.get('round')} "
-                     f"state={(card.get('pi') or {}).get('state')} "
-                     f"paused={bool(card.get('paused'))}")
-        lines.append(f"event={event.get('id')} kind={event.get('kind')} seq={event.get('seq')}")
-        lines.append(f"summary={event.get('summary')}")
-        lines.append(f"question={event.get('question')}")
-        lines.append(f"candidate_head={head or 'unknown'}")
-        for label, key in (("brief", "briefRef"), ("checks", "checksRef"),
-                           ("receipt", "receiptRef"), ("state", "stateRef")):
-            if evidence.get(key):
-                lines.append(f"{label}={evidence.get(key)}")
-        lines.append("decide=" + _decide_hint(card.get("repo"), card.get("taskId"), event))
-    if len(pending) > limit:
-        lines.append(f"... plus {len(pending) - limit} more pending events; run packet/show")
-    return _text("\n".join(lines), MAX_PACKET_CHARS)
+def _event_block(card: dict, event: dict, include_title: bool) -> list:
+    lines = []
+    if include_title:
+        lines.append(f"task={card.get('taskId')} title={_text(card.get('title') or '', 120)}")
+        goal = _text(card.get("goal") or "", 160)
+        if goal:
+            lines.append(f"goal={goal}")
+    evidence = event.get("evidence") or {}
+    head = (event.get("candidate") or {}).get("head")
+    lines.append(f"round={event.get('round')} state={(card.get('pi') or {}).get('state')} "
+                 f"paused={bool(card.get('paused'))}")
+    lines.append(f"event={event.get('id')} kind={event.get('kind')} seq={event.get('seq')}")
+    lines.append(f"summary={event.get('summary')}")
+    lines.append(f"question={event.get('question')}")
+    lines.append(f"candidate_head={head or 'unknown'}")
+    for label, key in (("brief", "briefRef"), ("checks", "checksRef"),
+                       ("receipt", "receiptRef"), ("state", "stateRef")):
+        if evidence.get(key):
+            lines.append(f"{label}={evidence.get(key)}")
+    lines.append("decide=" + _decide_hint(card.get("repo"), card.get("taskId"), event))
+    return lines
+
+
+def build_packet(pending, limit: int = MAX_PACKET_EVENTS):
+    """Build a bounded packet and return ``(text, included_pairs)``.
+
+    Only pairs fully represented inside the accumulated text are returned, so a
+    caller may claim exactly those event ids; omitted events stay unclaimed and
+    are delivered on a later tick.
+    """
+    header = "codex-pi board packet (registered automatic tick; delivery is not acknowledgement)"
+    lines = []
+    included = []
+    titled = set()
+    for card, event in pending:
+        if len(included) >= limit:
+            break
+        block = _event_block(card, event, card.get("taskId") not in titled)
+        candidate = "\n".join([header] + lines + block)
+        if len(candidate) > MAX_PACKET_CHARS:
+            break
+        titled.add(card.get("taskId"))
+        lines.extend(block)
+        included.append((card, event))
+    if not included:
+        return "", []
+    text = "\n".join([header] + lines)
+    remaining = len(pending) - len(included)
+    if remaining > 0:
+        note = (f"... plus {remaining} pending event(s) not included in this packet; the board "
+                "retains them and they will be delivered next")
+        if len(text) + len(note) + 1 <= MAX_PACKET_CHARS:
+            text = text + "\n" + note
+    return text, included
+
+
+def _monitor_problem(card: dict, monitors, monitor_problem, lease: float, now: float):
+    state = (card.get("pi") or {}).get("state")
+    if state not in ACTIVE_STATES:
+        return None
+    if monitors is None:
+        return f"monitor state is {monitor_problem}"
+    record = monitor_for(monitors, card.get("taskId"))
+    if not isinstance(record, dict):
+        return "monitor lease record is missing"
+    error = record.get("error")
+    if isinstance(error, str) and error:
+        return f"monitor error: {error}"
+    refreshed = record.get("refreshedAt")
+    if isinstance(refreshed, bool) or not isinstance(refreshed, (int, float)):
+        return "monitor lease record is corrupt"
+    age = now - refreshed
+    if age > lease:
+        return f"monitor lease expired {int(age)}s ago"
+    return None
+
+
+def _ensure_monitor_event(board_file, card: dict, reason: str, now: float):
+    """Publish at most one durable monitor_stale event per task/round.
+
+    Returns the unhandled event (possibly already present), ``None`` when it was
+    already decided, or ``\"contended\"`` when the short lock could not be taken.
+    """
+    round_number = (card.get("pi") or {}).get("round")
+    identity = event_identity(card.get("taskId"), round_number, "monitor_stale", "lease")
+    existing = find_event(card, identity)
+    if existing is not None:
+        return None if existing.get("handled") else existing
+    if identity in (card.get("handled") or {}):
+        return None
+    try:
+        fd = lock_fd(Path(board_file).with_name(BOARD_LOCK), blocking=False)
+    except (LockHeld, OSError):
+        return "contended"
+    try:
+        board, problem = read_board(board_file)
+        if board is None:
+            return "contended"
+        live = (board.get("cards") or {}).get(card.get("taskId"))
+        if not isinstance(live, dict):
+            return "contended"
+        event = add_event(
+            live, "monitor_stale", round_number, "lease",
+            f"monitor freshness is unknown: {reason}",
+            {"round": round_number, "head": None},
+            {"stateRef": (live.get("evidence") or {}).get("stateRef"),
+             "recovery": _refresh_hint(live)},
+            "Investigate or refresh the monitor; age alone is not proof that Pi is dead.",
+            now)
+        if event is None:
+            return None
+        board["revision"] = int(board.get("revision") or 0) + 1
+        board["updatedAt"] = now
+        _write_board(board_file, board)
+        card.setdefault("events", []).append(event)
+        card["nextSeq"] = max(int(card.get("nextSeq") or 1), int(live.get("nextSeq") or 1))
+        card["attention"] = live.get("attention")
+        return event
+    finally:
+        os.close(fd)
 
 
 def evaluate_gate(event, stop_mode=None, now=None):
@@ -682,6 +1072,7 @@ def evaluate_gate(event, stop_mode=None, now=None):
     now = time.time() if now is None else now
     started = time.monotonic()
     prompt = event.get("prompt") if isinstance(event, dict) else None
+    input_keys = sorted(event.keys())[:20] if isinstance(event, dict) else []
     if not isinstance(prompt, str) or not prompt.startswith("<heartbeat>"):
         return None
     match = HEARTBEAT_RE.fullmatch(prompt)
@@ -698,40 +1089,78 @@ def evaluate_gate(event, stop_mode=None, now=None):
         return None  # no registered gate: current behavior applies
     if gate.get("automationId") != automation_id or gate.get("instructions") != instructions:
         return None  # other ids/instructions/nonces are ordinary prompts
+    mode = stop_mode or os.environ.get("CODEX_PI_GATE_STOP_MODE") or "continue"
+    if mode not in STOP_MODES:
+        mode = "continue"
+    paused, pause_problem = session_paused(session)
+    if pause_problem is not None:
+        return _gate_diagnostic(session, f"session pause state is {pause_problem}",
+                                started, now, gate=gate, input_keys=input_keys)
+    if paused:
+        _audit("stop", session, gate, [], [], started, now,
+               reason="session paused after interruption", input_keys=input_keys)
+        return stop_output(mode, "codex-pi board: session paused after interruption; "
+                                 "explicit resume is required")
     board_raw = gate.get("boardPath")
     if not isinstance(board_raw, str) or not Path(board_raw).is_absolute():
-        return _gate_diagnostic(session, "gate registration has no valid board path", started, now)
+        return _gate_diagnostic(session, "gate registration has no valid board path",
+                                started, now, gate=gate, input_keys=input_keys)
     board_file = Path(board_raw)
     board, board_problem = read_board(board_file)
     if board is None:
         return _gate_diagnostic(session, f"board state is {board_problem}: {board_file}",
-                                started, now)
+                                started, now, gate=gate, input_keys=input_keys)
+    monitors, monitor_problem = read_monitors(board_file)
+    lease = monitor_lease_seconds()
     cards = cards_for_session(board, session)
-    pending = []
-    for card in cards:
-        if card.get("paused"):
+    active = [card for card in cards if not card.get("paused")]
+
+    # Detect an expired/unhealthy monitor lease only on a registered tick. A
+    # stale lease is a stable durable event, never a claim that Pi is dead.
+    monitor_diagnostics = []
+    for card in active:
+        problem = _monitor_problem(card, monitors, monitor_problem, lease, now)
+        if not problem:
             continue
+        outcome = _ensure_monitor_event(board_file, card, problem, now)
+        if outcome == "contended":
+            monitor_diagnostics.append(problem)
+
+    pending = []
+    for card in active:
         for item in card.get("events", []):
             if isinstance(item, dict) and not item.get("handled"):
                 pending.append((card, item))
-    delivered = gate.get("delivered") if isinstance(gate.get("delivered"), dict) else {}
-    new_pending = [(card, item) for card, item in pending if item.get("id") not in delivered]
-    mode = stop_mode or os.environ.get("CODEX_PI_GATE_STOP_MODE") or "continue"
-    if mode not in STOP_MODES:
-        mode = "continue"
-    if not new_pending:
-        _audit("stop", session, gate, cards, [], started, now, reason="no actionable events")
+    ttl = _claim_ttl_seconds()
+    claims = _active_claims(gate, now, ttl)
+    candidates = [(card, item) for card, item in pending if item.get("id") not in claims]
+    text, included = build_packet(candidates)
+    if not included:
+        if monitor_diagnostics:
+            return _gate_diagnostic(session, "monitor freshness unknown: "
+                                             + "; ".join(monitor_diagnostics[:3]),
+                                    started, now, gate=gate, input_keys=input_keys)
+        _audit("stop", session, gate, cards, [], started, now,
+               reason="no actionable events", input_keys=input_keys)
         return stop_output(mode, "codex-pi board: no actionable events for this registered tick")
-    packet = build_packet(session, new_pending)
-    older = len(pending) - len(new_pending)
-    if older > 0:
-        packet = _text(packet + f"\n({older} older unhandled events were already delivered; "
-                                 "run show/packet if needed)", MAX_PACKET_CHARS)
-    event_ids = [item.get("id") for _card, item in new_pending]
-    _mark_delivered(session, event_ids, now)
-    _audit("deliver", session, gate, cards, event_ids, started, now)
+    claimed = _claim_delivered(session, [item.get("id") for _card, item in included], now, ttl)
+    if not claimed:
+        _audit("stop", session, gate, cards, [], started, now,
+               reason="claim contention; retry next tick", input_keys=input_keys)
+        return stop_output(mode, "codex-pi board: delivery claim collision; "
+                                 "the event retries on the next tick")
+    if set(claimed) != {item.get("id") for _card, item in included}:
+        subset = [(card, item) for card, item in included if item.get("id") in claimed]
+        text, included = build_packet(subset)
+        if not included:
+            return stop_output(mode, "codex-pi board: delivery claim changed; retry next tick")
+    if monitor_diagnostics:
+        note = "monitor freshness unknown: " + "; ".join(monitor_diagnostics[:3])
+        if len(text) + len(note) + 1 <= MAX_PACKET_CHARS:
+            text = text + "\n" + note
+    _audit("deliver", session, gate, cards, claimed, started, now, input_keys=input_keys)
     return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
-                                   "additionalContext": packet}}
+                                   "additionalContext": text}}
 
 
 # ---------------------------------------------------------------------------
@@ -762,6 +1191,8 @@ def compact_card(card: dict, max_events: int = 5) -> dict:
         "attention": card.get("attention"), "codex": card.get("codex"),
         "pendingEvents": [compact_event(event) for event in pending[:max_events]],
         "pendingCount": len(pending),
+        "handledCount": len(card.get("handled") or {}),
+        "overflow": card.get("overflow"),
         "recentHandled": [compact_event(event) for event in handled[-2:]],
     }
 
@@ -776,6 +1207,33 @@ def select_cards(board: dict, owner=None, task_id=None, include_all=False) -> li
     if include_all:
         return [card for card in cards.values() if isinstance(card, dict)][:50]
     raise ValueError("provide --task, --owner or --all")
+
+
+def _monitor_view(board_file, task_ids):
+    monitors, problem = read_monitors(board_file)
+    lease = monitor_lease_seconds()
+    now = time.time()
+    view = {}
+    for task_id in task_ids:
+        if monitors is None:
+            view[task_id] = {"status": f"unknown ({problem})", "leaseSeconds": lease}
+            continue
+        record = monitor_for(monitors, task_id)
+        if not isinstance(record, dict):
+            view[task_id] = {"status": "missing", "leaseSeconds": lease}
+            continue
+        refreshed = record.get("refreshedAt")
+        entry = {"status": "healthy", "refreshedAt": refreshed,
+                 "ageSeconds": int(now - refreshed) if isinstance(refreshed, (int, float))
+                 and not isinstance(refreshed, bool) else None,
+                 "source": record.get("source"), "error": record.get("error"),
+                 "healthy": bool(record.get("healthy")), "leaseSeconds": lease}
+        if entry["error"]:
+            entry["status"] = "error"
+        elif entry["ageSeconds"] is not None and entry["ageSeconds"] > lease:
+            entry["status"] = "stale"
+        view[task_id] = entry
+    return view
 
 
 # ---------------------------------------------------------------------------
@@ -843,12 +1301,13 @@ def register_task(repo, task, session_id, automation_id, title=None, goal=None, 
             card["updatedAt"] = now
         board["revision"] = int(board.get("revision") or 0) + 1
         board["updatedAt"] = now
-        atomic(board_file, board)
+        _write_board(board_file, board)
     finally:
         os.close(fd)
     gate = register_gate(session, automation, board_file, [task_id], nonce, instructions, now)
     try:
-        refresh_with_status(board_file, task_id, build_status(str(root), task_id), now, block=True)
+        refresh_with_status(board_file, task_id, build_status(str(root), task_id), now,
+                            block=True, source="register")
     except (ValueError, OSError, LockHeld):
         pass
     payload = {"hook_event_name": "UserPromptSubmit", "session_id": session,
@@ -868,7 +1327,8 @@ def register_task(repo, task, session_id, automation_id, title=None, goal=None, 
         "testCommands": [gate_cmd, hook_cmd],
         "note": "register this exact automation prompt; only this session/id/instructions envelope "
                 "is eligible. Reading or delivering an event does not handle or accept it; "
-                "re-registering with a new nonce is the explicit re-arm for delivered events.",
+                "a lost delivery is retried after the claim expires, and re-registering with "
+                "--new-nonce is the explicit full re-arm.",
     }
 
 
@@ -879,14 +1339,13 @@ def decide(repo, task, event_id, decision, reviewed_head=None, note=None, now=No
         raise ValueError("event id must be a 64-character lowercase hex digest")
     mapped = DECISIONS.get(decision)
     if mapped is None:
-        raise ValueError("decision must be accept, reject or changes_requested")
+        raise ValueError("decision must be accept, reject, changes_requested or resolve")
     if mapped == "accepted":
         if not reviewed_head or not HEAD_RE.fullmatch(str(reviewed_head)):
             raise ValueError("accept requires an explicit --reviewed-head (7-64 hex chars); "
                              "a zero exit code is never acceptance")
-    else:
-        if reviewed_head is not None and not HEAD_RE.fullmatch(str(reviewed_head)):
-            raise ValueError("--reviewed-head must be a 7-64 hex commit id")
+    elif reviewed_head is not None and not HEAD_RE.fullmatch(str(reviewed_head)):
+        raise ValueError("--reviewed-head must be a 7-64 hex commit id")
     _root, _common, board_file = board_file_for_repo(repo)
     task_id = require_task_arg(task)
     fd = lock_fd(board_file.with_name(BOARD_LOCK), blocking=True, timeout=10)
@@ -898,36 +1357,84 @@ def decide(repo, task, event_id, decision, reviewed_head=None, note=None, now=No
         if not isinstance(card, dict):
             raise ValueError(f"task {task_id!r} is not registered on this board")
         event = find_event(card, event_id)
-        if event is None:
+        history = (card.get("handled") or {}).get(event_id) if event is None else None
+        if event is None and not isinstance(history, dict):
             raise ValueError(f"unknown event {event_id} for task {task_id!r}")
-        if event.get("handled"):
-            if event.get("decision") == mapped:
+        if event is None:
+            same = history.get("decision") == mapped and (
+                mapped != "accepted" or history.get("reviewedHead") == reviewed_head)
+            if same:
                 return {"ok": True, "idempotent": True, "taskId": task_id, "eventId": event_id,
                         "decision": mapped, "revision": board.get("revision")}
+            raise ValueError(f"event {event_id} was already decided as "
+                             f"{history.get('decision')!r}; refusing to overwrite or replay it "
+                             "with a different decision/reviewed head")
+        kind = event.get("kind")
+        if event.get("handled"):
+            same = event.get("decision") == mapped and (
+                mapped != "accepted" or event.get("reviewedHead") == reviewed_head)
+            if same:
+                return {"ok": True, "idempotent": True, "taskId": task_id, "eventId": event_id,
+                        "decision": mapped, "revision": board.get("revision")}
+            if mapped == "accepted" and event.get("reviewedHead") != reviewed_head:
+                raise ValueError("conflicting replay: this event was already accepted with a "
+                                 "different reviewed head")
             raise ValueError(f"event {event_id} is already handled as "
                              f"{event.get('decision')!r}; refusing to overwrite a decision")
-        candidate = event.get("candidate") or {}
-        head = candidate.get("head")
-        if mapped == "accepted" and head and str(reviewed_head).lower() != str(head).lower():
-            raise ValueError(f"reviewed head {reviewed_head!r} does not match event candidate "
-                             f"{head!r}; accept binds the exact candidate")
+        if mapped == "accepted":
+            if kind not in REVIEW_KINDS:
+                raise ValueError(f"event kind {kind!r} is a fault/observation; "
+                                 "use --decision resolve, not accept")
+            candidate_head = (event.get("candidate") or {}).get("head")
+            if not isinstance(candidate_head, str) or not HEAD_RE.fullmatch(candidate_head):
+                raise ValueError("event has no valid candidate commit head; accept requires an "
+                                 "exact full candidate")
+            if str(reviewed_head).lower() != candidate_head.lower():
+                raise ValueError(f"reviewed head {reviewed_head!r} does not match event candidate "
+                                 f"{candidate_head!r}; accept binds the exact candidate")
+        # Only the newest pending review event for the current round may change
+        # the aggregate review state; older decisions stay in history.
+        latest_review = None
+        for item in card.get("events", []):
+            if isinstance(item, dict) and item.get("kind") in REVIEW_KINDS \
+                    and not item.get("handled"):
+                if latest_review is None or (item.get("seq") or 0) > (latest_review.get("seq") or 0):
+                    latest_review = item
+        card_round = (card.get("pi") or {}).get("round")
+        is_current = (kind in REVIEW_KINDS and latest_review is not None
+                      and latest_review.get("id") == event_id
+                      and event.get("round") == card_round)
         event.update(handled=True, handledAt=now, decision=mapped,
                      reviewedHead=str(reviewed_head) if reviewed_head else None,
                      note=_text(note, MAX_NOTE) if note else None)
+        card.setdefault("handled", {})[event_id] = {
+            "at": now, "decision": mapped,
+            "reviewedHead": str(reviewed_head) if reviewed_head else None,
+            "round": event.get("round")}
+        _prune_events(card)
+        _update_overflow(card, now)
         codex = card.setdefault("codex", _default_codex())
-        codex.update(review=mapped,
-                     reviewedHead=str(reviewed_head) if reviewed_head else codex.get("reviewedHead"),
-                     decidedAt=now, lastEventId=event_id)
+        codex["lastEventId"] = event_id
+        codex["lastDecision"] = mapped
+        codex["lastDecisionAt"] = now
+        if is_current:
+            codex["review"] = mapped
+            if mapped == "accepted":
+                codex["reviewedHead"] = str(reviewed_head)
+            codex["decidedAt"] = now
+        else:
+            history_entry = {"eventId": event_id, "decision": mapped, "at": now,
+                             "round": event.get("round"),
+                             "reviewedHead": str(reviewed_head) if reviewed_head else None}
+            codex["history"] = (codex.get("history") or [])[-19:] + [history_entry]
         board["revision"] = int(board.get("revision") or 0) + 1
         board["updatedAt"] = now
-        atomic(board_file, board)
-        pending = sum(1 for item in card.get("events", [])
-                      if isinstance(item, dict) and not item.get("handled"))
+        _write_board(board_file, board)
         return {"ok": True, "idempotent": False, "taskId": task_id, "eventId": event_id,
-                "decision": mapped, "reviewedHead": reviewed_head,
-                "revision": board["revision"], "pendingCount": pending,
+                "decision": mapped, "reviewedHead": reviewed_head, "aggregate": is_current,
+                "revision": board["revision"], "pendingCount": len(pending_events(card)),
                 "note": "decision binds this exact event/candidate/round; accepted is explicit "
-                        "main review, never exit 0"}
+                        "main review of the current review event, never exit 0"}
     finally:
         os.close(fd)
 
@@ -950,7 +1457,7 @@ def set_paused(repo, task, paused: bool, note=None, now=None) -> dict:
         card["updatedAt"] = now
         board["revision"] = int(board.get("revision") or 0) + 1
         board["updatedAt"] = now
-        atomic(board_file, board)
+        _write_board(board_file, board)
         return {"ok": True, "taskId": task_id, "paused": bool(paused),
                 "revision": board["revision"],
                 "note": ("paused: automatic ticks stop and progress events do not resume work"
@@ -977,7 +1484,8 @@ def cmd_rearm(args) -> dict:
 def cmd_refresh(args) -> dict:
     root, _common, board_file = board_file_for_repo(args.repo)
     task_id = require_task_arg(args.task)
-    return refresh_with_status(board_file, task_id, build_status(str(root), task_id), block=True)
+    return refresh_with_status(board_file, task_id, build_status(str(root), task_id),
+                               block=True, source="cli")
 
 
 def cmd_show(args) -> dict:
@@ -989,6 +1497,7 @@ def cmd_show(args) -> dict:
     cards = select_cards(board, owner=owner, task_id=args.task, include_all=args.all)
     return {"ok": True, "revision": board.get("revision"), "count": len(cards),
             "cards": [compact_card(card) for card in cards],
+            "monitor": _monitor_view(board_file, [card.get("taskId") for card in cards]),
             "note": "compact projection only; no raw logs and no entire history"}
 
 
@@ -1001,15 +1510,17 @@ def cmd_packet(args) -> dict:
     card = board["cards"].get(task_id)
     if not isinstance(card, dict):
         raise ValueError(f"task {task_id!r} is not registered on this board")
-    pending = [event for event in card.get("events", [])
-               if isinstance(event, dict) and not event.get("handled")]
+    pending = pending_events(card)
     if args.event_id:
         pending = [event for event in pending if event.get("id") == args.event_id]
     if not pending:
         return {"ok": True, "taskId": task_id, "pendingCount": 0,
+                "monitor": _monitor_view(board_file, [task_id]).get(task_id),
                 "note": "no unhandled events for this task; nothing to deliver"}
     return {"ok": True, "taskId": task_id, "revision": board.get("revision"),
-            "pendingCount": len(pending),
+            "title": card.get("title"), "goal": card.get("goal"),
+            "pendingCount": len(pending), "overflow": card.get("overflow"),
+            "monitor": _monitor_view(board_file, [task_id]).get(task_id),
             "events": [compact_event(event) for event in pending[:5]],
             "note": "reading/delivering does not handle or accept; use decide"}
 
@@ -1024,7 +1535,11 @@ def cmd_pause(args) -> dict:
 
 
 def cmd_resume(args) -> dict:
-    return set_paused(args.repo, args.task, False, note=args.note)
+    result = set_paused(args.repo, args.task, False, note=args.note)
+    session = args.session_id or os.environ.get("CODEX_THREAD_ID")
+    if session:
+        result["sessionPause"] = resume_session(session)
+    return result
 
 
 def cmd_gate(args) -> dict:
@@ -1057,10 +1572,10 @@ def build_parser() -> argparse.ArgumentParser:
     register.add_argument("--plan-ref")
     register.add_argument("--codex-task-id")
     register.add_argument("--new-nonce", action="store_true",
-                          help="explicitly rotate the automation nonce; clears delivery state")
+                          help="explicitly rotate the automation nonce; clears delivery claims")
     register.set_defaults(func=cmd_register)
 
-    rearm = sub.add_parser("rearm", help="explicitly clear delivery state without changing the prompt")
+    rearm = sub.add_parser("rearm", help="explicitly clear delivery claims without changing the prompt")
     rearm.add_argument("--repo", required=True)
     rearm.add_argument("--task", required=True)
     rearm.add_argument("--session-id", required=True)
@@ -1099,9 +1614,10 @@ def build_parser() -> argparse.ArgumentParser:
     pause.add_argument("--note")
     pause.set_defaults(func=cmd_pause)
 
-    resume = sub.add_parser("resume", help="explicitly resume a paused card")
+    resume = sub.add_parser("resume", help="explicitly resume a paused card (and optional session)")
     resume.add_argument("--repo", required=True)
     resume.add_argument("--task", required=True)
+    resume.add_argument("--session-id", help="also clear an interrupt pause for this session")
     resume.add_argument("--note")
     resume.set_defaults(func=cmd_resume)
 

@@ -255,6 +255,57 @@ class GuardTest(unittest.TestCase):
         self.assertFalse(receipt["timed_out"])
         self.assertFalse(receipt["cancelled"])
 
+    def test_partial_lower_bound_over_budget_breaches_and_stops_child(self):
+        if os.geteuid() == 0:
+            self.skipTest("root ignores directory permissions")
+        locked = self.watch / "locked"
+        locked.mkdir()
+        (locked / "hidden.bin").write_bytes(b"y" * 10)
+        os.chmod(locked, 0o000)
+        self.addCleanup(os.chmod, locked, 0o700)
+        proc = self.start_check(
+            "--watch-path", self.watch, "--max-bytes", "1000",
+            "--health-interval-seconds", "0.2", "--",
+            sys.executable, "-c",
+            "import time; print('START', flush=True); time.sleep(60)")
+        marker = self.wait_marker()
+        pid = json.loads(marker.read_text(encoding="utf-8"))["pid"]
+        (self.watch / "big.bin").write_bytes(b"x" * 50000)
+        stdout, stderr = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 75, stderr)
+        receipt = json.loads(Path(json.loads(stdout)["receipt"]).read_text(encoding="utf-8"))
+        guard = receipt["resource_limit"]
+        self.assertTrue(guard["breached"])
+        self.assertEqual(guard["breach_basis"], "partial lower bound")
+        self.assertTrue(guard["unknown"], "the full size stays unknown")
+        self.assertGreaterEqual(guard["observed_bytes"], 50000)
+        self.assertTrue(guard["stopped_child"])
+        self.assertIn("partial lower bound", guard["reason"])
+        log = self.checks / receipt["log"]
+        self.assertIn("START", log.read_text(encoding="utf-8"))
+        self.assertFalse(self.alive(pid), "a partial lower-bound breach must stop the owned child")
+
+    def test_preflight_partial_over_budget_stops_before_spawn(self):
+        if os.geteuid() == 0:
+            self.skipTest("root ignores directory permissions")
+        (self.watch / "big.bin").write_bytes(b"x" * 50000)
+        locked = self.watch / "locked"
+        locked.mkdir()
+        (locked / "hidden.bin").write_bytes(b"y" * 10)
+        os.chmod(locked, 0o000)
+        self.addCleanup(os.chmod, locked, 0o700)
+        child_marker = self.tmp / "child-ran"
+        proc = self.run_check(
+            "--watch-path", self.watch, "--max-bytes", "1000",
+            "--health-interval-seconds", "0.2", "--",
+            sys.executable, "-c", f"open({str(child_marker)!r}, 'w').write('ran')")
+        self.assertEqual(proc.returncode, 75, proc.stderr)
+        receipt = self.receipt_from(proc)
+        guard = receipt["resource_limit"]
+        self.assertTrue(guard["breached"])
+        self.assertEqual(guard["breach_basis"], "partial lower bound")
+        self.assertFalse(child_marker.exists(), "a proven partial breach must not spawn a child")
+
     def test_guard_timeout_and_cancel_stay_distinct(self):
         (self.watch / "small.bin").write_bytes(b"x" * 10)
         proc = self.run_check(

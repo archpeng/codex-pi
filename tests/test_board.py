@@ -6,6 +6,7 @@ ever invoked; the no-Codex trap and an explicit PI_BIN trap cover the hook path.
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -20,9 +21,36 @@ from pathlib import Path
 from runtime_helpers import (RUNTIME, Repo, base_env, cleanup_repos, default_config,
                              make_pi_trap)
 
+sys.path.insert(0, str(RUNTIME))
+import pi_board  # noqa: E402
+
 BOARD = RUNTIME / "pi_board.py"
 HOOK = RUNTIME / "pi_handoff.py"
 MODEL = "deepseek/deepseek-flash"
+
+
+def board_only(repo, task_id: str = "unit-task", owner: str = "session-A",
+               state: str = "running", round_number: int = 3) -> dict:
+    """A valid in-memory board with one card, for importable unit-level checks."""
+    board = {"schemaVersion": 1, "revision": 1, "createdAt": 1, "updatedAt": 1, "cards": {}}
+    card = pi_board._new_card(task_id, owner, owner, "Unit task", "Unit goal", "brief.md", None,
+                              repo.root, repo.state_dir, str(repo.root), 1)
+    card["pi"] = {"round": round_number, "state": state, "stage": "implementing",
+                   "updatedAt": 1}
+    board["cards"][task_id] = card
+    return board
+
+
+def write_board(repo, board) -> Path:
+    path = repo.state_dir / "board.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(board, indent=2), encoding="utf-8")
+    return path
+
+
+def gate_file(tmp: Path, session: str) -> Path:
+    digest = hashlib.sha256(session.encode("utf-8")).hexdigest()
+    return Path(tmp) / "handoffs" / "gates" / f"{digest}.json"
 
 
 def h_env(tmp: Path, **extra) -> dict:
@@ -163,8 +191,11 @@ class BoardTest(unittest.TestCase):
         reg = self.register(repo, "board-task", env, title="T", goal="G", brief_ref="brief.md")
         self.assertEqual(reg["taskId"], "board-task")
         self.assertEqual(reg["automationId"], "pi-harness")
-        self.assertIn("codex-pi-board-tick ", reg["automationPrompt"])
+        self.assertIn("board probe nonce=", reg["automationPrompt"])
         self.assertIn(reg["nonce"], reg["automationPrompt"])
+        self.assertIn("Purpose: deliver pending board events", reg["automationPrompt"])
+        self.assertIn("pause this probe", reg["automationPrompt"])
+        self.assertLessEqual(len(reg["automationPrompt"]), 200)
         self.assertIn(reg["automationPrompt"], reg["automationEnvelope"])
         self.assertEqual(len(reg["testCommands"]), 2)
         self.assertTrue(any("gate" in command for command in reg["testCommands"]))
@@ -274,12 +305,19 @@ class BoardTest(unittest.TestCase):
                              "--event-id", event["id"], "--decision", "accept",
                              env=env, expect=2)
         self.assertIn("reviewed-head", accepted.stderr)
+        fault_accept = run_board("decide", "--repo", repo.root, "--task", "ghost-task",
+                                 "--event-id", event["id"], "--decision", "accept",
+                                 "--reviewed-head", "a" * 40, env=env, expect=2)
+        self.assertIn("fault/observation", fault_accept.stderr)
         decided = board_json("decide", "--repo", repo.root, "--task", "ghost-task",
-                             "--event-id", event["id"], "--decision", "reject",
+                             "--event-id", event["id"], "--decision", "resolve",
                              "--note", "inspect owner", env=env)
-        self.assertEqual(decided["decision"], "rejected")
-        self.assertTrue(self.card(repo, "ghost-task")["events"][0]["handled"])
-        self.assertEqual(self.card(repo, "ghost-task")["codex"]["review"], "rejected")
+        self.assertEqual(decided["decision"], "resolved")
+        self.assertFalse(decided["aggregate"], "a fault decision never changes review aggregate state")
+        card = self.card(repo, "ghost-task")
+        self.assertTrue(card["events"][0]["handled"])
+        self.assertEqual(card["codex"]["review"], "pending")
+        self.assertEqual(card["codex"]["lastDecision"], "resolved")
 
     def test_decide_binds_exact_event_and_never_auto_accepts(self):
         repo, worktree = self.make()
@@ -369,8 +407,15 @@ class BoardTest(unittest.TestCase):
         board = self.read_board(repo)
         events = board["cards"]["board-race"]["events"]
         self.assertEqual(len([event for event in events if event["kind"] == "review_required"]), 1)
-        self.assertEqual(len(events), 1)
-        self.assertFalse(events[0]["handled"])
+        self.assertEqual(len({event["id"] for event in events}), len(events),
+                         "concurrent refreshes must not publish duplicate event identities")
+        self.assertFalse([event for event in events if event["handled"]])
+        # A single follow-up refresh must neither republish nor rewrite the board.
+        revision = self.read_board(repo)["revision"]
+        self.refresh(repo, "board-race", env)
+        board = self.read_board(repo)
+        self.assertEqual(len(board["cards"]["board-race"]["events"]), len(events))
+        self.assertEqual(board["revision"], revision)
 
     # ------------------------------------------------------------------
     def test_gate_stop_deliver_once_and_passthrough_variants(self):
@@ -378,7 +423,7 @@ class BoardTest(unittest.TestCase):
         env = h_env(self.tmp, PI_DOUBLE_MODE="ok")
         repo.start("board-gate", worktree, env=env)
         self.assertEqual(repo.wait_terminal("board-gate", env=env)["state"], "completed")
-        reg = self.register(repo, "board-gate", env)
+        reg = self.register(repo, "board-gate", env, goal="Review the delivered candidate")
         prompt = envelope(reg["automationId"], reg["automationPrompt"])
         before = self.board_bytes(repo)
         delivered = json.loads(run_hook(gate_payload("session-A", repo.root, prompt), env).stdout)
@@ -386,6 +431,7 @@ class BoardTest(unittest.TestCase):
         self.assertIn("board-gate", context)
         self.assertIn("review_required", context)
         self.assertIn("candidate_head=", context)
+        self.assertIn("goal=Review the delivered candidate", context)
         self.assertIn("decide=python3", context)
         self.assertNotIn("continue", delivered)
         self.assertEqual(self.board_bytes(repo), before,
@@ -627,7 +673,7 @@ class BoardTest(unittest.TestCase):
         self.assertFalse(stopped.get("continue", True))
         rearmed = board_json("rearm", "--repo", repo.root, "--task", "board-rearm",
                              "--session-id", "session-A", env=env)
-        self.assertTrue(rearmed["deliveredCleared"])
+        self.assertTrue(rearmed["claimsCleared"])
         again = json.loads(run_hook(gate_payload("session-A", repo.root, prompt), env).stdout)
         self.assertIn("hookSpecificOutput", again,
                       "an explicit re-arm redelivers delivered but still unhandled events")
@@ -659,7 +705,8 @@ class BoardTest(unittest.TestCase):
         env = h_env(self.tmp, PI_DOUBLE_MODE="ok")
         repo.start("board-show", worktree, env=env)
         self.assertEqual(repo.wait_terminal("board-show", env=env)["state"], "completed")
-        self.register(repo, "board-show", env, session="session-show", title="Visible task")
+        self.register(repo, "board-show", env, session="session-show", title="Visible task",
+                      goal="Visible goal")
         show = board_json("show", "--repo", repo.root, "--owner", "session-show", env=env)
         self.assertEqual(show["count"], 1)
         self.assertEqual(show["cards"][0]["taskId"], "board-show")
@@ -668,6 +715,8 @@ class BoardTest(unittest.TestCase):
         self.assertEqual(other["count"], 0)
         packet = board_json("packet", "--repo", repo.root, "--task", "board-show", env=env)
         self.assertEqual(packet["pendingCount"], 1)
+        self.assertEqual(packet["title"], "Visible task")
+        self.assertEqual(packet["goal"], "Visible goal")
         self.assertEqual(packet["events"][0]["kind"], "review_required")
         self.assertNotIn("summaryText", json.dumps(packet))
         self.assertNotIn("round.jsonl", json.dumps(packet))
@@ -684,6 +733,461 @@ class BoardTest(unittest.TestCase):
         self.assertIn("invalid", failed.stderr)
         failed = run_board("refresh", "--repo", repo.root, "--task", "board-bad", env=env, expect=2)
         self.assertIn("invalid", failed.stderr)
+
+    # ------------------------------------------------------------------
+    # Round 3 review repairs
+    # ------------------------------------------------------------------
+    def test_pending_events_beyond_display_budget_are_retained(self):
+        repo, _worktree = self.make()
+        board = board_only(repo)
+        card = board["cards"]["unit-task"]
+        for index in range(60):
+            event = pi_board.add_event(card, "resource_breach", 3, f"check-{index}:path:100",
+                                       f"breach {index}", {"round": 3, "head": None},
+                                       {"guardPath": "p"}, "resolve or repair", 2 + index)
+            self.assertIsNotNone(event)
+        self.assertEqual(len(pi_board.pending_events(card)), 60)
+        self.assertTrue(card["overflow"]["active"])
+        board_file = write_board(repo, board)
+        env = h_env(self.tmp)
+        show = board_json("show", "--repo", repo.root, "--task", "unit-task", env=env)
+        self.assertEqual(show["cards"][0]["pendingCount"], 60)
+        self.assertTrue(show["cards"][0]["overflow"]["active"])
+        first = pi_board.pending_events(card)[0]
+        decided = board_json("decide", "--repo", repo.root, "--task", "unit-task",
+                             "--event-id", first["id"], "--decision", "resolve", env=env)
+        self.assertEqual(decided["pendingCount"], 59)
+        live, problem = pi_board.read_board(board_file)
+        self.assertIsNone(problem)
+        self.assertEqual(len(pi_board.pending_events(live["cards"]["unit-task"])), 59)
+
+    def test_replay_of_pruned_handled_identity_does_not_resurface(self):
+        repo, _worktree = self.make()
+        board = board_only(repo)
+        card = board["cards"]["unit-task"]
+        event = pi_board.add_event(card, "resource_breach", 3, "check:path:100",
+                                   "s", {}, {}, "q", 1)
+        event.update(handled=True, handledAt=2, decision="resolved")
+        pi_board._prune_events(card)
+        for index in range(pi_board.MAX_HANDLED_EVENTS + 5):
+            extra = pi_board.add_event(card, "resource_breach", 3, f"other-{index}:p:1",
+                                       "s", {}, {}, "q", 3 + index)
+            extra.update(handled=True, handledAt=4 + index, decision="resolved")
+            pi_board._prune_events(card)
+        self.assertIsNone(pi_board.find_event(card, event["id"]))
+        self.assertIn(event["id"], card["handled"])
+        replayed = pi_board.add_event(card, "resource_breach", 3, "check:path:100",
+                                      "s", {}, {}, "q", 99)
+        self.assertIsNone(replayed, "a pruned handled identity must never resurface")
+
+    def test_overflow_write_refusal_is_explicit_and_keeps_old_bytes(self):
+        repo, _worktree = self.make()
+        board = board_only(repo)
+        board_file = write_board(repo, board)
+        before = board_file.read_bytes()
+        card = board["cards"]["unit-task"]
+        payload = "x" * pi_board.MAX_SUMMARY
+        for index in range(4000):
+            pi_board.add_event(card, "resource_breach", 3, f"huge-{index}:p:1", payload,
+                               {"round": 3, "head": None}, {"guardPath": "p"}, "q", index)
+        self.assertGreater(len(pi_board._serialized_board(board)), pi_board.MAX_BOARD_BYTES)
+        with self.assertRaises(pi_board.BoardOverflow):
+            pi_board._write_board(board_file, board)
+        self.assertEqual(board_file.read_bytes(), before,
+                         "a refused overflow write must not truncate the board")
+        self.assertGreaterEqual(len(pi_board.pending_events(card)), 4000,
+                                "refusing the write must not drop unhandled events")
+
+    def test_gate_claims_only_represented_events_and_expires_for_retry(self):
+        repo, worktree = self.make()
+        env = h_env(self.tmp, PI_DOUBLE_MODE="ok")
+        repo.start("board-claims", worktree, env=env)
+        self.assertEqual(repo.wait_terminal("board-claims", env=env)["state"], "completed")
+        reg = self.register(repo, "board-claims", env, session="session-claims")
+        board_file = Path(reg["boardPath"])
+        board, problem = pi_board.read_board(board_file)
+        self.assertIsNone(problem)
+        card = board["cards"]["board-claims"]
+        round_number = card["pi"]["round"]
+        for index in range(3):
+            pi_board.add_event(card, "resource_breach", round_number,
+                               f"extra-{index}:p:{100 + index}", f"extra breach {index}",
+                               {"round": round_number, "head": None},
+                               {"guardPath": "p", "observedBytes": 10}, "resolve or repair",
+                               time.time() + index)
+        pi_board._write_board(board_file, board)
+        prompt = envelope(reg["automationId"], reg["automationPrompt"])
+        payload = gate_payload("session-claims", repo.root, prompt)
+        first = json.loads(run_hook(payload, env).stdout)
+        context = first["hookSpecificOutput"]["additionalContext"]
+        gate = json.loads(gate_file(self.tmp, "session-claims").read_text(encoding="utf-8"))
+        claimed = set(gate["claims"])
+        self.assertTrue(claimed, "the tick must claim something")
+        for event_id in claimed:
+            self.assertIn(event_id, context, "every claimed event must be fully represented")
+        self.assertLess(len(claimed), 4, "only fully represented events may be claimed")
+        second = json.loads(run_hook(payload, env).stdout)
+        self.assertIn("hookSpecificOutput", second,
+                      "the remaining unclaimed event is delivered on the next tick")
+        gate = json.loads(gate_file(self.tmp, "session-claims").read_text(encoding="utf-8"))
+        self.assertEqual(len(gate["claims"]), 4)
+        third = json.loads(run_hook(payload, env).stdout)
+        self.assertFalse(third.get("continue", True),
+                         "duplicate ticks stay quiet during the claim")
+        gate["claims"] = {key: 1.0 for key in gate["claims"]}
+        gate_file(self.tmp, "session-claims").write_text(json.dumps(gate), encoding="utf-8")
+        retried = json.loads(run_hook(payload, env).stdout)
+        self.assertIn("hookSpecificOutput", retried,
+                      "an expired claim must be retried after a lost turn")
+        board, _ = pi_board.read_board(board_file)
+        card = board["cards"]["board-claims"]
+        target = pi_board.pending_events(card)[0]
+        board_json("decide", "--repo", repo.root, "--task", "board-claims",
+                   "--event-id", target["id"], "--decision", "resolve", env=env)
+        gate = json.loads(gate_file(self.tmp, "session-claims").read_text(encoding="utf-8"))
+        gate["claims"] = {key: 1.0 for key in gate["claims"]}
+        gate_file(self.tmp, "session-claims").write_text(json.dumps(gate), encoding="utf-8")
+        after = json.loads(run_hook(payload, env).stdout)
+        text = after.get("hookSpecificOutput", {}).get("additionalContext", "")
+        self.assertNotIn(target["id"], text, "a handled event must never resurface")
+        # Pause suppresses retries even after a claim expires.
+        board_json("pause", "--repo", repo.root, "--task", "board-claims", env=env)
+        gate = json.loads(gate_file(self.tmp, "session-claims").read_text(encoding="utf-8"))
+        gate["claims"] = {key: 1.0 for key in gate["claims"]}
+        gate_file(self.tmp, "session-claims").write_text(json.dumps(gate), encoding="utf-8")
+        paused = json.loads(run_hook(payload, env).stdout)
+        self.assertFalse(paused.get("continue", True), "pause suppresses expired-claim retries")
+        self.assertNotIn("hookSpecificOutput", paused)
+        board_json("resume", "--repo", repo.root, "--task", "board-claims", env=env)
+        resumed = json.loads(run_hook(payload, env).stdout)
+        self.assertIn("hookSpecificOutput", resumed,
+                      "explicit resume re-delivers the still-unhandled events")
+
+    def test_packet_size_boundary_claims_only_fitting_events(self):
+        repo, _worktree = self.make()
+        board = board_only(repo)
+        card = board["cards"]["unit-task"]
+        pairs = []
+        for index in range(4):
+            event = pi_board.add_event(card, "resource_breach", 3, f"size-{index}:p:1",
+                                       "s" * pi_board.MAX_SUMMARY,
+                                       {"round": 3, "head": None},
+                                       {"guardPath": "p", "observedBytes": index},
+                                       "q" * 300, index)
+            pairs.append((card, event))
+        original = pi_board.MAX_PACKET_CHARS
+        pi_board.MAX_PACKET_CHARS = 1200
+        try:
+            text, included = pi_board.build_packet(pairs)
+        finally:
+            pi_board.MAX_PACKET_CHARS = original
+        self.assertGreaterEqual(len(included), 1)
+        self.assertLess(len(included), 4, "the size boundary must omit at least one event")
+        for _card, event in included:
+            self.assertIn(event["id"], text)
+
+    def test_decide_current_vs_old_round_and_conflicting_replay(self):
+        repo, _worktree = self.make()
+        env = h_env(self.tmp)
+        board = board_only(repo, task_id="review-task", owner="session-r", state="running")
+        card = board["cards"]["review-task"]
+        old_head, new_head = "a" * 40, "b" * 40
+        old_event = pi_board.add_event(card, "review_required", 3, "old", "round 3 terminal",
+                                       {"round": 3, "head": old_head}, {"stateRef": "s"},
+                                       "review", 1)
+        new_event = pi_board.add_event(card, "review_required", 4, "new", "round 4 terminal",
+                                       {"round": 4, "head": new_head}, {"stateRef": "s"},
+                                       "review", 2)
+        card["pi"]["round"] = 4
+        board_file = write_board(repo, board)
+        old_decided = board_json("decide", "--repo", repo.root, "--task", "review-task",
+                                 "--event-id", old_event["id"], "--decision", "accept",
+                                 "--reviewed-head", old_head, env=env)
+        self.assertFalse(old_decided["aggregate"], "an old round decision stays history")
+        board, _ = pi_board.read_board(board_file)
+        self.assertEqual(board["cards"]["review-task"]["codex"]["review"], "pending")
+        new_decided = board_json("decide", "--repo", repo.root, "--task", "review-task",
+                                 "--event-id", new_event["id"], "--decision", "accept",
+                                 "--reviewed-head", new_head, env=env)
+        self.assertTrue(new_decided["aggregate"])
+        board, _ = pi_board.read_board(board_file)
+        self.assertEqual(board["cards"]["review-task"]["codex"]["review"], "accepted")
+        conflict = run_board("decide", "--repo", repo.root, "--task", "review-task",
+                             "--event-id", new_event["id"], "--decision", "accept",
+                             "--reviewed-head", "c" * 40, env=env, expect=2)
+        self.assertIn("different reviewed head", conflict.stderr)
+        old_conflict = run_board("decide", "--repo", repo.root, "--task", "review-task",
+                                 "--event-id", old_event["id"], "--decision", "accept",
+                                 "--reviewed-head", "d" * 40, env=env, expect=2)
+        self.assertIn("different reviewed head", old_conflict.stderr)
+
+    def test_decide_rejects_unknown_head(self):
+        repo, _worktree = self.make()
+        env = h_env(self.tmp)
+        board = board_only(repo, task_id="unknown-head", owner="session-u", state="running")
+        card = board["cards"]["unknown-head"]
+        event = pi_board.add_event(card, "review_required", 3, "no-head", "s",
+                                   {"round": 3, "head": None}, {}, "q", 1)
+        write_board(repo, board)
+        proc = run_board("decide", "--repo", repo.root, "--task", "unknown-head",
+                         "--event-id", event["id"], "--decision", "accept",
+                         "--reviewed-head", "a" * 40, env=env, expect=2)
+        self.assertIn("no valid candidate", proc.stderr)
+
+    def put_monitor(self, repo, task, **fields):
+        path = repo.state_dir / "board.monitor.json"
+        path.write_text(json.dumps({"schemaVersion": 1,
+                                    "tasks": {task: dict(fields, task=task)}}), encoding="utf-8")
+
+    def test_monitor_healthy_quiet_task_has_no_stale_event(self):
+        repo, worktree = self.make()
+        env = h_env(self.tmp, PI_DOUBLE_MODE="hang")
+        repo.start("board-monitor-healthy", worktree, env=env)
+        repo.wait_round_state("board-monitor-healthy", "running")
+        try:
+            reg = self.register(repo, "board-monitor-healthy", env, session="session-mh")
+            prompt = envelope(reg["automationId"], reg["automationPrompt"])
+            tick = json.loads(run_hook(gate_payload("session-mh", repo.root, prompt), env).stdout)
+            self.assertFalse(tick.get("continue", True), "healthy quiet work stays quiet")
+            card = self.card(repo, "board-monitor-healthy")
+            self.assertEqual([event for event in card["events"]
+                              if event["kind"] == "monitor_stale"], [])
+        finally:
+            repo.cancel("board-monitor-healthy", env=env)
+            repo.wait_terminal("board-monitor-healthy", env=env, timeout=25)
+
+    def _monitor_case(self, name: str, mutate, expected: str, *, terminal: bool = False):
+        repo, worktree = self.make(name=f"repo-{name}")
+        mode = "ok" if terminal else "hang"
+        env = h_env(self.tmp, PI_DOUBLE_MODE=mode)
+        task = f"task-{name}"
+        repo.start(task, worktree, env=env)
+        if terminal:
+            self.assertEqual(repo.wait_terminal(task, env=env)["state"], "completed")
+        else:
+            repo.wait_round_state(task, "running")
+        try:
+            reg = self.register(repo, task, env, session=f"session-{name}")
+            mutate(repo, task)
+            prompt = envelope(reg["automationId"], reg["automationPrompt"])
+            tick = json.loads(run_hook(gate_payload(f"session-{name}", repo.root, prompt), env).stdout)
+            card = self.card(repo, task)
+            events = [event for event in card["events"] if event["kind"] == "monitor_stale"]
+            if terminal:
+                self.assertEqual(events, [], "a terminal card has no monitor lease to lose")
+                self.assertIn("hookSpecificOutput", tick,
+                              "the terminal review event still delivers")
+                return
+            self.assertEqual(len(events), 1, tick)
+            self.assertIn(expected, events[0]["summary"])
+            self.assertIn("hookSpecificOutput", tick)
+            # a second tick does not publish a second stale event
+            run_hook(gate_payload(f"session-{name}", repo.root, prompt), env)
+            card = self.card(repo, task)
+            self.assertEqual(len([event for event in card["events"]
+                                  if event["kind"] == "monitor_stale"]), 1)
+        finally:
+            if not terminal:
+                repo.cancel(task, env=env)
+                repo.wait_terminal(task, env=env, timeout=25)
+
+    def test_monitor_missing_expired_corrupt_and_error_are_visible(self):
+        def remove(repo, task):
+            (repo.state_dir / "board.monitor.json").unlink()
+        self._monitor_case("missing", remove, "missing")
+
+        def expire(repo, task):
+            self.put_monitor(repo, task, healthy=True, error=None, source="supervisor",
+                             refreshedAt=time.time() - 10000)
+        self._monitor_case("expired", expire, "expired")
+
+        def corrupt(repo, task):
+            (repo.state_dir / "board.monitor.json").write_text("{broken", encoding="utf-8")
+        self._monitor_case("corrupt", corrupt, "invalid")
+
+        def errored(repo, task):
+            self.put_monitor(repo, task, healthy=False, error="simulated monitor failure",
+                             source="monitor", refreshedAt=time.time())
+        self._monitor_case("error", errored, "monitor error")
+
+        self._monitor_case("terminal", lambda repo, task: None, "", terminal=True)
+
+    def test_interrupt_pauses_and_only_resume_rearms(self):
+        repo, worktree = self.make()
+        env = h_env(self.tmp, PI_DOUBLE_MODE="ok")
+        repo.start("board-pause-session", worktree, env=env)
+        self.assertEqual(repo.wait_terminal("board-pause-session", env=env)["state"], "completed")
+        reg = self.register(repo, "board-pause-session", env, session="session-interrupt")
+        prompt = envelope(reg["automationId"], reg["automationPrompt"])
+        payload = gate_payload("session-interrupt", repo.root, prompt)
+        run_hook({"hook_event_name": "Interrupt", "session_id": "session-interrupt",
+                  "cwd": str(repo.root), "turn_id": "t1"}, env)
+        paused = json.loads(run_hook(payload, env).stdout)
+        self.assertFalse(paused.get("continue", True), "an automatic tick stays stopped")
+        self.assertNotIn("hookSpecificOutput", paused)
+        human = run_hook(gate_payload("session-interrupt", repo.root, "ordinary question"), env)
+        self.assertEqual(json.loads(human.stdout), {}, "a human prompt is never blocked")
+        run_hook({"hook_event_name": "SessionStart", "session_id": "session-interrupt",
+                  "cwd": str(repo.root)}, env)
+        still_paused = json.loads(run_hook(payload, env).stdout)
+        self.assertFalse(still_paused.get("continue", True),
+                         "SessionStart must not silently clear an interrupt pause")
+        board_json("resume", "--repo", repo.root, "--task", "board-pause-session",
+                   "--session-id", "session-interrupt", env=env)
+        resumed = json.loads(run_hook(payload, env).stdout)
+        self.assertIn("hookSpecificOutput", resumed, "explicit resume re-arms the gate")
+
+    def test_gate_claim_lock_contention_never_blocks_conversation(self):
+        repo, worktree = self.make()
+        env = h_env(self.tmp, PI_DOUBLE_MODE="ok")
+        repo.start("board-claim-lock", worktree, env=env)
+        self.assertEqual(repo.wait_terminal("board-claim-lock", env=env)["state"], "completed")
+        reg = self.register(repo, "board-claim-lock", env, session="session-claim-lock")
+        payload = gate_payload("session-claim-lock", repo.root,
+                               envelope(reg["automationId"], reg["automationPrompt"]))
+        lock_path = gate_file(self.tmp, "session-claim-lock").with_suffix(".lock")
+        stream = open(lock_path, "a+", encoding="utf-8")
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        try:
+            started = time.monotonic()
+            proc = run_hook(payload, env, timeout=5)
+            elapsed = time.monotonic() - started
+            self.assertEqual(proc.returncode, 0)
+            data = json.loads(proc.stdout)
+            self.assertFalse(data.get("continue", True), "a claim collision turns the tick into a quiet stop")
+            self.assertNotIn("hookSpecificOutput", data)
+            self.assertLess(elapsed, 3.0, f"claim contention blocked the hook for {elapsed:.2f}s")
+        finally:
+            fcntl.flock(stream, fcntl.LOCK_UN)
+            stream.close()
+        delivered = json.loads(run_hook(payload, env).stdout)
+        self.assertIn("hookSpecificOutput", delivered,
+                      "the next tick delivers after the claim lock is released")
+
+    def test_resource_fingerprint_is_stable_while_bytes_grow(self):
+        repo, worktree = self.make()
+        env = h_env(self.tmp, PI_DOUBLE_MODE="hang")
+        repo.start("board-growing-breach", worktree, env=env)
+        repo.wait_round_state("board-growing-breach", "running")
+        checks = repo.task_dir("board-growing-breach") / "rounds" / "1" / "round.checks"
+        checks.mkdir(parents=True, exist_ok=True)
+        log = checks / "growing-check-abc.log"
+        log.write_text("check output\n", encoding="utf-8")
+        marker = checks / "growing-check-abc.running"
+
+        def emit(observed):
+            marker.write_text(json.dumps({
+                "schema_version": 1, "id": "growing-check", "pid": os.getpid(),
+                "started_at": time.time(), "deadline_at": time.time() + 600,
+                "timeout_seconds": 600, "deadline_scope": "wrapper timeout only",
+                "log": log.name, "receipt": "growing-check-abc.json",
+                "resource_limit": {"path": str(self.tmp / "watch"), "max_bytes": 100,
+                                   "observed_bytes": observed, "breached": True,
+                                   "unknown": False, "complete": True,
+                                   "reason": f"observed at least {observed} bytes"},
+            }), encoding="utf-8")
+
+        try:
+            self.register(repo, "board-growing-breach", env)
+            emit(100)
+            self.refresh(repo, "board-growing-breach", env)
+            emit(900)
+            self.refresh(repo, "board-growing-breach", env)
+            card = self.card(repo, "board-growing-breach")
+            events = [event for event in card["events"] if event["kind"] == "resource_breach"]
+            self.assertEqual(len(events), 1, "one continuing breach is one event")
+        finally:
+            repo.cancel("board-growing-breach", env=env)
+            repo.wait_terminal("board-growing-breach", env=env, timeout=25)
+
+    def test_monitor_exception_becomes_a_visible_unhealthy_lease(self):
+        repo, _worktree = self.make()
+        board = board_only(repo, task_id="monitor-boom", owner="session-mb", state="running")
+        board_file = write_board(repo, board)
+        original = pi_board.build_status
+
+        def broken(*args, **kwargs):
+            raise ValueError("simulated status failure")
+
+        pi_board.build_status = broken
+        try:
+            result = pi_board.refresh_supervisor({
+                "repo": str(repo.root), "task": "monitor-boom",
+                "commonDir": str(repo.state_dir.parent)})
+        finally:
+            pi_board.build_status = original
+        self.assertFalse(result["ok"])
+        monitors, problem = pi_board.read_monitors(board_file)
+        self.assertIsNone(problem)
+        record = pi_board.monitor_for(monitors, "monitor-boom")
+        self.assertIsInstance(record, dict)
+        self.assertFalse(record.get("healthy"))
+        self.assertIn("simulated status failure", record.get("error") or "")
+
+    def test_unregistered_task_avoids_status_work(self):
+        repo, _worktree = self.make()
+        board = board_only(repo, task_id="registered-other", owner="session-o")
+        write_board(repo, board)
+        calls = []
+        original = pi_board.build_status
+
+        def forbidden(*args, **kwargs):
+            calls.append(args)
+            raise AssertionError("build_status must not run for an unregistered task")
+
+        pi_board.build_status = forbidden
+        try:
+            result = pi_board.refresh_registered_task({
+                "repo": str(repo.root), "task": "not-registered",
+                "commonDir": str(repo.state_dir.parent)})
+        finally:
+            pi_board.build_status = original
+        self.assertFalse(result["refreshed"])
+        self.assertEqual(calls, [])
+        self.assertEqual(result["reason"], "task is not registered")
+
+    def test_ordinary_prompt_under_board_write_lock_is_fast(self):
+        repo, worktree = self.make()
+        env = h_env(self.tmp, PI_DOUBLE_MODE="ok")
+        repo.start("board-normal-lock", worktree, env=env)
+        self.assertEqual(repo.wait_terminal("board-normal-lock", env=env)["state"], "completed")
+        self.register(repo, "board-normal-lock", env, session="session-normal-lock")
+        lock_path = repo.state_dir / "board.lock"
+        stream = open(lock_path, "a+", encoding="utf-8")
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        try:
+            started = time.monotonic()
+            proc = run_hook(gate_payload("session-normal-lock", repo.root,
+                                         "ordinary human question"), env, timeout=5)
+            elapsed = time.monotonic() - started
+            self.assertEqual(proc.returncode, 0)
+            self.assertEqual(json.loads(proc.stdout), {})
+            self.assertLess(elapsed, 3.0,
+                            f"the normal prompt path waited on a board lock for {elapsed:.2f}s")
+        finally:
+            fcntl.flock(stream, fcntl.LOCK_UN)
+            stream.close()
+
+    def test_audit_records_only_hook_input_key_names(self):
+        repo, worktree = self.make()
+        env = h_env(self.tmp, PI_DOUBLE_MODE="ok")
+        repo.start("board-audit", worktree, env=env)
+        self.assertEqual(repo.wait_terminal("board-audit", env=env)["state"], "completed")
+        reg = self.register(repo, "board-audit", env, session="session-audit")
+        payload = gate_payload("session-audit", repo.root,
+                               envelope(reg["automationId"], reg["automationPrompt"]))
+        payload["turnTrigger"] = "automation_heartbeat_scheduled"  # ignored by the gate
+        run_hook(payload, env)
+        audit = self.tmp / "handoffs" / "gates" / "gate-audit.jsonl"
+        lines = [json.loads(line) for line in audit.read_text(encoding="utf-8").splitlines() if line]
+        self.assertTrue(lines)
+        last = lines[-1]
+        self.assertEqual(last["decision"], "deliver")
+        self.assertIn("prompt", last["inputKeys"])
+        self.assertIn("session_id", last["inputKeys"])
+        rendered = json.dumps(last)
+        self.assertNotIn(reg["automationPrompt"], rendered, "the audit must not copy the prompt")
+        self.assertNotIn(reg["nonce"], rendered, "the audit must not copy the nonce")
 
 
 if __name__ == "__main__":
