@@ -1688,7 +1688,10 @@ class PhaseTest(unittest.TestCase):
                 "minRun": 2, "forbidSkip": True}
         path = self.write_contract("counts-gate.json",
                                    self.contract(repo, "P-PYCOUNT", design_sha=sha, items=[item]))
-        env = self.h_env(PI_DOUBLE_MODE="delay-ok", PI_DOUBLE_DELAY="6")
+        # Importing the sample must not create an untracked __pycache__ that
+        # makes this otherwise-clean candidate receipt dirty.
+        env = self.h_env(PI_DOUBLE_MODE="delay-ok", PI_DOUBLE_DELAY="6",
+                         PYTHONDONTWRITEBYTECODE="1")
         self.start(repo, worktree, "counts-gate", path, env)
         repo.wait_round_state("counts-gate", "running")
         checks = repo.task_dir("counts-gate") / "rounds" / "1" / "round.checks"

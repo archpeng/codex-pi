@@ -1,4 +1,13 @@
-# 验证记录（2026-09-26）
+# 验证记录
+
+## 0.5.1 三次验收失败转由 Codex 实施（2026-09-27）
+
+按同一交付目标的正式质量否决计数，不按Pi工具调用或总轮号。第三次交付未过验收时产生接手事件；普通continue、自动补证和内部worker均不得再启动Pi。原Codex主会话确认writer释放后整体重审方案并直接实施，原生Pi的Flash限制保持，未引入第二个Codex模型。
+
+- [全套241项原始回归](validation/takeover-full-20260927.log)：240通过，1项既有Python计数夹具失败。根因是导入sample_gate生成未跟踪的__pycache__，导致候选receipt正确标dirty并触发缺证续行；没有放宽运行时准入或修改判分。
+- 对该夹具设置PYTHONDONTWRITEBYTECODE后，[原测试完整复跑通过](validation/takeover-count-fixture-20260927.log)，仍核对真实通过、skip/失败/未知计数、board与accept的拒绝/恢复。其他240项代码和结果同范围复用，未将初次全量运行改写成全绿。
+- [7项接手专项](validation/takeover-focused-20260927.log)通过，包括三个实际进程替身交付轮次后第四轮零启动、重复事件不重复计数、合同变化不清零、外部缺料分类不可重放篡改、历史phase决定、resume/记录裁剪不清接手、自动/内部worker拒绝。全部使用本地进程替身，无真实模型或provider调用。
+- Plugin/Skill结构校验与diff检查通过；项目监督Skill、配置和执行合同同步。安装刷新与现有冻结helper采用是不同边界，不能将源码完成冒称所有活动会话已热升级。
 
 ## 0.3.0 有界等待与两个真实任务迁移
 

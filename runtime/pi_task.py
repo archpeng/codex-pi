@@ -80,7 +80,7 @@ PHASE_TERMINAL_STATES = ("completed", "failed", "timed_out", "cancelled", "inter
 CONFIG_KEYS = ("schemaVersion", "model", "thinking", "constraints", "checks",
                "maxWorkers", "timeoutSeconds")
 HELPER_FILES = ("pi_task.py", "pi_phase.py", "pi_summary.py", "pi_check.py", "pi_copy.py",
-                "pi_size.py", "pi_board.py", "VERSION")
+                "pi_size.py", "pi_board.py", "pi_takeover.py", "VERSION")
 REFERENCE_EXTENSIONS = ("md", "markdown", "txt", "json", "sh", "bash", "zsh", "py",
                         "js", "mjs", "cjs", "ts", "tsx", "yaml", "yml", "toml", "cfg", "ini")
 
@@ -998,6 +998,10 @@ def board_pause_active(task: dict):
     card = (board.get("cards") or {}).get(task_id)
     if not isinstance(card, dict):
         return False, None
+    from pi_takeover import review_policy
+    policy = review_policy(card)
+    if policy["takeoverRequired"]:
+        return True, policy["instruction"]
     if card.get("paused"):
         return True, "board card is paused"
     thread = card.get("ownerThread")
@@ -2289,6 +2293,9 @@ def run_worker(args) -> int:
     # internal _worker entry and an edited/stale task.json must not bypass the
     # model restriction.
     require_allowed_model(task.get("model"), "frozen task")
+    blocked, reason = board_pause_active(task)
+    if blocked and reason and reason.startswith("Codex takeover required"):
+        raise ValueError(reason)
     round_number = int(args.round)
     timeout_seconds = float(args.timeout_seconds)
 
@@ -2309,6 +2316,9 @@ def run_worker(args) -> int:
     worktree = Path(task["worktree"])
 
     while True:
+        blocked, reason = board_pause_active(task)
+        if blocked and reason and reason.startswith("Codex takeover required"):
+            raise ValueError(reason)
         round_dir = task_dir / "rounds" / str(round_number)
         if not round_dir.is_dir():
             raise ValueError(f"round directory is missing: {round_dir}")
@@ -2642,6 +2652,8 @@ def cmd_continue(args) -> dict:
         if lock_is_held(task_dir / ".supervisor.lock"):
             raise ValueError("supervisor lease is still held; task is not terminal-known")
         paused, pause_reason = board_pause_active(frozen)
+        if paused and pause_reason and pause_reason.startswith("Codex takeover required"):
+            raise ValueError(pause_reason)
         if paused:
             raise ValueError(f"task handoff is paused ({pause_reason}); an explicit pi_board resume "
                              "is required before continuing")

@@ -103,3 +103,15 @@ For a phase task with `resourceLimits`, the supervisor additionally measures eve
 Directory guards measure declared regular-file bytes without following symlinks. An observed known breach stops only the owned command group and records the failure; an incomplete measurement stays unknown. The copy helper preserves literal symlinks and refuses existing destinations, recursion, known overages or unknown verification. These rules prevent the 14 MB → 6.5 GB expansion incident without asking the main model to poll.
 
 See [handoff and recovery](handoff.md) for event decisions, uncertain delivery, interruption and safe migration.
+
+## Review failure and direct Codex implementation
+
+Negative delivery decisions default to quality failures. For example:
+
+```sh
+python3 runtime/pi_board.py decide --repo REPO --task TASK --event-id EVENT --decision changes_requested --failure-kind quality --note "Actual outcome failed the bound acceptance check"
+```
+
+Only genuine missing external evidence/authority uses `--failure-kind external` with a nonempty `--note` naming the unlock condition. `reviewPolicy` in `decide`/`show` exposes the three-delivery limit, distinct failed rounds and implementation owner. Exact replays do not increment; a contract edit cannot reset the phase count. Old phase-bound negative decisions count unless explicitly classified otherwise; inspect their actual reports before drawing a model-capability conclusion. No PID/log activity, raw test failure or queue delivery increments the counter by itself.
+
+At three, `codex_takeover_required` is emitted and Pi continuation is refused, including after board resume. This transfers the remaining outcome to the existing main task; it does not launch a model or grant write ownership. First prove the worker/supervisor/descendants stopped, then follow the Skill's whole-outcome reassessment, coherent design and direct Codex implementation. Preserve task evidence and use project-level checks/acceptance for the new code. Do not accept the old Pi candidate as evidence for Codex's later implementation. Keep the completed Pi task as a retained handoff record; a future independently authorized outcome is a separate dispatch, never a disguised retry.

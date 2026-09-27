@@ -1,0 +1,12 @@
+test_accepted_outcome_and_different_phase_do_not_inherit_a_failed_streak (test_takeover.TakeoverTest.test_accepted_outcome_and_different_phase_do_not_inherit_a_failed_streak) ... ok
+test_continue_refuses_before_mutating_rounds_or_launching_a_worker (test_takeover.TakeoverTest.test_continue_refuses_before_mutating_rounds_or_launching_a_worker) ... ok
+test_legacy_phase_decisions_count_and_latch_survives_pruning_and_resume (test_takeover.TakeoverTest.test_legacy_phase_decisions_count_and_latch_survives_pruning_and_resume) ... ok
+test_non_delivery_faults_and_progress_never_count (test_takeover.TakeoverTest.test_non_delivery_faults_and_progress_never_count) ... ok
+test_third_distinct_review_latches_and_duplicate_cannot_double_count (test_takeover.TakeoverTest.test_third_distinct_review_latches_and_duplicate_cannot_double_count) ... ok
+test_three_real_completed_rounds_cannot_launch_a_fourth (test_takeover.TakeoverTest.test_three_real_completed_rounds_cannot_launch_a_fourth) ... ok
+test_two_events_on_one_round_count_once_and_external_blocker_does_not (test_takeover.TakeoverTest.test_two_events_on_one_round_count_once_and_external_blocker_does_not) ... ok
+
+----------------------------------------------------------------------
+Ran 7 tests in 7.075s
+
+OK

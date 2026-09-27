@@ -55,6 +55,8 @@ from pi_task import (ACTIVE_STATES, TERMINAL_STATES, TASK_RE, LockHeld, atomic, 
                      normalize_candidate, probe_worktree_head, read_json,
                      require_allowed_model, require_task_arg, task_dir_for, terminate)
 
+from pi_takeover import FAILURE_KINDS, TAKEOVER_MESSAGE, review_policy
+
 SCHEMA_VERSION = 1
 BOARD_DIR = "codex-pi"
 BOARD_FILE = "board.json"
@@ -1976,6 +1978,7 @@ def compact_card(card: dict, max_events: int = 5) -> dict:
         "paused": bool(card.get("paused")), "pausedAt": card.get("pausedAt"),
         "pauseNote": card.get("pauseNote"), "pi": card.get("pi"),
         "phase": card.get("phase"), "progress": card.get("progress"),
+        "reviewPolicy": review_policy(card),
         "evidence": card.get("evidence"), "check": card.get("check"),
         "progressNotify": _notify_view(card),
         "attention": card.get("attention"), "codex": card.get("codex"),
@@ -2167,7 +2170,7 @@ def _resolve_commit(worktree, object_id):
 
 
 def decide(repo, task, event_id, decision, reviewed_head=None, note=None, phase=None,
-           contract_hash=None, now=None) -> dict:
+           contract_hash=None, now=None, failure_kind=None) -> dict:
     now = time.time() if now is None else now
     event_id = str(event_id)
     if not EVENT_ID_RE.fullmatch(event_id):
@@ -2175,6 +2178,10 @@ def decide(repo, task, event_id, decision, reviewed_head=None, note=None, phase=
     mapped = DECISIONS.get(decision)
     if mapped is None:
         raise ValueError("decision must be accept, reject, changes_requested or resolve")
+    if failure_kind is not None and (failure_kind not in FAILURE_KINDS or mapped not in ("rejected", "changes_requested")):
+        raise ValueError("--failure-kind applies only to reject/changes_requested: quality or external")
+    if failure_kind == "external" and not (isinstance(note, str) and note.strip()):
+        raise ValueError("external blockers require --note with the missing input/authority and unlock condition")
     _root, _common, board_file = board_file_for_repo(repo)
     task_id = require_task_arg(task)
     fd = lock_fd(board_file.with_name(BOARD_LOCK), blocking=True, timeout=10)
@@ -2190,6 +2197,10 @@ def decide(repo, task, event_id, decision, reviewed_head=None, note=None, phase=
         history = (card.get("handled") or {}).get(event_id) if event is None else None
         if event is None and not isinstance(history, dict):
             raise ValueError(f"unknown event {event_id} for task {task_id!r}")
+        effective_kind = failure_kind or ("quality" if mapped in ("rejected", "changes_requested") else None)
+        prior_decision = event if event is not None else history
+        if prior_decision.get("handled", event is None) and failure_kind is not None and prior_decision.get("failureKind", "quality") != failure_kind:
+            raise ValueError("conflicting replay: failure classification is immutable")
         if event is None:
             if history.get("phaseId") and mapped == "accepted" \
                     and (phase != history.get("phaseId")
@@ -2318,14 +2329,15 @@ def decide(repo, task, event_id, decision, reviewed_head=None, note=None, phase=
         is_current = (kind in REVIEW_KINDS and latest_review is not None
                       and latest_review.get("id") == event_id
                       and event.get("round") == card_round)
-        event.update(handled=True, handledAt=now, decision=mapped,
+        event.update(handled=True, handledAt=now, decision=mapped, failureKind=effective_kind,
                      reviewedHead=str(reviewed_head) if reviewed_head else None,
                      note=_text(note, MAX_NOTE) if note else None)
         card.setdefault("handled", {})[event_id] = {
             "at": now, "decision": mapped,
             "reviewedHead": str(reviewed_head) if reviewed_head else None,
             "round": event.get("round"), "phaseId": event.get("phaseId"),
-            "contractHash": event.get("contractHash")}
+            "contractHash": event.get("contractHash"), "eventKind": kind,
+            "failureKind": effective_kind}
         if event_phase:
             phase_card = card.setdefault("phase", {})
             phase_card["decidedEventId"] = event_id
@@ -2359,11 +2371,23 @@ def decide(repo, task, event_id, decision, reviewed_head=None, note=None, phase=
                              "phaseId": event.get("phaseId"),
                              "contractHash": event.get("contractHash")}
             codex["history"] = (codex.get("history") or [])[-19:] + [history_entry]
+        policy = review_policy(card)
+        if policy["takeoverRequired"]:
+            codex.setdefault("takeover", {"required": True, "at": now, "scope": policy["scope"],
+                                         "failedReports": policy["failedReports"]})
+            takeover = add_event(card, "codex_takeover_required", card_round, "three-failed-deliveries",
+                                 "Codex must take over implementation after three failed reviewed deliveries",
+                                 event.get("candidate") or {}, {"reviewPolicy": policy},
+                                 TAKEOVER_MESSAGE, now)
+            if takeover is not None:
+                takeover["phaseId"] = event_phase
+                takeover["contractHash"] = event.get("contractHash")
         board["revision"] = int(board.get("revision") or 0) + 1
         board["updatedAt"] = now
         _write_board(board_file, board)
         return {"ok": True, "idempotent": False, "taskId": task_id, "eventId": event_id,
                 "decision": mapped, "reviewedHead": reviewed_head, "aggregate": is_current,
+                "reviewPolicy": policy,
                 "phaseId": event_phase, "contractHash": event.get("contractHash"),
                 "revision": board["revision"], "pendingCount": len(pending_events(card)),
                 "note": "decision binds this exact event/candidate/round; accepted is explicit "
@@ -2479,7 +2503,8 @@ def cmd_packet(args) -> dict:
 def cmd_decide(args) -> dict:
     return decide(args.repo, args.task, args.event_id, args.decision,
                   reviewed_head=args.reviewed_head, note=args.note,
-                  phase=args.phase, contract_hash=args.contract_hash)
+                  phase=args.phase, contract_hash=args.contract_hash,
+                  failure_kind=args.failure_kind)
 
 
 def cmd_pause(args) -> dict:
@@ -2562,6 +2587,9 @@ def build_parser() -> argparse.ArgumentParser:
                                           "phase id")
     decide.add_argument("--contract-hash", help="required with accept for a phase-bound event; the "
                                                  "exact contract revision hash")
+    decide.add_argument("--failure-kind", choices=FAILURE_KINDS,
+                        help="negative delivery decision: quality (default) counts toward three; "
+                             "external requires an explanatory note and does not count")
     decide.add_argument("--note")
     decide.set_defaults(func=cmd_decide)
 

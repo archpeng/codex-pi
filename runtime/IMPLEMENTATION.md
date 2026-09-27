@@ -32,6 +32,7 @@ double or explicit path only). Helpers used by the Pi worker are
 | `runtime/pi_check.py` | One-check receipt: true exit/signal/timeout, log sha256, HEAD/dirty, counts |
 | `runtime/pi_handoff.py` | Short legacy handoff, board-route recovery and interruption |
 | `runtime/pi_board.py` | Shared evidence board, event decisions, queue claims and deterministic CLI transport |
+| `runtime/pi_takeover.py` | Read-only failure-policy fold from exact review decisions; three rejected deliveries transfer implementation to the existing Codex task |
 | `runtime/pi_copy.py` / `pi_size.py` | Bounded evidence copying and byte scans without following symlinks |
 | `hooks/hooks.json` | Plugin-discovered synchronous Stop, Interrupt and recovery commands; requires host trust |
 | `runtime/VERSION` | Runtime version copied into every task state |
@@ -263,3 +264,5 @@ double in `tests/doubles/`. Coverage includes:
   current lifecycle command needs it.
 - Requires Python 3.10+, Git, and `fcntl`/POSIX process groups (macOS/Linux).
   Tests use process doubles only; real Pi/provider behavior is not proven here.
+
+Three reviewed quality failures in the same phase (across contract revisions) produce a retained Codex takeover. Distinct rounds count once; external blockers require explicit classification and a note. Continuation and internal-worker admission enforce the derived board policy. The runtime never implements or starts Codex: the existing main task reassesses the complete outcome and performs authorized work after verifying writer release. Project acceptance remains the completion authority.
