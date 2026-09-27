@@ -1,6 +1,6 @@
 ---
 name: collaborate
-description: Prepare, delegate and review Pi implementation, or take over repeatedly rejected delivery in the existing Codex task. Use for Codex–Pi task preparation, execution, repair and handoff; not unrelated Codex-only coding.
+description: Prepare, delegate and review Pi implementation, or take over a reviewed failed delivery in the existing Codex task. Use for Codex–Pi task preparation, execution, repair and handoff; not unrelated Codex-only coding.
 ---
 
 # Codex designs and reviews; Pi implements until takeover
@@ -45,7 +45,7 @@ A delivery is a completed report reviewed by the existing Codex main task, not a
 
 Count **one exact main decision per distinct round** on a `review_required`/`phase_blocked` event when its decision is `changes_requested`/`reject` with `--failure-kind quality` (the default for negative delivery decisions). Duplicate events for one round, Pi's internal red tests, routine repairs, progress, and the single pre-review missing-receipt auto-continuation never count. A genuine external prerequisite uses `--failure-kind external --note ...` explaining the missing evidence/authority and unlock condition; it does not count, and changing executor cannot supply it. An expected missing model/human gate in a correctly bounded checkpoint is not a failed checkpoint. Do not relabel implementation or evidence defects as external blockers.
 
-The runtime derives `reviewPolicy` (`limit`, `limitSource`, `failedDeliveries`, `implementationOwner`, `reason`) from exact board decisions and emits `codex_takeover_required` at the pinned limit. `continue`, automatic continuation and the internal worker refuse further Pi implementation; `pause`/`resume` cannot clear takeover. A real accepted outcome starts a fresh count and resolves the latch, so an authorized next phase can be delegated under the same pinned limit; renaming a failed task, phase, contract or checkpoint is never a reset. Review existing eligible historical decisions when adopting the rule; raw round counts alone prove nothing. Unregistered tasks need board registration and exact review decisions before further repair dispatch; prose-only failure reports are not a machine counter.
+The runtime derives `reviewPolicy` (`limit`, `limitSource`, `failedDeliveries`, `implementationOwner`, `reason`) from exact board decisions and emits `codex_takeover_required` at the pinned limit. `continue`, automatic continuation and the internal worker refuse further Pi implementation; `pause`/`resume` and later acceptance cannot clear takeover for the same task. Acceptance before the limit starts a fresh count for an authorized next phase; after takeover, a future outcome needs a separate dispatch. Renaming a failed task, phase, contract or checkpoint is never a reset. Review existing eligible historical decisions when adopting the rule; raw round counts alone prove nothing. Unregistered tasks need board registration and exact review decisions before further repair dispatch; prose-only failure reports are not a machine counter.
 
 Takeover is **a new whole-outcome assessment followed by direct implementation**, not a longer list of patches for Pi:
 

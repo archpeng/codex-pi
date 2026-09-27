@@ -215,20 +215,41 @@ class TakeoverPolicyTest(unittest.TestCase):
         self.assertEqual(policy["failedDeliveries"], 1)
         self.assertEqual(policy["implementationOwner"], "codex")
 
-    def test_fresh_accepted_outcome_resets_count_and_resolves_the_latch(self):
-        self.new_card(review_pin=pin(1))
+    def test_accepted_outcome_resets_count_before_takeover(self):
+        self.new_card(review_pin=pin(2))
         self.decide(self.publish(1))
-        self.assertTrue(review_policy(self.card)["takeoverRequired"])
+        self.assertFalse(review_policy(self.card)["takeoverRequired"])
         accepted = self.decide(self.publish(2), decision="accept", reviewed_head=self.head)
         self.assertEqual(accepted["decision"], "accepted")
         policy = accepted["reviewPolicy"]
         self.assertEqual(policy["failedDeliveries"], 0)
         self.assertFalse(policy["takeoverRequired"])
         self.assertEqual(policy["implementationOwner"], "pi")
-        self.assertFalse(self.card["codex"]["takeover"]["required"])
         # A fresh accepted outcome starts its own pinned count.
         out = self.decide(self.publish(3))
         self.assertEqual(out["reviewPolicy"]["failedDeliveries"], 1)
+        self.assertFalse(out["reviewPolicy"]["takeoverRequired"])
+
+    def test_reached_latch_survives_a_later_injected_acceptance(self):
+        self.new_card(review_pin=pin(1))
+        self.decide(self.publish(1))
+        self.assertTrue(review_policy(self.card)["takeoverRequired"])
+        # A real Pi continuation is refused here. Even an injected later
+        # acceptance must not silently return this task's work to Pi.
+        accepted = self.decide(self.publish(2), decision="accept", reviewed_head=self.head)
+        self.assertEqual(accepted["decision"], "accepted")
+        self.assertTrue(accepted["reviewPolicy"]["takeoverRequired"])
+        self.assertTrue(self.card["codex"]["takeover"]["required"])
+
+    def test_invalid_task_pin_never_relaxes_to_legacy_three(self):
+        self.new_card(review_pin=pin(1))
+        self.card["reviewPolicyPin"] = {"qualityFailureLimit": "invalid"}
+        self.write()
+        self.reload()
+        policy = review_policy(self.card)
+        self.assertEqual(policy["limit"], 1)
+        self.assertEqual(policy["limitSource"], "invalid-task-pin-fail-closed")
+        out = self.decide(self.publish(1))
         self.assertTrue(out["reviewPolicy"]["takeoverRequired"])
 
     def test_external_blocker_never_counts_and_classification_is_immutable(self):
@@ -321,6 +342,11 @@ class TakeoverLifecycleTest(unittest.TestCase):
         self.assertEqual(card["reviewPolicy"]["limit"], 1)
         self.assertEqual(card["reviewPolicy"]["failedDeliveries"], 0)
         event = self.review_event("one-failure")
+        review_packet = board_cli("packet", "--repo", self.repo.root, "--task", "one-failure",
+                                  env=self.env)
+        self.assertIn("reviewPolicy=limit:1,failed:0,owner:pi", review_packet["packet"])
+        self.assertIn("0 of 1 pinned reviewed quality failure allowance used",
+                      review_packet["packet"])
         decided = self.decide("one-failure", event["id"], "changes_requested")
         self.assertEqual(decided["reviewPolicy"]["failedDeliveries"], 1)
         self.assertTrue(decided["reviewPolicy"]["takeoverRequired"])

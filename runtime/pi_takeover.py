@@ -6,7 +6,8 @@ former limit of three. Counting is task-scoped since the last accepted outcome:
 one exact negative quality decision per reported round counts, while duplicate
 events, contract revisions, phase renames, ordinary checks, progress and
 explicitly external blockers do not. A real acceptance starts a fresh count and
-resolves a takeover latch recorded before it.
+resets failures before takeover. A reached takeover remains latched for that
+task; a later outcome needs a separate dispatch.
 """
 from __future__ import annotations
 
@@ -86,12 +87,11 @@ def review_policy(card: dict) -> dict:
     when it is an exact main decision on a delivery event (``review_required``
     or ``phase_blocked``), is ``rejected``/``changes_requested`` with
     ``failure-kind quality``, and represents a round not already counted. An
-    accepted delivery decision resets the count and resolves a prior latch. A
-    persisted takeover latch cannot be cleared by refresh/resume, contract
-    revisions or phase renames; only a real acceptance recorded after the latch
-    clears it. Missing historical event kinds count only when a stored phase
-    identity proves this was a delivery decision, not an arbitrary operational
-    event.
+    accepted delivery decision resets the count before the limit is reached. A
+    persisted takeover latch cannot be cleared by refresh/resume, acceptance,
+    contract revisions or phase renames. Missing historical event kinds count
+    only when a stored phase identity proves this was a delivery decision, not
+    an arbitrary operational event.
     """
     card = card if isinstance(card, dict) else {}
     task_key = "task:" + str(card.get("taskId"))
@@ -101,6 +101,12 @@ def review_policy(card: dict) -> dict:
     pin = pinned_review_limit(card)
     limit = pin["qualityFailureLimit"] if pin else None
     limit_source = "task-pin" if pin else None
+    if limit is None and "reviewPolicyPin" in card:
+        # A malformed pin must never silently turn a new one-delivery task into
+        # a three-delivery legacy task. The creation-time pin is authoritative;
+        # its loss is conservative until the board can be repaired from it.
+        limit = NEW_TASK_DEFAULT_LIMIT
+        limit_source = "invalid-task-pin-fail-closed"
     if limit is None and latched:
         limit = normalize_review_limit(latch.get("limit"))
         if limit is not None:
@@ -108,8 +114,6 @@ def review_policy(card: dict) -> dict:
     if limit is None:
         limit = LEGACY_FAILED_DELIVERY_LIMIT
         limit_source = "legacy-default"
-    latch_at = latch.get("at") if latched else None
-    accepted_after_latch = False
     failed, rounds = [], set()
     for record in sorted(_records(card).values(),
                          key=lambda row: (row.get("at") or 0, row.get("eventId") or "")):
@@ -118,12 +122,9 @@ def review_policy(card: dict) -> dict:
             continue
         decision = record.get("decision")
         if decision == "accepted":
-            # A real accepted outcome is the only reset. Renaming a failed
-            # phase/contract never reaches it, and an old acceptance recorded
-            # before the latch does not resolve that latch.
-            if latched and isinstance(latch_at, (int, float)) \
-                    and (record.get("at") or 0) >= latch_at:
-                accepted_after_latch = True
+            # An accepted delivery resets failures before the threshold. A
+            # takeover is terminal for this task's Pi allocation even if a
+            # later event is injected or a contract/phase is changed.
             failed, rounds = [], set()
             continue
         if decision not in ("rejected", "changes_requested"):
@@ -139,9 +140,6 @@ def review_policy(card: dict) -> dict:
                        "phaseId": record.get("phaseId"),
                        "contractHash": record.get("contractHash"),
                        "at": record.get("at")})
-    if accepted_after_latch:
-        latched = False
-        latch_at = None
     required = bool(latched) or len(failed) >= limit
     if latched and not failed and isinstance(latch.get("failedReports"), list):
         reports = list(latch.get("failedReports"))

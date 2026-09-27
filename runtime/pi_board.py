@@ -1732,7 +1732,12 @@ def build_packet(card: dict, events, limit: int = MAX_PACKET_EVENTS):
         ]
         if event.get("phaseId"):
             block.append(f"phase={event.get('phaseId')} contract={event.get('contractHash')}")
+        # Every actionable packet needs the allocation boundary at the point
+        # of review. A takeover event carries its immutable decision snapshot;
+        # ordinary review and fault events use the current board projection.
         event_policy = (event.get("evidence") or {}).get("reviewPolicy")
+        if not isinstance(event_policy, dict):
+            event_policy = review_policy(card)
         if isinstance(event_policy, dict):
             block.append("reviewPolicy=" + ",".join(
                 f"{label}:{event_policy.get(key)}" for label, key in
@@ -2438,17 +2443,6 @@ def decide(repo, task, event_id, decision, reviewed_head=None, note=None, phase=
             if takeover is not None:
                 takeover["phaseId"] = event_phase
                 takeover["contractHash"] = event.get("contractHash")
-        else:
-            existing_latch = codex.get("takeover") \
-                if isinstance(codex.get("takeover"), dict) else None
-            if isinstance(existing_latch, dict) and existing_latch.get("required"):
-                # A real acceptance recorded after the latch resolved it. Keep a
-                # bounded history entry; every refusal path reads review_policy,
-                # which already ignores this resolved latch.
-                codex["takeover"] = {
-                    "required": False, "clearedAt": now, "clearedBy": event_id,
-                    "previous": {key: existing_latch.get(key)
-                                 for key in ("at", "scope", "limit", "outcome")}}
         board["revision"] = int(board.get("revision") or 0) + 1
         board["updatedAt"] = now
         _write_board(board_file, board)
