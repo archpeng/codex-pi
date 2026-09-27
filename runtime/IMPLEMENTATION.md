@@ -32,7 +32,7 @@ double or explicit path only). Helpers used by the Pi worker are
 | `runtime/pi_check.py` | One-check receipt: true exit/signal/timeout, log sha256, HEAD/dirty, counts |
 | `runtime/pi_handoff.py` | Short legacy handoff, board-route recovery and interruption |
 | `runtime/pi_board.py` | Shared evidence board, event decisions, queue claims and deterministic CLI transport |
-| `runtime/pi_takeover.py` | Read-only failure-policy fold from exact review decisions; three rejected deliveries transfer implementation to the existing Codex task |
+| `runtime/pi_takeover.py` | Read-only failure-policy fold from exact review decisions; a pinned quality-failure limit (new default 1, explicit 2, legacy 3) transfers implementation to the existing Codex task |
 | `runtime/pi_copy.py` / `pi_size.py` | Bounded evidence copying and byte scans without following symlinks |
 | `hooks/hooks.json` | Plugin-discovered synchronous Stop, Interrupt and recovery commands; requires host trust |
 | `runtime/VERSION` | Runtime version copied into every task state |
@@ -143,8 +143,10 @@ error.
   evidence paths immediately. The config model must be the allowed model.
   `--read-only` limits Pi to `read,grep,find,ls`; writable uses
   `read,write,edit,bash` and is explicitly not a security sandbox. Every brief
-  contains the user directive never to run `codex`. The command returns while
-  the worker continues after the caller process exits.
+  contains the user directive never to run `codex`. `--review-limit 1|2` pins the
+  task's quality-failure limit (default 1) in `task.json`; registration copies it
+  to the board and later contract/config changes cannot raise it. The command
+  returns while the worker continues after the caller process exits.
 - `continue` — only a terminal-known task of the same frozen checkout, same
   pinned session and worktree, next immutable round. Refuses while the task lock
   is held (including by an orphaned Pi), when the previous state is unknown,
@@ -265,4 +267,4 @@ double in `tests/doubles/`. Coverage includes:
 - Requires Python 3.10+, Git, and `fcntl`/POSIX process groups (macOS/Linux).
   Tests use process doubles only; real Pi/provider behavior is not proven here.
 
-Three reviewed quality failures in the same phase (across contract revisions) produce a retained Codex takeover. Distinct rounds count once; external blockers require explicit classification and a note. Continuation and internal-worker admission enforce the derived board policy. The runtime never implements or starts Codex: the existing main task reassesses the complete outcome and performs authorized work after verifying writer release. Project acceptance remains the completion authority.
+A new task pins a reviewed quality-failure limit at creation: **one** by default, or an explicit **two** for a narrowly scoped local repair path (`start --review-limit 2`). Tasks that predate the pin keep the former limit of **three**. The pin is copied to the board at registration; contract edits, phase renames, pause/resume, retries and later config edits cannot raise it. Counting is task-scoped since the last accepted outcome: one exact main decision per distinct round on a `review_required`/`phase_blocked` event (`changes_requested`/`reject`, `failure-kind quality`), while duplicate events for one round, checks, progress, the single missing-receipt auto-continuation and explicitly external blockers do not count. A real acceptance resets the count and resolves the latch, so an authorized fresh phase can be delegated again under the same pinned limit; renaming a failed outcome never resets it. At the limit the board persists `codex_takeover_required` with the pinned limit, counted failures, implementation owner and reason, and continuation, automatic continuation and internal-worker admission refuse Pi. The runtime never implements or starts Codex: the existing main task reassesses the complete outcome and performs authorized work after verifying writer release. Project acceptance remains the completion authority.

@@ -106,12 +106,26 @@ See [handoff and recovery](handoff.md) for event decisions, uncertain delivery, 
 
 ## Review failure and direct Codex implementation
 
-Negative delivery decisions default to quality failures. For example:
+If a large outcome has a staged, objectively reviewable intermediate result, dispatch it as a new task with the default pinned limit:
+
+```sh
+python3 runtime/pi_task.py start --repo REPO --task TASK --worktree WT --prompt-file BRIEF
+```
+
+A new task allows one reviewed quality failure. Only when the task is narrowly scoped and the local repair path is known at dispatch, pin two local failures instead:
+
+```sh
+python3 runtime/pi_task.py start --repo REPO --task TASK --review-limit 2 --worktree WT --prompt-file BRIEF
+```
+
+The choice is frozen in `task.json` and copied to the board at registration; `start` accepts only 1 (default) or 2. Tasks without a pin keep the former limit of three. Contract revisions, phase renames, pause/resume, retries and later config edits never raise it or erase counted failures.
+
+Record negative delivery decisions as quality failures. For example:
 
 ```sh
 python3 runtime/pi_board.py decide --repo REPO --task TASK --event-id EVENT --decision changes_requested --failure-kind quality --note "Actual outcome failed the bound acceptance check"
 ```
 
-Only genuine missing external evidence/authority uses `--failure-kind external` with a nonempty `--note` naming the unlock condition. `reviewPolicy` in `decide`/`show` exposes the three-delivery limit, distinct failed rounds and implementation owner. Exact replays do not increment; a contract edit cannot reset the phase count. Old phase-bound negative decisions count unless explicitly classified otherwise; inspect their actual reports before drawing a model-capability conclusion. No PID/log activity, raw test failure or queue delivery increments the counter by itself.
+Only genuine missing external evidence/authority uses `--failure-kind external` with a nonempty `--note` naming the unlock condition. `reviewPolicy` in `decide`/`show` exposes the pinned `limit`/`limitSource`, distinct failed rounds, `implementationOwner` and `reason`. Counting is task-scoped since the last accepted outcome: one main decision per distinct round; exact replays, duplicate events for one round, `--failure-kind external`, checks, progress and the single missing-receipt auto-continuation do not increment. A contract edit or phase rename cannot reset the count. Old phase-bound negative decisions count unless explicitly classified otherwise; inspect their actual reports before drawing a model-capability conclusion. No PID/log activity, raw test failure or queue delivery increments the counter by itself.
 
-At three, `codex_takeover_required` is emitted and Pi continuation is refused, including after board resume. This transfers the remaining outcome to the existing main task; it does not launch a model or grant write ownership. First prove the worker/supervisor/descendants stopped, then follow the Skill's whole-outcome reassessment, coherent design and direct Codex implementation. Preserve task evidence and use project-level checks/acceptance for the new code. Do not accept the old Pi candidate as evidence for Codex's later implementation. Keep the completed Pi task as a retained handoff record; a future independently authorized outcome is a separate dispatch, never a disguised retry.
+At the pinned limit, `codex_takeover_required` is emitted and Pi continuation is refused, including after board resume. A real accepted outcome resets the count and resolves the latch, so an authorized fresh phase may again be delegated under the same pinned task limit. Takeover transfers the remaining outcome to the existing main task; it does not launch a model or grant write ownership. First prove the worker/supervisor/descendants stopped, then follow the Skill's whole-outcome reassessment, coherent design and direct Codex implementation. Preserve task evidence and use project-level checks/acceptance for the new code. Do not accept the old Pi candidate as evidence for Codex's later implementation. Keep the completed Pi task as a retained handoff record; a future independently authorized outcome is a separate dispatch, never a disguised retry.

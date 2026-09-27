@@ -55,7 +55,7 @@ from pi_task import (ACTIVE_STATES, TERMINAL_STATES, TASK_RE, LockHeld, atomic, 
                      normalize_candidate, probe_worktree_head, read_json,
                      require_allowed_model, require_task_arg, task_dir_for, terminate)
 
-from pi_takeover import FAILURE_KINDS, TAKEOVER_MESSAGE, review_policy
+from pi_takeover import FAILURE_KINDS, normalize_review_limit, review_policy
 
 SCHEMA_VERSION = 1
 BOARD_DIR = "codex-pi"
@@ -629,8 +629,8 @@ def _default_codex() -> dict:
 
 
 def _new_card(task_id, thread, title, goal, brief_ref, plan_ref, repo, common, worktree,
-              transport, codex_bin, now) -> dict:
-    return {
+              transport, codex_bin, now, review_pin=None) -> dict:
+    card = {
         "taskId": task_id, "ownerThread": thread, "codexTaskId": thread,
         "title": _text(title or task_id, 200), "goal": _text(goal or "", 600),
         "planRef": plan_ref, "briefRef": brief_ref,
@@ -642,6 +642,9 @@ def _new_card(task_id, thread, title, goal, brief_ref, plan_ref, repo, common, w
         "evidence": {}, "check": None, "events": [], "handled": {}, "overflow": None,
         "nextSeq": 1, "attention": None, "codex": _default_codex(),
     }
+    if isinstance(review_pin, dict):
+        card["reviewPolicyPin"] = dict(review_pin)
+    return card
 
 
 def event_identity(task_id: str, round_number, kind: str, fingerprint: str) -> str:
@@ -1729,6 +1732,13 @@ def build_packet(card: dict, events, limit: int = MAX_PACKET_EVENTS):
         ]
         if event.get("phaseId"):
             block.append(f"phase={event.get('phaseId')} contract={event.get('contractHash')}")
+        event_policy = (event.get("evidence") or {}).get("reviewPolicy")
+        if isinstance(event_policy, dict):
+            block.append("reviewPolicy=" + ",".join(
+                f"{label}:{event_policy.get(key)}" for label, key in
+                (("limit", "limit"), ("failed", "failedDeliveries"),
+                 ("owner", "implementationOwner"), ("reason", "reason"))
+                if event_policy.get(key) is not None))
         coverage = event.get("coverage")
         if isinstance(coverage, dict):
             block.append("coverage=" + ",".join(f"{key}:{coverage.get(key)}" for key in
@@ -2049,6 +2059,35 @@ def _decide_hint(repo, task_id, event: dict) -> str:
 # operations
 # ---------------------------------------------------------------------------
 
+def _task_review_pin(frozen: dict) -> dict | None:
+    """The dispatch-time quality-failure pin frozen in task.json, if valid."""
+    raw = frozen.get("reviewPolicy") if isinstance(frozen, dict) else None
+    if not isinstance(raw, dict):
+        return None
+    limit = normalize_review_limit(raw.get("qualityFailureLimit"))
+    if limit is None:
+        return None
+    pinned_at = raw.get("pinnedAt")
+    if not isinstance(pinned_at, (int, float)) or isinstance(pinned_at, bool):
+        pinned_at = frozen.get("createdAt")
+    return {"schemaVersion": 1, "qualityFailureLimit": limit, "pinnedAt": pinned_at,
+            "pinnedBy": _text(raw.get("pinnedBy") or "start", 60)}
+
+
+def _adopt_task_review_pin(card: dict, pin: dict | None) -> None:
+    """Adopt the creation-time pin once, before any delivery failure exists.
+
+    A card that already carries a pin is never overwritten, so re-registration,
+    contract edits or later config changes cannot raise or reset the limit.
+    Legacy cards without a pin stay on the legacy default.
+    """
+    if not isinstance(pin, dict) or isinstance(card.get("reviewPolicyPin"), dict):
+        return
+    policy = review_policy(card)
+    if policy["failedDeliveries"] == 0 and not policy["takeoverRequired"]:
+        card["reviewPolicyPin"] = dict(pin)
+
+
 def register_task(repo, task, thread=None, transport=TRANSPORT_OFFLINE, codex_bin=None,
                   title=None, goal=None, brief_ref=None, plan_ref=None, codex_task_id=None,
                   now=None) -> dict:
@@ -2063,6 +2102,7 @@ def register_task(repo, task, thread=None, transport=TRANSPORT_OFFLINE, codex_bi
     if not isinstance(frozen, dict) or frozen.get("task") != task_id:
         raise ValueError(f"task {task_id!r} has no readable task.json; inspect {task_dir}")
     require_allowed_model(frozen.get("model"), "board registration")
+    review_pin = _task_review_pin(frozen)
     transport = _validate_transport(transport)
     owner_thread = _validate_thread(thread, required=(transport == TRANSPORT_CLI_QUEUE))
     resolved_bin = None
@@ -2087,7 +2127,7 @@ def register_task(repo, task, thread=None, transport=TRANSPORT_OFFLINE, codex_bi
         if not isinstance(card, dict):
             card = _new_card(task_id, owner_thread, title or task_id, goal or "", brief_ref,
                              plan_ref, root, common, frozen.get("worktree"), transport,
-                             resolved_bin, now)
+                             resolved_bin, now, review_pin=review_pin)
             cards[task_id] = card
         else:
             card["ownerThread"] = owner_thread or card.get("ownerThread")
@@ -2107,6 +2147,7 @@ def register_task(repo, task, thread=None, transport=TRANSPORT_OFFLINE, codex_bi
             card["repo"] = str(root)
             card["commonDir"] = str(common)
             card["worktree"] = frozen.get("worktree")
+            _adopt_task_review_pin(card, review_pin)
             card["updatedAt"] = now
         board["revision"] = int(board.get("revision") or 0) + 1
         board["updatedAt"] = now
@@ -2373,15 +2414,41 @@ def decide(repo, task, event_id, decision, reviewed_head=None, note=None, phase=
             codex["history"] = (codex.get("history") or [])[-19:] + [history_entry]
         policy = review_policy(card)
         if policy["takeoverRequired"]:
-            codex.setdefault("takeover", {"required": True, "at": now, "scope": policy["scope"],
-                                         "failedReports": policy["failedReports"]})
-            takeover = add_event(card, "codex_takeover_required", card_round, "three-failed-deliveries",
-                                 "Codex must take over implementation after three failed reviewed deliveries",
+            existing_latch = codex.get("takeover") \
+                if isinstance(codex.get("takeover"), dict) else None
+            if isinstance(existing_latch, dict) and existing_latch.get("required"):
+                existing_latch.update({"required": True, "scope": policy["scope"],
+                                       "outcome": policy.get("outcome"),
+                                       "limit": policy["limit"],
+                                       "failedReports": policy["failedReports"]})
+            else:
+                # First reach of the pinned limit: keep the exact time so a later
+                # acceptance can be proven to have happened after the latch.
+                codex["takeover"] = {"required": True, "at": now, "scope": policy["scope"],
+                                     "outcome": policy.get("outcome"),
+                                     "limit": policy["limit"],
+                                     "failedReports": policy["failedReports"]}
+            takeover = add_event(card, "codex_takeover_required", card_round,
+                                 "quality-failure-limit-reached",
+                                 f"Codex must take over implementation after {policy['limit']} "
+                                 f"failed reviewed "
+                                 f"deliver{'y' if policy['limit'] == 1 else 'ies'}",
                                  event.get("candidate") or {}, {"reviewPolicy": policy},
-                                 TAKEOVER_MESSAGE, now)
+                                 policy["instruction"], now)
             if takeover is not None:
                 takeover["phaseId"] = event_phase
                 takeover["contractHash"] = event.get("contractHash")
+        else:
+            existing_latch = codex.get("takeover") \
+                if isinstance(codex.get("takeover"), dict) else None
+            if isinstance(existing_latch, dict) and existing_latch.get("required"):
+                # A real acceptance recorded after the latch resolved it. Keep a
+                # bounded history entry; every refusal path reads review_policy,
+                # which already ignores this resolved latch.
+                codex["takeover"] = {
+                    "required": False, "clearedAt": now, "clearedBy": event_id,
+                    "previous": {key: existing_latch.get(key)
+                                 for key in ("at", "scope", "limit", "outcome")}}
         board["revision"] = int(board.get("revision") or 0) + 1
         board["updatedAt"] = now
         _write_board(board_file, board)
@@ -2588,8 +2655,9 @@ def build_parser() -> argparse.ArgumentParser:
     decide.add_argument("--contract-hash", help="required with accept for a phase-bound event; the "
                                                  "exact contract revision hash")
     decide.add_argument("--failure-kind", choices=FAILURE_KINDS,
-                        help="negative delivery decision: quality (default) counts toward three; "
-                             "external requires an explanatory note and does not count")
+                        help="negative delivery decision: quality (default) counts toward the "
+                             "pinned task limit; external requires an explanatory note and "
+                             "does not count")
     decide.add_argument("--note")
     decide.set_defaults(func=cmd_decide)
 
