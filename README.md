@@ -40,6 +40,15 @@
 
 本机源目录 `/Users/jlpeng/plugins/codex-pi`，注册在个人 marketplace。依赖 Python 3.10+、Git、已有 Pi CLI；自动通知另需支持 `queue` 的 Codex CLI 和桌面应用。认证沿用现有本地配置，插件不复制密钥。运行时适用于 macOS/Linux，使用标准库、文件锁和进程组。
 
+其他 Codex 环境在取得私有仓库 `archpeng/codex-pi` 的 GitHub 访问权限后，可以直接安装仓库自带的 marketplace：
+
+```sh
+codex plugin marketplace add archpeng/codex-pi --ref main
+codex plugin add codex-pi@codex-pi
+```
+
+在桌面应用中重新加载插件，并按提示审核、信任 Hooks；用新会话加载新版技能。安装只提供协作工具，不会复制本机的 Pi/DeepSeek 凭据或项目配置。已有项目仍需自己的 `.agents/codex-pi.json` 和领域约束。
+
 更新通过正式插件安装流程完成；若应用要求重新审核、信任 Hooks，由用户在应用内完成。不得手改缓存或信任记录。运行中任务保留原 helper 快照，在安全终态后采用新版本。已有任务的迁移需验证原会话和工作树没有改变。
 
 测试：`python3 -m unittest discover -s tests -p 'test_*.py' -v`。脚本测试不等于桌面验收；实际入口验证见 [CLI queue 实测](docs/validation/cli-queue-20260926.md)。社区产品比较见 [调查记录](docs/community-research.md)。
