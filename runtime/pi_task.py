@@ -44,6 +44,7 @@ from pi_takeover import (EXPLICIT_REVIEW_LIMITS, LEGACY_FAILED_DELIVERY_LIMIT,
 
 SCHEMA_VERSION = 1
 DEFAULT_MODEL = "deepseek/deepseek-flash"
+ALLOWED_MODELS = (DEFAULT_MODEL, "newapi/glm-5.3")
 DEFAULT_THINKING = "max"
 DEFAULT_TIMEOUT = 14400
 MAX_TIMEOUT = 604800
@@ -274,11 +275,11 @@ def validate_reference(root: Path, entry: str, kind: str) -> None:
 
 
 def require_allowed_model(model, context: str) -> str:
-    """Hard model restriction: deepseek/deepseek-flash and nothing else."""
-    if model != DEFAULT_MODEL:
-        raise ValueError(f"{context} model {model!r} is not allowed; this runtime only permits "
-                         f"{DEFAULT_MODEL!r} (no substitution or fallback is performed; existing "
-                         "evidence is not modified)")
+    """Allow only the explicit, locally configured worker model choices."""
+    if model not in ALLOWED_MODELS:
+        choices = ", ".join(repr(item) for item in ALLOWED_MODELS)
+        raise ValueError(f"{context} model {model!r} is not allowed; choose one of {choices} "
+                         "(no substitution or fallback is performed; existing evidence is not modified)")
     return model
 
 
@@ -1963,10 +1964,9 @@ def compose_brief(task: dict, round_number: int, prompt: str, prior: dict | None
              "agent, and do not call an OpenAI model through Codex. The Codex main session",
              "reviews outcomes; this Pi session implements and reports. Never run `codex`.",
              "",
-             "Model policy: this mechanism permits only `deepseek/deepseek-flash`. Do not call,",
+             f"Model policy: this task is pinned to `{task['model']}` at task creation. Do not call,",
              "delegate to, or spawn any nested agent/model on another provider or model, and do",
-             "not fall back automatically to any other model. If the pinned allowed model is not",
-             "available, stop and report that instead of switching models.",
+             "not fall back automatically. If the pinned model is unavailable, stop and report it.",
              "",
              f"Mode: {'read-only' if read_only else 'writable'}; allowed tools: {tools}.",
              ("Read-only is a tool allowlist, not a security sandbox."
@@ -2157,7 +2157,7 @@ def finish_round(task_dir: Path, round_number: int, round_dir: Path, task: dict,
     atomic(round_dir / "round.state.json", state)
     try:
         data = summarize(round_dir / "round.jsonl", worktree, round_dir,
-                         DEFAULT_MODEL, checks_dir=round_dir / "round.checks")
+                         task.get("model"), checks_dir=round_dir / "round.checks")
         atomic(round_dir / "round.summary.json", data)
         (round_dir / "round.summary.txt").write_text(compact(data), encoding="utf-8")
     except Exception as exc:  # summary failure must not hide the raw evidence
@@ -2352,7 +2352,7 @@ def run_worker(args) -> int:
         tools = READ_ONLY_TOOLS if task["readOnly"] else WRITABLE_TOOLS
         pi_bin = os.environ.get("PI_BIN") or "pi"
         argv = [pi_bin, "-p", "--mode", "json", "--session-id", task["sessionId"],
-                "--session-dir", task["sessionDir"], "--model", DEFAULT_MODEL,
+                "--session-dir", task["sessionDir"], "--model", task["model"],
                 "--thinking", task["thinking"], "--tools", tools,
                 "--no-extensions", "--no-skills", "--no-prompt-templates",
                 "@" + str(round_dir / "brief.md")]
@@ -4030,9 +4030,10 @@ def cmd_project(args) -> dict:
             },
             "limits": {"maxWorkers": config["maxWorkers"], "timeoutSeconds": config["timeoutSeconds"],
                        "model": config["model"], "thinking": config["thinking"],
-                       "allowedModels": [DEFAULT_MODEL],
-                       "modelPolicy": "only deepseek/deepseek-flash is permitted; other IDs are "
-                                      "rejected, never substituted or defaulted",
+                       "allowedModels": list(ALLOWED_MODELS),
+                       "modelPolicy": "each new task pins one explicitly allowed project-configured model; "
+                                      "existing task snapshots never change and unavailable models are "
+                                      "rejected without substitution",
                        "reviewPolicy": {
                            "newTaskDefaultLimit": NEW_TASK_DEFAULT_LIMIT,
                            "explicitLocalLimit": 2,

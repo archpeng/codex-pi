@@ -1,6 +1,6 @@
 # Codex + Pi
 
-当前 Codex 主任务负责设计、派工与验收；Pi 固定使用 `deepseek/deepseek-flash` / `max` 完成实施。项目只需 `.agents/codex-pi.json` 和自己的领域约束，公共插件维护进程、同会话返修、看板和原始证据。
+当前 Codex 主任务负责设计、派工与验收；Pi 按项目配置从两个显式模型中选择：`deepseek/deepseek-flash` 或 `newapi/glm-5.3`。默认仍为 DeepSeek Flash/max。项目只需 `.agents/codex-pi.json` 和自己的领域约束，公共插件维护进程、同会话返修、看板和原始证据。
 
 ## 协作方式
 
@@ -28,6 +28,10 @@
 ```
 
 `checks` 是验收指引，插件不会把它当作通过证明。`maxWorkers` 是容量上限；项目的依赖和并行资格仍由项目约束决定。整轮超时和单个命令的时限分别设置。Pi 退出码 0 仅表示执行结束。
+
+`model` 仅接受 `deepseek/deepseek-flash` 或 `newapi/glm-5.3`。每个新任务会把模型固定在任务快照中；改项目配置只影响后续新任务，不会切换已有任务。模型不可用时任务失败并保留原证，不自动回退到另一个 provider/model。NewAPI GLM 路由要求本机 Pi 已配置 `newapi` provider 和凭证。
+
+例如，需让该项目后续新任务使用 NewAPI GLM-5.3，可将项目配置中的 `model` 改为 `newapi/glm-5.3`。已运行或已冻结的任务继续使用快照记录的模型。
 
 ## 故障与费用边界
 

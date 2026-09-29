@@ -103,6 +103,27 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual(recorded["tools"], "read,grep,find,ls")
         self.assertIn("read-only", (repo.task_dir("ro") / "rounds" / "1" / "brief.md").read_text())
 
+    def test_project_selected_newapi_model_is_pinned_and_passed_to_pi(self):
+        model = "newapi/glm-5.3"
+        repo, worktree = self.make(default_config(model=model))
+        trace = self.tmp / "newapi-trace.jsonl"
+        env = base_env(PI_DOUBLE_MODE="session-trace", PI_DOUBLE_TRACE=str(trace),
+                       PI_DOUBLE_REPORTED_PROVIDER="newapi",
+                       PI_DOUBLE_REPORTED_MODEL="glm-5.3")
+
+        started = repo.start_json("newapi-model", worktree, env=env)
+        self.assertEqual(started["model"], model)
+        result = repo.wait_terminal("newapi-model", env=env)
+        self.assertEqual(result["state"], "completed")
+        self.assertEqual(result["summary"]["model_check"], "matched")
+
+        task = json.loads((repo.task_dir("newapi-model") / "task.json").read_text())
+        self.assertEqual(task["model"], model)
+        brief = (repo.task_dir("newapi-model") / "rounds" / "1" / "brief.md").read_text()
+        self.assertIn(f"pinned to `{model}`", brief)
+        recorded = json.loads(trace.read_text().splitlines()[0])
+        self.assertEqual(recorded["model"], model)
+
     # ------------------------------------------------------------------
     def test_failed_attempt_stays_visible_and_continue_uses_same_session(self):
         repo, worktree = self.make()
@@ -116,6 +137,9 @@ class LifecycleTest(unittest.TestCase):
         round1 = repo.task_dir("beta") / "rounds" / "1"
         brief1 = (round1 / "brief.md").read_bytes()
         log1 = (round1 / "round.jsonl").read_bytes()
+
+        # Changing project selection never changes an already-started task.
+        write_config(repo.root, default_config(model="newapi/glm-5.3"))
 
         ok_env = base_env(PI_DOUBLE_MODE="session-trace", PI_DOUBLE_TRACE=str(trace))
         response = json.loads(repo.continue_task("beta", env=ok_env).stdout)
@@ -135,6 +159,8 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual((round1 / "round.jsonl").read_bytes(), log1)
         recorded = [json.loads(line) for line in trace.read_text().splitlines()]
         self.assertEqual(len(recorded), 2)
+        self.assertEqual(recorded[0]["model"], "deepseek/deepseek-flash")
+        self.assertEqual(recorded[1]["model"], "deepseek/deepseek-flash")
         self.assertEqual(recorded[0]["sessionId"], recorded[1]["sessionId"])
         self.assertEqual(recorded[0]["sessionDir"], recorded[1]["sessionDir"])
         self.assertEqual(recorded[1]["cwd"], str(worktree.resolve()))
@@ -550,7 +576,7 @@ class LifecycleTest(unittest.TestCase):
         trap, marker = make_pi_trap(self.tmp / "bin")
         proc = run_cli("continue", "--repo", str(repo.root), "--task", "stale-model",
                        "--prompt", "x", env=base_env(PI_BIN=str(trap)), expect=2)
-        self.assertIn("only permits", proc.stderr)
+        self.assertIn("choose one", proc.stderr)
         self.assertIn("not modified", proc.stderr)
         self.assertEqual(snapshot_files(task_dir), before)
         self.assertFalse((task_dir / "rounds" / "2").exists())
@@ -574,7 +600,7 @@ class LifecycleTest(unittest.TestCase):
              "--timeout-seconds", "5"],
             env=base_env(PI_BIN=str(trap)), capture_output=True, text=True, timeout=30)
         self.assertNotEqual(proc.returncode, 0, proc.stdout)
-        self.assertIn("only permits", proc.stderr)
+        self.assertIn("choose one", proc.stderr)
         self.assertEqual(snapshot_files(task_dir), before)
         self.assertFalse(marker.exists())
 

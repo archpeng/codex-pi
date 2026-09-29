@@ -83,8 +83,9 @@ class ConfigTest(unittest.TestCase):
         self.assertIn("read", data["capabilities"]["readOnlyTools"])
         self.assertIn("bash", data["capabilities"]["writableTools"])
         self.assertTrue(data["limits"]["readOnlyIsNotASecuritySandbox"])
-        self.assertEqual(data["limits"]["allowedModels"], ["deepseek/deepseek-flash"])
-        self.assertIn("only deepseek/deepseek-flash", data["limits"]["modelPolicy"])
+        self.assertEqual(data["limits"]["allowedModels"],
+                         ["deepseek/deepseek-flash", "newapi/glm-5.3"])
+        self.assertIn("each new task pins", data["limits"]["modelPolicy"])
         self.assertEqual(data["activeTaskCount"], 0)
 
     def test_invalid_limits_rejected(self):
@@ -130,7 +131,8 @@ class ConfigTest(unittest.TestCase):
         data = cli_json("project", "--repo", str(project_wt))
         self.assertEqual(data["repo"], str(project_wt.resolve()))
         self.assertEqual(data["config"]["model"], "deepseek/deepseek-flash")
-        self.assertEqual(data["limits"]["allowedModels"], ["deepseek/deepseek-flash"])
+        self.assertEqual(data["limits"]["allowedModels"],
+                         ["deepseek/deepseek-flash", "newapi/glm-5.3"])
         self.assertEqual(data["capabilities"]["configCheckout"], str(project_wt.resolve()))
         # A second linked worker checkout is accepted and uses the project checkout config.
         started = run_cli("start", "--repo", str(project_wt), "--task", "cfg",
@@ -184,11 +186,12 @@ class ConfigTest(unittest.TestCase):
     def test_disallowed_model_rejected_by_project_and_start(self):
         trap, marker = make_pi_trap(self.tmp / "bin")
         cases = {
-            "openai-codex/gpt-6-luna": "only permits",
-            "gpt-4o": "only permits",
-            "deepseek-flash": "only permits",
-            " deepseek/deepseek-flash": "only permits",
-            "deepseek/deepseek-flash ": "only permits",
+            "openai-codex/gpt-6-luna": "choose one",
+            "gpt-4o": "choose one",
+            "deepseek-flash": "choose one",
+            " deepseek/deepseek-flash": "choose one",
+            "deepseek/deepseek-flash ": "choose one",
+            "newapi/deepseek-flash": "choose one",
             "": "non-empty",
         }
         for index, (bad, expected) in enumerate(cases.items()):
@@ -214,7 +217,8 @@ class ConfigTest(unittest.TestCase):
         data = cli_json("project", "--repo", str(project), env=env)
         self.assertEqual(data["repo"], str(project.resolve()))
         self.assertEqual(data["config"]["model"], "deepseek/deepseek-flash")
-        self.assertEqual(data["limits"]["allowedModels"], ["deepseek/deepseek-flash"])
+        self.assertEqual(data["limits"]["allowedModels"],
+                         ["deepseek/deepseek-flash", "newapi/glm-5.3"])
         primary_proc = run_cli("project", "--repo", str(primary), env=env, expect=None)
         self.assertIn(primary_proc.returncode, (0, 2))
         if primary_proc.returncode == 0:
@@ -223,7 +227,7 @@ class ConfigTest(unittest.TestCase):
             self.assertNotEqual(primary_data["configPath"], data["configPath"])
         else:
             self.assertTrue("codex-pi.json" in primary_proc.stderr
-                            or "only permits" in primary_proc.stderr,
+                            or "choose one" in primary_proc.stderr,
                             primary_proc.stderr)
         self.assertFalse(marker.exists())
 
